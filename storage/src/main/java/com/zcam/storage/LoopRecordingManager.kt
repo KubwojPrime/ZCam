@@ -1,6 +1,7 @@
 ﻿package com.zcam.storage
 
-interface LoopRecordingManager {
-    suspend fun start()
-    suspend fun stop()
+import com.zcam.core.domain.recording.LoopRecordingEngine
+
+interface LoopRecordingManager : LoopRecordingEngine {
+    suspend fun isHealthy(): Boolean
 }

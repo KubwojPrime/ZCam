@@ -28,6 +28,8 @@ dependencies {
     implementation(libs.hilt.android)
     kapt(libs.hilt.compiler)
     implementation(libs.timber)
+
+    testImplementation(libs.junit4)
 }
 
 kapt {

@@ -31,6 +31,7 @@ dependencies {
     implementation(libs.androidx.camera.lifecycle)
     implementation(libs.androidx.camera.video)
     implementation(libs.androidx.camera.view)
+    implementation(libs.guava)
 
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.hilt.android)

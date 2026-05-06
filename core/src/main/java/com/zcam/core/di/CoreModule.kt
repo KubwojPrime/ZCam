@@ -4,6 +4,8 @@ import com.zcam.core.dispatchers.DefaultDispatcher
 import com.zcam.core.dispatchers.DefaultDispatcherProvider
 import com.zcam.core.dispatchers.DispatcherProvider
 import com.zcam.core.dispatchers.IoDispatcher
+import com.zcam.core.domain.settings.AllowlistFeatureFlagGuard
+import com.zcam.core.domain.settings.FeatureFlagGuard
 import com.zcam.core.logging.TimberZCamLogger
 import com.zcam.core.logging.ZCamLogger
 import dagger.Binds
@@ -41,4 +43,10 @@ object CoreDispatchersModule {
     @Singleton
     @DefaultDispatcher
     fun provideDefaultDispatcher(): CoroutineDispatcher = Dispatchers.Default
+
+    @Provides
+    @Singleton
+    fun provideFeatureFlagGuard(): FeatureFlagGuard = AllowlistFeatureFlagGuard(
+        mutableFlags = AllowlistFeatureFlagGuard.defaultMutableFlags
+    )
 }

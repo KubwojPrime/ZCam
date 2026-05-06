@@ -1,7 +1,9 @@
 ﻿package com.zcam.data.di
 
-import com.zcam.data.DataStoreSettingsRepository
-import com.zcam.data.SettingsRepository
+import com.zcam.core.domain.settings.RuntimeSettingsRepository
+import com.zcam.core.domain.settings.RuntimeStateRepository
+import com.zcam.data.DataStoreRuntimeSettingsRepository
+import com.zcam.data.DataStoreRuntimeStateRepository
 import dagger.Binds
 import dagger.Module
 import dagger.hilt.InstallIn
@@ -14,5 +16,13 @@ abstract class DataModule {
 
     @Binds
     @Singleton
-    abstract fun bindSettingsRepository(impl: DataStoreSettingsRepository): SettingsRepository
+    abstract fun bindRuntimeSettingsRepository(
+        impl: DataStoreRuntimeSettingsRepository
+    ): RuntimeSettingsRepository
+
+    @Binds
+    @Singleton
+    abstract fun bindRuntimeStateRepository(
+        impl: DataStoreRuntimeStateRepository
+    ): RuntimeStateRepository
 }

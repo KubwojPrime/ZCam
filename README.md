@@ -17,25 +17,43 @@ ZCam to lokalna aplikacja Android (LAN only) zaprojektowana pod pracę 24/7.
 
 - `app` - bootstrap aplikacji, manifest, Activity, uruchamianie service
 - `core` - logger, dispatchery coroutines, wspólne DI
+- `core` - logger, dispatchery coroutines, kontrakty domenowe i use-case
 - `camera` - runtime kamery + źródło ramek MJPEG (placeholder, gotowe do podpięcia CameraX encoder)
 - `server` - lokalny HTTP `/health` i `/mjpeg` (chunked multipart MJPEG)
 - `audio` - push-to-talk manager (szkielet runtime)
 - `storage` - loop recording manager z retencją segmentów
 - `watchdog` - heartbeat monitoring i wykrywanie zastałych komponentów
-- `security` - LAN access policy + walidacja PIN/token
+- `security` - LAN access policy + PIN/token + trusted devices
 - `client` - lokalny klient HTTP do sprawdzania serwera
 - `service` - foreground runtime coordinator + `ZCamForegroundService`
-- `data` - DataStore preferences + repo ustawień
+- `data` - DataStore runtime settings + feature flags + trusted devices
 - `ui` - ekran Compose sterujący start/stop runtime
 
 ## Przepływ runtime
 
 1. UI uruchamia `ZCamForegroundService`.
 2. Service startuje `ZCamRuntimeCoordinator`.
-3. Coordinator uruchamia: watchdog, camera, audio, storage, HTTP server.
-4. Server wystawia LAN-only endpointy:
+3. Coordinator uruchamia watchdog i komponenty runtime (server/camera/audio/storage).
+4. Watchdog monitoruje heartbeat i emituje sygnały recovery.
+5. Coordinator wykonuje recovery z retry/backoff/cooldown.
+6. Server wystawia LAN-only endpointy:
    - `GET /health`
    - `GET /mjpeg`
+
+## Runtime Health i Recovery
+
+- Obserwowalne health states:
+  - `RuntimeHealthRepository.health` (stan runtime per komponent)
+  - `WatchdogEngine.health` (stan watchdog i heartbeat)
+- Recovery:
+  - exponential backoff (`RecoveryPolicy`)
+  - limit prób + cooldown (bez pętli awaryjnych)
+  - mutex per komponent (brak równoległych recovery tego samego komponentu)
+- Auto-restore:
+  - restart procesu: `ZCamApplication` odtwarza runtime z `RuntimeStateRepository`
+  - reboot urządzenia: `BootReceiver` odtwarza runtime z `RuntimeStateRepository`
+- Logowanie produkcyjne:
+  - logi runtime/watchdog/restore mają `event IDs` (`LogEventId`, np. `RUN-100`, `REC-101`, `WDG-102`)
 
 ## Wątki i stabilność
 
@@ -44,6 +62,42 @@ ZCam to lokalna aplikacja Android (LAN only) zaprojektowana pod pracę 24/7.
 - Service działa jako foreground z typami: `camera|microphone|mediaPlayback`.
 - Loop recording ma politykę retencji (limit rozmiaru + minimum wolnego miejsca).
 - Watchdog raportuje stale heartbeat (bazowy mechanizm recovery).
+
+## Kontrakty Domenowe
+
+- MJPEG streaming: `MjpegStreamingEngine` + use-case start/stop.
+- Loop recording: `LoopRecordingEngine` + use-case start/stop/sweep.
+- Audio PTT/live/playback: `AudioEngine` + use-case PTT/live/playback.
+- Security (PIN/token/trusted devices): `SecurityEngine` + use-case auth/trust/revoke.
+- Watchdog/recovery: `WatchdogEngine` + use-case heartbeat/recovery.
+
+## Centralna Konfiguracja
+
+`RuntimeSettingsDefaults`:
+- 720p (`1280x720`)
+- 15 FPS
+- H.264
+- segment 5 min
+- limit 32 GB
+- min free 5 GB
+
+Walidacja odbywa się przez `RuntimeSettingsValidator` przed zapisem do DataStore.
+
+## Feature Flags i Runtime Settings
+
+- Runtime settings są przechowywane w `DataStoreRuntimeSettingsRepository`.
+- Feature flags są silnie typowane (`FeatureFlag`, `FeatureFlags`) i zmieniane tylko przez allowlist (`FeatureFlagGuard`).
+- Trusted devices są serializowane bezpiecznie (Base64 URL-safe) i walidowane przed utrwaleniem.
+
+## Testy Jednostkowe
+
+- kontrakty/use-case: `core/src/test/.../DomainUseCasesContractTest.kt`
+- walidacja konfiguracji: `core/src/test/.../RuntimeSettingsValidatorTest.kt`
+- feature flag guard: `core/src/test/.../FeatureFlagGuardTest.kt`
+- codec trusted devices: `data/src/test/.../TrustedDeviceCodecTest.kt`
+- recovery policy: `service/src/test/.../RecoveryPolicyTest.kt`
+- recovery runtime coordinator: `service/src/test/.../ZCamRuntimeCoordinatorRecoveryTest.kt`
+- watchdog stale->recovery: `watchdog/src/test/.../ProcessWatchdogManagerRecoveryTest.kt`
 
 ## Decyzje Techniczne Pod 24/7
 

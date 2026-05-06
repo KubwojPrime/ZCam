@@ -1,7 +1,5 @@
 ﻿package com.zcam.watchdog
 
-interface WatchdogManager {
-    suspend fun start()
-    suspend fun stop()
-    fun signalHeartbeat(component: String)
-}
+import com.zcam.core.domain.watchdog.WatchdogEngine
+
+interface WatchdogManager : WatchdogEngine

@@ -1,6 +1,5 @@
 ﻿package com.zcam.security
 
-interface SecurityManager {
-    suspend fun validateToken(candidate: String): Boolean
-    suspend fun validatePin(candidate: String): Boolean
-}
+import com.zcam.core.domain.security.SecurityEngine
+
+interface SecurityManager : SecurityEngine

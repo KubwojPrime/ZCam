@@ -3,17 +3,38 @@
 import com.zcam.audio.PushToTalkManager
 import com.zcam.camera.CameraRuntime
 import com.zcam.core.dispatchers.DispatcherProvider
+import com.zcam.core.domain.settings.RuntimeSettingsRepository
+import com.zcam.core.domain.settings.RuntimeStateRepository
+import com.zcam.core.domain.watchdog.RecoveryReason
+import com.zcam.core.domain.watchdog.RecoveryRequest
+import com.zcam.core.domain.watchdog.WatchdogComponentHealth
+import com.zcam.core.domain.watchdog.WatchdogComponentStatus
+import com.zcam.core.logging.LogEventId
 import com.zcam.core.logging.ZCamLogger
+import com.zcam.core.logging.e
+import com.zcam.core.logging.i
+import com.zcam.core.logging.w
 import com.zcam.server.LocalHttpServer
+import com.zcam.service.runtime.ComponentHealthStatus
+import com.zcam.service.runtime.RecoveryPolicy
+import com.zcam.service.runtime.RetryBackoffScheduler
+import com.zcam.service.runtime.RuntimeComponent
+import com.zcam.service.runtime.RuntimeHealthRepository
 import com.zcam.storage.LoopRecordingManager
 import com.zcam.watchdog.WatchdogManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -24,49 +45,442 @@ class ZCamRuntimeCoordinator @Inject constructor(
     private val pushToTalkManager: PushToTalkManager,
     private val loopRecordingManager: LoopRecordingManager,
     private val watchdogManager: WatchdogManager,
+    private val runtimeSettingsRepository: RuntimeSettingsRepository,
+    private val runtimeStateRepository: RuntimeStateRepository,
+    private val runtimeHealthRepository: RuntimeHealthRepository,
+    private val recoveryPolicy: RecoveryPolicy,
+    private val retryBackoffScheduler: RetryBackoffScheduler,
     private val dispatchers: DispatcherProvider,
     private val logger: ZCamLogger
 ) {
 
+    val health: StateFlow<com.zcam.service.runtime.RuntimeHealthSnapshot>
+        get() = runtimeHealthRepository.health
+
     private val runtimeScope = CoroutineScope(SupervisorJob() + dispatchers.default)
+    private val isRunning = AtomicBoolean(false)
+    private val componentLocks = RuntimeComponent.entries.associateWith { Mutex() }
+    private val recoveryAttempts = ConcurrentHashMap<RuntimeComponent, Int>()
+
+    private val componentByKey = ConcurrentHashMap<String, RuntimeComponent>()
+
     private var heartbeatJob: Job? = null
+    private var recoveryCollectorJob: Job? = null
+
+    @Volatile
+    private var activeComponents: Map<RuntimeComponent, ManagedComponent> = emptyMap()
+    @Volatile
+    private var watchdogRecoveryEnabled: Boolean = true
 
     suspend fun start() = withContext(dispatchers.io) {
-        logger.i("Runtime start sequence")
-
-        watchdogManager.start()
-        cameraRuntime.start()
-        pushToTalkManager.start()
-        loopRecordingManager.start()
-        localHttpServer.start()
-
-        if (heartbeatJob?.isActive != true) {
-            heartbeatJob = runtimeScope.launch {
-                while (isActive) {
-                    watchdogManager.signalHeartbeat("camera")
-                    watchdogManager.signalHeartbeat("server")
-                    watchdogManager.signalHeartbeat("audio")
-                    watchdogManager.signalHeartbeat("storage")
-                    delay(2_000L)
-                }
-            }
+        if (!isRunning.compareAndSet(false, true)) {
+            logger.i(LogEventId.RUNTIME_ALREADY_RUNNING, "Runtime start ignored, already running")
+            return@withContext
         }
 
-        logger.i("Runtime started")
+        runCatching {
+            runtimeStateRepository.setDesiredRunning(true)
+            runtimeHealthRepository.reset()
+            recoveryAttempts.clear()
+
+            val settings = runtimeSettingsRepository.settings.first()
+            watchdogRecoveryEnabled = settings.featureFlags.watchdogRecovery
+            activeComponents = buildActiveComponents(settings)
+            componentByKey.clear()
+            activeComponents.values.forEach { componentByKey[it.watchdogKey] = it.component }
+
+            logger.i(LogEventId.RUNTIME_START_SEQUENCE, "Runtime start sequence")
+
+            watchdogManager.start()
+            registerWatchdogComponents()
+            startRecoveryCollector()
+
+            for (component in startOrder()) {
+                startComponent(component)
+            }
+
+            startHeartbeatLoop()
+        }.onFailure { error ->
+            logger.e(LogEventId.COMPONENT_FAILED, error, "Runtime startup failed")
+            isRunning.set(false)
+            stopInternal(persistDesiredState = false)
+        }
     }
 
-    suspend fun stop() = withContext(dispatchers.io) {
-        logger.i("Runtime stop sequence")
+    suspend fun stop(persistDesiredState: Boolean) = withContext(dispatchers.io) {
+        if (!isRunning.compareAndSet(true, false)) {
+            logger.i(LogEventId.RUNTIME_ALREADY_STOPPED, "Runtime stop ignored, already stopped")
+            if (persistDesiredState) {
+                runtimeStateRepository.setDesiredRunning(false)
+            }
+            return@withContext
+        }
+
+        stopInternal(persistDesiredState)
+    }
+
+    private suspend fun stopInternal(persistDesiredState: Boolean) {
+        logger.i(LogEventId.RUNTIME_STOP_SEQUENCE, "Runtime stop sequence")
+
+        if (persistDesiredState) {
+            runtimeStateRepository.setDesiredRunning(false)
+        }
 
         heartbeatJob?.cancel()
         heartbeatJob = null
 
-        localHttpServer.stop()
-        loopRecordingManager.stop()
-        pushToTalkManager.stop()
-        cameraRuntime.stop()
-        watchdogManager.stop()
+        recoveryCollectorJob?.cancel()
+        recoveryCollectorJob = null
 
-        logger.i("Runtime stopped")
+        for (component in stopOrder()) {
+            stopComponent(component)
+        }
+
+        watchdogManager.stop()
+        runtimeHealthRepository.mark(
+            component = RuntimeComponent.WATCHDOG,
+            status = ComponentHealthStatus.STOPPED,
+            eventId = LogEventId.WATCHDOG_STOPPED,
+            message = "watchdog stopped"
+        )
+
+        activeComponents = emptyMap()
+        componentByKey.clear()
+        recoveryAttempts.clear()
+        watchdogRecoveryEnabled = true
+    }
+
+    private fun startRecoveryCollector() {
+        if (recoveryCollectorJob?.isActive == true) return
+
+        recoveryCollectorJob = runtimeScope.launch {
+            watchdogManager.recoveryEvents.collect { request ->
+                if (!watchdogRecoveryEnabled) return@collect
+                val component = componentByKey[request.component] ?: return@collect
+                launch {
+                    recoverComponent(component, request)
+                }
+            }
+        }
+    }
+
+    private fun startHeartbeatLoop() {
+        if (heartbeatJob?.isActive == true) return
+
+        heartbeatJob = runtimeScope.launch {
+            while (isActive && isRunning.get()) {
+                activeComponents.values.forEach { managed ->
+                    val status = health.value.components[managed.component]?.status
+                    val shouldProbe = status == ComponentHealthStatus.HEALTHY || status == ComponentHealthStatus.STARTING
+                    if (!shouldProbe) return@forEach
+
+                    val isHealthy = runCatching { managed.healthCheck.invoke() }.getOrDefault(false)
+                    if (isHealthy) {
+                        watchdogManager.heartbeat(managed.watchdogKey)
+                    } else {
+                        val attempt = (recoveryAttempts[managed.component] ?: 0) + 1
+                        recoveryAttempts[managed.component] = attempt
+                        logger.w(
+                            LogEventId.COMPONENT_FAILED,
+                            "Health probe failed for ${managed.component.name}, attempt=$attempt"
+                        )
+                        runtimeHealthRepository.mark(
+                            component = managed.component,
+                            status = ComponentHealthStatus.FAILED,
+                            eventId = LogEventId.COMPONENT_FAILED,
+                            message = "health probe failed",
+                            recoveryAttempts = attempt
+                        )
+                        watchdogManager.updateComponentStatus(
+                            component = managed.watchdogKey,
+                            status = WatchdogComponentStatus.FAILED,
+                            details = "health probe failed"
+                        )
+                        watchdogManager.requestRecovery(
+                            RecoveryRequest(
+                                component = managed.watchdogKey,
+                                reason = RecoveryReason.RESOURCE_LOST,
+                                details = "health probe failed for ${managed.component.name.lowercase()}",
+                                attempt = attempt
+                            )
+                        )
+                    }
+                }
+                watchdogManager.heartbeat(WATCHDOG_KEY)
+                retryBackoffScheduler.pause(HEARTBEAT_INTERVAL_MS)
+            }
+        }
+    }
+
+    private suspend fun registerWatchdogComponents() {
+        watchdogManager.registerComponent(WATCHDOG_KEY, timeoutMs = WATCHDOG_TIMEOUT_MS)
+        watchdogManager.updateComponentStatus(WATCHDOG_KEY, WatchdogComponentStatus.HEALTHY, "watchdog runtime active")
+        runtimeHealthRepository.mark(
+            component = RuntimeComponent.WATCHDOG,
+            status = ComponentHealthStatus.HEALTHY,
+            eventId = LogEventId.WATCHDOG_STARTED,
+            message = "watchdog active"
+        )
+
+        activeComponents.values.forEach { managed ->
+            watchdogManager.registerComponent(managed.watchdogKey, timeoutMs = managed.timeoutMs)
+            watchdogManager.updateComponentStatus(
+                component = managed.watchdogKey,
+                status = WatchdogComponentStatus.STARTING,
+                details = "component registered"
+            )
+        }
+    }
+
+    private suspend fun startComponent(component: RuntimeComponent) {
+        val managed = activeComponents[component] ?: return
+
+        runtimeHealthRepository.mark(
+            component = component,
+            status = ComponentHealthStatus.STARTING,
+            eventId = LogEventId.COMPONENT_STARTING,
+            message = "${component.name.lowercase()} starting"
+        )
+        watchdogManager.updateComponentStatus(
+            component = managed.watchdogKey,
+            status = WatchdogComponentStatus.STARTING,
+            details = "start requested"
+        )
+        logger.i(LogEventId.COMPONENT_STARTING, "Starting ${component.name}")
+
+        runCatching {
+            managed.start.invoke()
+        }.onSuccess {
+            recoveryAttempts[component] = 0
+            runtimeHealthRepository.mark(
+                component = component,
+                status = ComponentHealthStatus.HEALTHY,
+                eventId = LogEventId.COMPONENT_HEALTHY,
+                message = "${component.name.lowercase()} healthy"
+            )
+            watchdogManager.updateComponentStatus(
+                component = managed.watchdogKey,
+                status = WatchdogComponentStatus.HEALTHY,
+                details = "started"
+            )
+            watchdogManager.heartbeat(managed.watchdogKey)
+            logger.i(LogEventId.COMPONENT_HEALTHY, "${component.name} healthy")
+        }.onFailure { error ->
+            val attempt = (recoveryAttempts[component] ?: 0) + 1
+            recoveryAttempts[component] = attempt
+            runtimeHealthRepository.mark(
+                component = component,
+                status = ComponentHealthStatus.FAILED,
+                eventId = LogEventId.COMPONENT_FAILED,
+                message = "${component.name.lowercase()} failed: ${error.message}",
+                recoveryAttempts = attempt
+            )
+            watchdogManager.updateComponentStatus(
+                component = managed.watchdogKey,
+                status = WatchdogComponentStatus.FAILED,
+                details = error.message
+            )
+            logger.e(LogEventId.COMPONENT_FAILED, error, "${component.name} start failed")
+            watchdogManager.requestRecovery(
+                RecoveryRequest(
+                    component = managed.watchdogKey,
+                    reason = RecoveryReason.START_FAILURE,
+                    details = "start failure: ${error.message}",
+                    attempt = attempt
+                )
+            )
+        }
+    }
+
+    private suspend fun stopComponent(component: RuntimeComponent) {
+        val managed = activeComponents[component] ?: return
+        runtimeHealthRepository.mark(
+            component = component,
+            status = ComponentHealthStatus.STOPPING,
+            eventId = LogEventId.COMPONENT_STOPPING,
+            message = "${component.name.lowercase()} stopping"
+        )
+        logger.i(LogEventId.COMPONENT_STOPPING, "Stopping ${component.name}")
+
+        runCatching {
+            managed.stop.invoke()
+        }.onFailure { error ->
+            logger.e(LogEventId.COMPONENT_FAILED, error, "${component.name} stop failed")
+        }
+
+        runtimeHealthRepository.mark(
+            component = component,
+            status = ComponentHealthStatus.STOPPED,
+            eventId = LogEventId.COMPONENT_STOPPED,
+            message = "${component.name.lowercase()} stopped"
+        )
+        watchdogManager.updateComponentStatus(
+            component = managed.watchdogKey,
+            status = WatchdogComponentStatus.STOPPED,
+            details = "stopped"
+        )
+    }
+
+    private suspend fun recoverComponent(component: RuntimeComponent, request: RecoveryRequest) {
+        val managed = activeComponents[component] ?: return
+        val mutex = componentLocks.getValue(component)
+
+        mutex.withLock {
+            if (!isRunning.get()) return
+
+            var attempt = (recoveryAttempts[component] ?: 0)
+
+            while (isRunning.get()) {
+                attempt += 1
+                recoveryAttempts[component] = attempt
+
+                val useCooldown = attempt > recoveryPolicy.maxAttemptsBeforeCooldown
+                val delayMs = if (useCooldown) recoveryPolicy.cooldownMs else recoveryPolicy.nextDelayMs(attempt)
+
+                runtimeHealthRepository.mark(
+                    component = component,
+                    status = ComponentHealthStatus.RECOVERING,
+                    eventId = LogEventId.RECOVERY_SCHEDULED,
+                    message = "recovery in ${delayMs} ms (${request.reason})",
+                    recoveryAttempts = attempt
+                )
+
+                if (useCooldown) {
+                    logger.w(
+                        LogEventId.RECOVERY_COOLDOWN,
+                        "Recovery cooldown for ${component.name}: ${delayMs}ms"
+                    )
+                } else {
+                    logger.w(
+                        LogEventId.RECOVERY_SCHEDULED,
+                        "Recovery scheduled for ${component.name} in ${delayMs}ms, attempt=$attempt"
+                    )
+                }
+
+                retryBackoffScheduler.pause(delayMs)
+                if (!isRunning.get()) return
+
+                logger.i(LogEventId.RECOVERY_ATTEMPT, "Recovery attempt for ${component.name}, attempt=$attempt")
+
+                val recovered = runCatching {
+                    managed.stop.invoke()
+                    managed.start.invoke()
+                }.fold(
+                    onSuccess = { true },
+                    onFailure = { error ->
+                        logger.e(
+                            LogEventId.RECOVERY_FAILED,
+                            error,
+                            "Recovery attempt failed for ${component.name}, attempt=$attempt"
+                        )
+                        false
+                    }
+                )
+
+                if (recovered) {
+                    recoveryAttempts[component] = 0
+                    runtimeHealthRepository.mark(
+                        component = component,
+                        status = ComponentHealthStatus.HEALTHY,
+                        eventId = LogEventId.RECOVERY_SUCCEEDED,
+                        message = "recovery succeeded",
+                        recoveryAttempts = attempt
+                    )
+                    watchdogManager.updateComponentStatus(
+                        component = managed.watchdogKey,
+                        status = WatchdogComponentStatus.HEALTHY,
+                        details = "recovered"
+                    )
+                    watchdogManager.heartbeat(managed.watchdogKey)
+                    logger.i(LogEventId.RECOVERY_SUCCEEDED, "Recovery succeeded for ${component.name}")
+                    return
+                }
+
+                if (useCooldown) {
+                    attempt = 0
+                    recoveryAttempts[component] = 0
+                }
+            }
+        }
+    }
+
+    private fun buildActiveComponents(
+        settings: com.zcam.core.domain.config.RuntimeSettings
+    ): Map<RuntimeComponent, ManagedComponent> {
+        val flags = settings.featureFlags
+        val map = linkedMapOf<RuntimeComponent, ManagedComponent>()
+
+        map[RuntimeComponent.SERVER] = ManagedComponent(
+            component = RuntimeComponent.SERVER,
+            watchdogKey = SERVER_KEY,
+            timeoutMs = 25_000L,
+            start = { localHttpServer.start(settings.serverPort) },
+            stop = { localHttpServer.stop() },
+            healthCheck = { localHttpServer.isHealthy() }
+        )
+
+        if (flags.mjpegStreaming) {
+            map[RuntimeComponent.CAMERA] = ManagedComponent(
+                component = RuntimeComponent.CAMERA,
+                watchdogKey = CAMERA_KEY,
+                timeoutMs = 25_000L,
+                start = { cameraRuntime.start(settings.stream) },
+                stop = { cameraRuntime.stop() },
+                healthCheck = { cameraRuntime.isHealthy() }
+            )
+        }
+
+        if (flags.audioPushToTalk || flags.audioLive || flags.audioPlayback) {
+            map[RuntimeComponent.AUDIO] = ManagedComponent(
+                component = RuntimeComponent.AUDIO,
+                watchdogKey = AUDIO_KEY,
+                timeoutMs = 30_000L,
+                start = { pushToTalkManager.start() },
+                stop = { pushToTalkManager.stop() },
+                healthCheck = { pushToTalkManager.isHealthy() }
+            )
+        }
+
+        if (flags.loopRecording) {
+            map[RuntimeComponent.STORAGE] = ManagedComponent(
+                component = RuntimeComponent.STORAGE,
+                watchdogKey = STORAGE_KEY,
+                timeoutMs = 40_000L,
+                start = { loopRecordingManager.start(settings.recording) },
+                stop = { loopRecordingManager.stop() },
+                healthCheck = { loopRecordingManager.isHealthy() }
+            )
+        }
+
+        return map
+    }
+
+    private fun startOrder(): List<RuntimeComponent> = listOf(
+        RuntimeComponent.SERVER,
+        RuntimeComponent.CAMERA,
+        RuntimeComponent.AUDIO,
+        RuntimeComponent.STORAGE
+    )
+
+    private fun stopOrder(): List<RuntimeComponent> = startOrder().asReversed()
+
+    private data class ManagedComponent(
+        val component: RuntimeComponent,
+        val watchdogKey: String,
+        val timeoutMs: Long,
+        val start: suspend () -> Unit,
+        val stop: suspend () -> Unit,
+        val healthCheck: suspend () -> Boolean
+    )
+
+    private companion object {
+        const val HEARTBEAT_INTERVAL_MS = 2_000L
+        const val WATCHDOG_TIMEOUT_MS = WatchdogComponentHealth.DEFAULT_HEARTBEAT_TIMEOUT_MS
+
+        const val WATCHDOG_KEY = "watchdog"
+        const val SERVER_KEY = "server"
+        const val CAMERA_KEY = "camera"
+        const val AUDIO_KEY = "audio"
+        const val STORAGE_KEY = "storage"
     }
 }

@@ -25,7 +25,6 @@ android {
 
 dependencies {
     implementation(project(":core"))
-    implementation(project(":data"))
 
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.hilt.android)

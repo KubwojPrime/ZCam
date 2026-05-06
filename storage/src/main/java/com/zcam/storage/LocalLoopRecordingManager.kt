@@ -2,6 +2,7 @@
 
 import android.content.Context
 import com.zcam.core.dispatchers.DispatcherProvider
+import com.zcam.core.domain.config.LoopRecordingConfig
 import com.zcam.core.logging.ZCamLogger
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
@@ -22,21 +23,23 @@ class LocalLoopRecordingManager @Inject constructor(
     private val logger: ZCamLogger
 ) : LoopRecordingManager {
 
-    private val policy = RecordingPolicy()
     private val scope = CoroutineScope(SupervisorJob() + dispatchers.io)
     private var loopJob: Job? = null
+    private var activeConfig: LoopRecordingConfig = LoopRecordingConfig()
 
-    override suspend fun start() = withContext(dispatchers.io) {
+    override suspend fun start(config: LoopRecordingConfig) = withContext(dispatchers.io) {
+        activeConfig = config
         if (loopJob?.isActive == true) return@withContext
+
         val recordingDir = recordingDir()
         recordingDir.mkdirs()
 
         loopJob = scope.launch {
-            logger.i("Loop recording started")
+            logger.i("Loop recording started with ${activeConfig.segmentMinutes} minute segments")
             while (isActive) {
                 writeSegmentMarker(recordingDir)
-                enforceRetention(recordingDir)
-                delay(policy.segmentLength.inWholeMilliseconds)
+                enforceRetention(recordingDir, activeConfig)
+                delay(activeConfig.segmentMinutes * 60_000L)
             }
         }
     }
@@ -47,6 +50,14 @@ class LocalLoopRecordingManager @Inject constructor(
         logger.i("Loop recording stopped")
     }
 
+    override suspend fun forceRetentionSweep() = withContext(dispatchers.io) {
+        enforceRetention(recordingDir(), activeConfig)
+    }
+
+    override suspend fun isHealthy(): Boolean = withContext(dispatchers.io) {
+        loopJob?.isActive == true
+    }
+
     private fun recordingDir(): File = File(context.filesDir, "zcam_recordings")
 
     private fun writeSegmentMarker(dir: File) {
@@ -54,13 +65,16 @@ class LocalLoopRecordingManager @Inject constructor(
         file.writeText("segment placeholder")
     }
 
-    private fun enforceRetention(dir: File) {
+    private fun enforceRetention(dir: File, config: LoopRecordingConfig) {
+        val maxStorageBytes = config.maxStorageGb.toLong() * 1024L * 1024L * 1024L
+        val minFreeBytes = config.minFreeStorageGb.toLong() * 1024L * 1024L * 1024L
+
         val files = dir.listFiles()?.sortedBy { it.lastModified() } ?: emptyList()
         var totalSize = files.sumOf { it.length() }
 
         for (file in files) {
             val free = dir.usableSpace
-            if (totalSize <= policy.maxStorageBytes && free >= policy.minFreeBytes) {
+            if (totalSize <= maxStorageBytes && free >= minFreeBytes) {
                 break
             }
             totalSize -= file.length()

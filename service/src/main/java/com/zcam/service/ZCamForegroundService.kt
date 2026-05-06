@@ -9,7 +9,10 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import com.zcam.core.logging.LogEventId
 import com.zcam.core.logging.ZCamLogger
+import com.zcam.core.logging.e
+import com.zcam.core.logging.i
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -31,7 +34,7 @@ class ZCamForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        logger.i("Foreground service created")
+        logger.i(LogEventId.SERVICE_CREATED, "Foreground service created")
         ensureNotificationChannel()
     }
 
@@ -39,19 +42,27 @@ class ZCamForegroundService : Service() {
         val action = intent?.action ?: ServiceCommands.ACTION_START
         when (action) {
             ServiceCommands.ACTION_STOP -> {
-                logger.i("Foreground service stop requested")
+                logger.i(LogEventId.SERVICE_STOP_REQUESTED, "Foreground service stop requested")
                 serviceScope.launch {
-                    runtimeCoordinator.stop()
+                    runCatching {
+                        runtimeCoordinator.stop(persistDesiredState = true)
+                    }.onFailure { error ->
+                        logger.e(LogEventId.COMPONENT_FAILED, error, "Runtime stop failed")
+                    }
                     stopSelf()
                 }
                 return START_NOT_STICKY
             }
 
             else -> {
-                logger.i("Foreground service start requested")
+                logger.i(LogEventId.SERVICE_START_REQUESTED, "Foreground service start requested")
                 startForegroundRuntime()
                 serviceScope.launch {
-                    runtimeCoordinator.start()
+                    runCatching {
+                        runtimeCoordinator.start()
+                    }.onFailure { error ->
+                        logger.e(LogEventId.COMPONENT_FAILED, error, "Runtime start failed")
+                    }
                 }
                 return START_STICKY
             }
@@ -60,7 +71,11 @@ class ZCamForegroundService : Service() {
 
     override fun onDestroy() {
         CoroutineScope(Dispatchers.IO).launch {
-            runtimeCoordinator.stop()
+            runCatching {
+                runtimeCoordinator.stop(persistDesiredState = false)
+            }.onFailure { error ->
+                logger.e(LogEventId.COMPONENT_FAILED, error, "Runtime forced stop failed")
+            }
         }
         serviceScope.cancel()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)

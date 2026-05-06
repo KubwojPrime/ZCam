@@ -1,6 +1,7 @@
 ﻿package com.zcam.camera
 
-interface CameraRuntime {
-    suspend fun start()
-    suspend fun stop()
+import com.zcam.core.domain.mjpeg.MjpegStreamingEngine
+
+interface CameraRuntime : MjpegStreamingEngine {
+    suspend fun isHealthy(): Boolean
 }

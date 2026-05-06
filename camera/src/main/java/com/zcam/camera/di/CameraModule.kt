@@ -2,6 +2,7 @@
 
 import com.zcam.camera.CameraRuntime
 import com.zcam.camera.CameraRuntimeImpl
+import com.zcam.camera.FramePipelineStatusSource
 import com.zcam.camera.MjpegFrameSource
 import dagger.Binds
 import dagger.Module
@@ -20,4 +21,8 @@ abstract class CameraModule {
     @Binds
     @Singleton
     abstract fun bindFrameSource(impl: CameraRuntimeImpl): MjpegFrameSource
+
+    @Binds
+    @Singleton
+    abstract fun bindFramePipelineStatusSource(impl: CameraRuntimeImpl): FramePipelineStatusSource
 }
