@@ -21,6 +21,7 @@ import com.zcam.service.ZCamRuntimeCoordinator
 import com.zcam.storage.LoopRecordingManager
 import com.zcam.watchdog.WatchdogManager
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -35,11 +36,13 @@ import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import kotlin.time.Duration.Companion.seconds
 
 class ZCamRuntimeCoordinatorRecoveryTest {
 
+    @OptIn(ExperimentalCoroutinesApi::class)
     @Test
-    fun recovers_failed_component_with_retry_backoff() = runTest {
+    fun recovers_failed_component_with_retry_backoff() = runTest(timeout = 20.seconds) {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val dispatchers = TestDispatcherProvider(dispatcher)
 
@@ -76,20 +79,77 @@ class ZCamRuntimeCoordinatorRecoveryTest {
         )
 
         coordinator.start()
-        advanceTimeBy(50)
+        try {
+            advanceTimeBy(200)
 
-        assertTrue(flakyServer.startCalls >= 3)
-        assertTrue(scheduler.recordedDelays.any { it >= 5 })
-        assertEquals(true, runtimeState.desiredState.value.shouldRun)
-        assertEquals(
-            ComponentHealthStatus.HEALTHY,
-            coordinator.health.value.components.getValue(RuntimeComponent.SERVER).status
-        )
-
-        coordinator.stop(persistDesiredState = true)
-        advanceUntilIdle()
+            assertTrue(flakyServer.startCalls >= 3)
+            assertTrue(scheduler.recordedDelays.any { it >= 5 })
+            assertEquals(true, runtimeState.desiredState.value.shouldRun)
+            assertEquals(
+                ComponentHealthStatus.HEALTHY,
+                coordinator.health.value.components.getValue(RuntimeComponent.SERVER).status
+            )
+        } finally {
+            coordinator.stop(persistDesiredState = true)
+            advanceUntilIdle()
+        }
 
         assertEquals(false, runtimeState.desiredState.value.shouldRun)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun recovers_storage_component_after_storage_failure() = runTest(timeout = 20.seconds) {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val dispatchers = TestDispatcherProvider(dispatcher)
+
+        val server = FlakyServer(failuresBeforeSuccess = 0)
+        val flakyStorage = FlakyLoopRecordingManager(failuresBeforeSuccess = 2)
+        val watchdog = FakeWatchdogManager()
+        val runtimeState = FakeRuntimeStateRepository()
+        val runtimeSettings = FakeRuntimeSettingsRepository(
+            RuntimeSettingsDefaults.value.copy(
+                featureFlags = FeatureFlags(
+                    mjpegStreaming = false,
+                    loopRecording = true,
+                    audioPushToTalk = false,
+                    audioLive = false,
+                    audioPlayback = false,
+                    trustedDevices = true,
+                    watchdogRecovery = true
+                )
+            )
+        )
+        val scheduler = RecordingBackoffScheduler()
+        val coordinator = ZCamRuntimeCoordinator(
+            cameraRuntime = NoopCameraRuntime(),
+            localHttpServer = server,
+            pushToTalkManager = NoopAudioManager(),
+            loopRecordingManager = flakyStorage,
+            watchdogManager = watchdog,
+            runtimeSettingsRepository = runtimeSettings,
+            runtimeStateRepository = runtimeState,
+            runtimeHealthRepository = InMemoryRuntimeHealthRepository(),
+            recoveryPolicy = RecoveryPolicy(baseDelayMs = 5, maxDelayMs = 40, maxAttemptsBeforeCooldown = 4, cooldownMs = 100),
+            retryBackoffScheduler = scheduler,
+            dispatchers = dispatchers,
+            logger = NoopLogger()
+        )
+
+        coordinator.start()
+        try {
+            advanceTimeBy(250)
+
+            assertTrue(flakyStorage.startCalls >= 3)
+            assertTrue(scheduler.recordedDelays.any { it >= 5 })
+            assertEquals(
+                ComponentHealthStatus.HEALTHY,
+                coordinator.health.value.components.getValue(RuntimeComponent.STORAGE).status
+            )
+        } finally {
+            coordinator.stop(persistDesiredState = true)
+            advanceUntilIdle()
+        }
     }
 
     private class TestDispatcherProvider(
@@ -130,7 +190,10 @@ class ZCamRuntimeCoordinatorRecoveryTest {
                 components = emptyMap()
             )
         )
-        private val _events = MutableSharedFlow<RecoveryRequest>(extraBufferCapacity = 16)
+        private val _events = MutableSharedFlow<RecoveryRequest>(
+            replay = 1,
+            extraBufferCapacity = 16
+        )
 
         override val health: StateFlow<WatchdogHealthSnapshot> = _health.asStateFlow()
         override val recoveryEvents: Flow<RecoveryRequest> = _events.asSharedFlow()
@@ -181,12 +244,41 @@ class ZCamRuntimeCoordinatorRecoveryTest {
     }
 
     private class RecordingBackoffScheduler : RetryBackoffScheduler {
-        val recordedDelays = mutableListOf<Long>()
+        val recordedDelays = ArrayDeque<Long>()
 
         override suspend fun pause(millis: Long) {
-            recordedDelays += millis
-            delay(1)
+            if (recordedDelays.size >= 512) {
+                recordedDelays.removeFirst()
+            }
+            recordedDelays.addLast(millis)
+            delay(millis.coerceAtLeast(1L))
         }
+    }
+
+    private class FlakyLoopRecordingManager(
+        private var failuresBeforeSuccess: Int
+    ) : LoopRecordingManager {
+        var startCalls: Int = 0
+            private set
+        private var healthy = false
+
+        override suspend fun start(config: com.zcam.core.domain.config.LoopRecordingConfig) {
+            startCalls += 1
+            if (failuresBeforeSuccess > 0) {
+                failuresBeforeSuccess -= 1
+                healthy = false
+                throw IllegalStateException("simulated storage start failure")
+            }
+            healthy = true
+        }
+
+        override suspend fun stop() {
+            healthy = false
+        }
+
+        override suspend fun isHealthy(): Boolean = healthy
+
+        override suspend fun forceRetentionSweep() = Unit
     }
 
     private class FakeRuntimeStateRepository : RuntimeStateRepository {

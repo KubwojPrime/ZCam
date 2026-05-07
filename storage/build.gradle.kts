@@ -25,10 +25,14 @@ android {
 
 dependencies {
     implementation(project(":core"))
+    implementation(project(":camera"))
 
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.hilt.android)
     kapt(libs.hilt.compiler)
+
+    testImplementation(libs.junit4)
+    testImplementation(libs.kotlinx.coroutines.test)
 }
 
 kapt {

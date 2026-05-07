@@ -11,6 +11,13 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.FileOutputOptions
+import androidx.camera.video.Quality
+import androidx.camera.video.QualitySelector
+import androidx.camera.video.Recorder
+import androidx.camera.video.Recording
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
@@ -19,11 +26,14 @@ import com.zcam.core.dispatchers.DispatcherProvider
 import com.zcam.core.domain.config.StreamConfig
 import com.zcam.core.logging.ZCamLogger
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.nio.ByteBuffer
 import java.util.Base64
 import java.util.concurrent.Executor
@@ -42,7 +52,7 @@ class CameraRuntimeImpl @Inject constructor(
     @ApplicationContext private val appContext: Context,
     private val dispatchers: DispatcherProvider,
     private val logger: ZCamLogger
-) : CameraRuntime, MjpegFrameSource, FramePipelineStatusSource {
+) : CameraRuntime, MjpegFrameSource, FramePipelineStatusSource, VideoRecordingPipeline {
 
     private val latest = AtomicReference(PLACEHOLDER_JPEG)
     private val running = AtomicBoolean(false)
@@ -58,6 +68,7 @@ class CameraRuntimeImpl @Inject constructor(
     private val producedFrames = AtomicLong(0L)
     private val droppedFrames = AtomicLong(0L)
     private val lastFrameEpochMs = AtomicLong(0L)
+    private val analysisEnabled = AtomicBoolean(true)
 
     @Volatile
     private var cameraProvider: ProcessCameraProvider? = null
@@ -65,6 +76,16 @@ class CameraRuntimeImpl @Inject constructor(
     private var previewUseCase: Preview? = null
     @Volatile
     private var analysisUseCase: ImageAnalysis? = null
+    @Volatile
+    private var videoCaptureUseCase: VideoCapture<Recorder>? = null
+
+    private val recordingMutex = Mutex()
+    @Volatile
+    private var activeRecording: Recording? = null
+    @Volatile
+    private var activeRecordingFile: File? = null
+    @Volatile
+    private var activeRecordingFinalize: CompletableDeferred<VideoSegmentResult>? = null
 
     override suspend fun start(config: StreamConfig) {
         bindMutex.withLock {
@@ -77,6 +98,7 @@ class CameraRuntimeImpl @Inject constructor(
             producedFrames.set(0L)
             droppedFrames.set(0L)
             lastFrameEpochMs.set(0L)
+            analysisEnabled.set(true)
 
             val provider = awaitCameraProvider()
             val encoder = Nv21JpegEncoder()
@@ -98,20 +120,44 @@ class CameraRuntimeImpl @Inject constructor(
                     .setTargetResolution(Size(config.resolution.width, config.resolution.height))
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_NV21)
                     .build()
+                val recorder = Recorder.Builder()
+                    .setExecutor(cameraExecutor)
+                    .setQualitySelector(
+                        QualitySelector.fromOrderedList(
+                            listOf(Quality.HD, Quality.FHD, Quality.SD, Quality.LOWEST)
+                        )
+                    )
+                    .build()
+                val videoCapture = VideoCapture.withOutput(recorder)
 
                 analysis.setAnalyzer(cameraExecutor) { image ->
                     analyzeFrame(image, encoder, minFrameIntervalMs)
                 }
 
-                provider.bindToLifecycle(
-                    lifecycleOwner,
-                    CameraSelector.DEFAULT_BACK_CAMERA,
-                    preview,
-                    analysis
-                )
+                runCatching {
+                    provider.bindToLifecycle(
+                        lifecycleOwner,
+                        CameraSelector.DEFAULT_BACK_CAMERA,
+                        preview,
+                        analysis,
+                        videoCapture
+                    )
+                }.recoverCatching {
+                    // Some devices cannot handle Preview + Analysis + Video together.
+                    analysis.clearAnalyzer()
+                    provider.unbindAll()
+                    analysisEnabled.set(false)
+                    provider.bindToLifecycle(
+                        lifecycleOwner,
+                        CameraSelector.DEFAULT_BACK_CAMERA,
+                        preview,
+                        videoCapture
+                    )
+                }.getOrThrow()
 
                 previewUseCase = preview
                 analysisUseCase = analysis
+                videoCaptureUseCase = videoCapture
             }
 
             cameraProvider = provider
@@ -125,20 +171,35 @@ class CameraRuntimeImpl @Inject constructor(
             if (!running.get()) return
 
             logger.i("Camera runtime stop requested")
+            val pendingFile = activeRecordingFile
+            val finalize = recordingMutex.withLock {
+                activeRecording?.stop()
+                activeRecording = null
+                activeRecordingFile = null
+                val pendingFinalize = activeRecordingFinalize
+                activeRecordingFinalize = null
+                pendingFinalize
+            }
+            if (finalize != null && !finalize.isCompleted) {
+                finalize.complete(buildTimeoutResult(message = "camera runtime stopped", file = pendingFile))
+            }
             runOnMainExecutor {
                 analysisUseCase?.clearAnalyzer()
                 cameraProvider?.unbindAll()
                 lifecycleOwner.moveToCreated()
                 previewUseCase = null
                 analysisUseCase = null
+                videoCaptureUseCase = null
                 cameraProvider = null
             }
+            analysisEnabled.set(false)
             running.set(false)
         }
     }
 
     override suspend fun isHealthy(): Boolean {
         if (!running.get()) return false
+        if (!analysisEnabled.get()) return true
         val lastFrameAt = lastFrameEpochMs.get()
         if (lastFrameAt == 0L) return false
         return (System.currentTimeMillis() - lastFrameAt) <= HEALTHY_FRAME_AGE_MS
@@ -156,6 +217,86 @@ class CameraRuntimeImpl @Inject constructor(
         lastFrameEpochMs = lastFrameEpochMs.get()
     )
 
+    override suspend fun startVideoSegment(outputFile: File) {
+        recordingMutex.withLock {
+            check(running.get()) { "Camera runtime is not active." }
+            check(activeRecording == null) { "Video segment recording already active." }
+
+            val videoCapture = videoCaptureUseCase ?: error("VideoCapture is not bound.")
+            outputFile.parentFile?.mkdirs()
+
+            val finalizeDeferred = CompletableDeferred<VideoSegmentResult>()
+            activeRecordingFinalize = finalizeDeferred
+            activeRecordingFile = outputFile
+
+            val recording = videoCapture.output
+                .prepareRecording(
+                    appContext,
+                    FileOutputOptions.Builder(outputFile).build()
+                )
+                .start(mainExecutor) { event ->
+                    if (event is VideoRecordEvent.Finalize) {
+                        val result = VideoSegmentResult(
+                            file = outputFile,
+                            success = event.error == VideoRecordEvent.Finalize.ERROR_NONE,
+                            finalizedAtEpochMs = System.currentTimeMillis(),
+                            bytesWritten = outputFile.length(),
+                            errorCode = if (event.error == VideoRecordEvent.Finalize.ERROR_NONE) null else event.error,
+                            errorMessage = event.cause?.message
+                        )
+                        if (!finalizeDeferred.isCompleted) {
+                            finalizeDeferred.complete(result)
+                        }
+                        activeRecording = null
+                        activeRecordingFile = null
+                    }
+                }
+
+            activeRecording = recording
+        }
+    }
+
+    override suspend fun stopVideoSegment(timeoutMs: Long): VideoSegmentResult {
+        val finalize = recordingMutex.withLock {
+            val pendingFinalize = activeRecordingFinalize ?: error("No active video segment recording.")
+            val recording = activeRecording
+            recording?.stop()
+            pendingFinalize
+        }
+
+        val result = withTimeoutOrNull(timeoutMs) {
+            finalize.await()
+        } ?: buildTimeoutResult()
+
+        recordingMutex.withLock {
+            activeRecording = null
+            activeRecordingFile = null
+            activeRecordingFinalize = null
+        }
+        return result
+    }
+
+    override suspend fun abortVideoSegment() {
+        var pendingFile: File? = null
+        val finalize = recordingMutex.withLock {
+            val recording = activeRecording
+            val pendingFinalize = activeRecordingFinalize
+            pendingFile = activeRecordingFile
+            activeRecording = null
+            activeRecordingFile = null
+            activeRecordingFinalize = null
+            recording?.stop()
+            pendingFinalize
+        }
+        if (finalize != null && !finalize.isCompleted) {
+            finalize.complete(buildTimeoutResult(message = "segment aborted", file = pendingFile))
+        }
+    }
+
+    override suspend fun isVideoSegmentActive(): Boolean {
+        return recordingMutex.withLock { activeRecording != null }
+    }
+
     private suspend fun awaitCameraProvider(): ProcessCameraProvider = withContext(dispatchers.io) {
         suspendCancellableCoroutine { continuation ->
             val future = ProcessCameraProvider.getInstance(appContext)
@@ -169,6 +310,23 @@ class CameraRuntimeImpl @Inject constructor(
             )
         }
     }
+
+    private fun buildTimeoutResult(
+        message: String = "segment finalize timeout",
+        file: File? = activeRecordingFile
+    ): VideoSegmentResult {
+        val safeFile = file ?: File(recordingDirFallback(), "unknown_segment.mp4")
+        return VideoSegmentResult(
+            file = safeFile,
+            success = false,
+            finalizedAtEpochMs = System.currentTimeMillis(),
+            bytesWritten = safeFile.length(),
+            errorCode = null,
+            errorMessage = message
+        )
+    }
+
+    private fun recordingDirFallback(): File = File(appContext.filesDir, "zcam_recordings")
 
     private suspend fun <T> runOnMainExecutor(block: () -> T): T {
         return suspendCancellableCoroutine { continuation ->

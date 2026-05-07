@@ -4,6 +4,7 @@ import com.zcam.camera.CameraRuntime
 import com.zcam.camera.CameraRuntimeImpl
 import com.zcam.camera.FramePipelineStatusSource
 import com.zcam.camera.MjpegFrameSource
+import com.zcam.camera.VideoRecordingPipeline
 import dagger.Binds
 import dagger.Module
 import dagger.hilt.InstallIn
@@ -25,4 +26,8 @@ abstract class CameraModule {
     @Binds
     @Singleton
     abstract fun bindFramePipelineStatusSource(impl: CameraRuntimeImpl): FramePipelineStatusSource
+
+    @Binds
+    @Singleton
+    abstract fun bindVideoRecordingPipeline(impl: CameraRuntimeImpl): VideoRecordingPipeline
 }
