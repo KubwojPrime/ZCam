@@ -1,4 +1,4 @@
-﻿plugins {
+plugins {
     alias(libs.plugins.android.library)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.kapt)
@@ -26,12 +26,17 @@ android {
 dependencies {
     implementation(project(":core"))
     implementation(project(":camera"))
+    implementation(project(":audio"))
     implementation(project(":security"))
 
     implementation(libs.nanohttpd)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.hilt.android)
     kapt(libs.hilt.compiler)
+
+    testImplementation(libs.junit4)
+    testImplementation(libs.okhttp)
+    testImplementation(libs.kotlinx.coroutines.test)
 }
 
 kapt {

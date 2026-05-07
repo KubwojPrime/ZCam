@@ -23,7 +23,7 @@ ZCam to lokalna aplikacja Android (LAN only) zaprojektowana pod pracę 24/7.
 - `audio` - push-to-talk manager (szkielet runtime)
 - `storage` - loop recording manager z retencją segmentów
 - `watchdog` - heartbeat monitoring i wykrywanie zastałych komponentów
-- `security` - LAN access policy + PIN/token + trusted devices
+- `security` - LAN access policy + PIN/token + trusted devices + QR pairing + token rotation/revocation
 - `client` - lokalny klient HTTP do sprawdzania serwera
 - `service` - foreground runtime coordinator + `ZCamForegroundService`
 - `data` - DataStore runtime settings + feature flags + trusted devices
@@ -38,7 +38,13 @@ ZCam to lokalna aplikacja Android (LAN only) zaprojektowana pod pracę 24/7.
 5. Coordinator wykonuje recovery z retry/backoff/cooldown.
 6. Server wystawia LAN-only endpointy:
    - `GET /health`
-   - `GET /mjpeg`
+   - `GET /video` (`/mjpeg` alias)
+   - `GET /snapshot.jpg`
+   - `GET /api/status`
+   - `GET /api/security/pair/qr`
+   - `POST /api/security/pair`
+   - `POST /api/security/token/rotate`
+   - `POST /api/security/token/revoke`
 
 ## Runtime Health i Recovery
 
@@ -89,6 +95,14 @@ Walidacja odbywa się przez `RuntimeSettingsValidator` przed zapisem do DataStor
 - Feature flags są silnie typowane (`FeatureFlag`, `FeatureFlags`) i zmieniane tylko przez allowlist (`FeatureFlagGuard`).
 - Trusted devices są serializowane bezpiecznie (Base64 URL-safe) i walidowane przed utrwaleniem.
 
+## Lokalny Model Security
+
+- `LAN-only`: każde żądanie HTTP jest odrzucane, jeśli IP klienta nie jest z dozwolonych zakresów LAN/VPN.
+- `PIN + token`: pairing urządzenia wymaga poprawnego PIN-u i jednorazowego challenge, a endpointy runtime wymagają tokenu API.
+- `Trusted devices`: urządzenia są rejestrowane lokalnie w `DataStore` i egzekwowane podczas autoryzacji.
+- `QR pairing`: serwer generuje challenge (`sessionId`, `pairingCode`, payload `zcam://pair?...`) do sparowania klienta.
+- `Token lifecycle`: obsługa rotacji i odwoływania tokenów + sanity-check po restarcie (naprawa uszkodzonego stanu auth).
+
 ## Testy Jednostkowe
 
 - kontrakty/use-case: `core/src/test/.../DomainUseCasesContractTest.kt`
@@ -98,6 +112,8 @@ Walidacja odbywa się przez `RuntimeSettingsValidator` przed zapisem do DataStor
 - recovery policy: `service/src/test/.../RecoveryPolicyTest.kt`
 - recovery runtime coordinator: `service/src/test/.../ZCamRuntimeCoordinatorRecoveryTest.kt`
 - watchdog stale->recovery: `watchdog/src/test/.../ProcessWatchdogManagerRecoveryTest.kt`
+- security: `security/src/test/.../LanAccessPolicyTest.kt`, `security/src/test/.../LocalSecurityManagerNegativeTest.kt`
+- security endpointy: `server/src/test/.../ZCamSecurityEndpointsIntegrationTest.kt`
 
 ## Decyzje Techniczne Pod 24/7
 

@@ -1,17 +1,18 @@
 [versions]
 agp = "8.13.2"
 kotlin = "2.0.21"
-coreKtx = "1.18.0"
-activityCompose = "1.13.0"
-lifecycle = "2.10.0"
-composeBom = "2026.03.00"
+coreKtx = "1.15.0"
+activityCompose = "1.10.1"
+lifecycle = "2.8.7"
+composeBom = "2025.02.00"
 coroutines = "1.10.2"
-camerax = "1.6.0"
-datastore = "1.2.1"
+camerax = "1.5.2"
+datastore = "1.1.1"
 hilt = "2.51.1"
 timber = "5.0.1"
 okhttp = "4.12.0"
 nanohttpd = "2.3.1"
+material = "1.12.0"
 junit4 = "4.13.2"
 guava = "33.2.1-android"
 
@@ -41,6 +42,7 @@ hilt-compiler = { group = "com.google.dagger", name = "hilt-android-compiler", v
 timber = { group = "com.jakewharton.timber", name = "timber", version.ref = "timber" }
 okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
 nanohttpd = { group = "org.nanohttpd", name = "nanohttpd", version.ref = "nanohttpd" }
+google-material = { group = "com.google.android.material", name = "material", version.ref = "material" }
 junit4 = { group = "junit", name = "junit", version.ref = "junit4" }
 guava = { group = "com.google.guava", name = "guava", version.ref = "guava" }
 

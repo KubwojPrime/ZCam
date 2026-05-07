@@ -357,6 +357,37 @@ class ZCamRuntimeCoordinatorRecoveryTest {
         override suspend fun stopLiveListen() = Unit
         override suspend fun startPlayback(source: com.zcam.core.domain.audio.PlaybackSource) = Unit
         override suspend fun stopPlayback() = Unit
+        override suspend fun handleLiveMode(
+            mode: com.zcam.audio.AudioLiveMode,
+            enabled: Boolean
+        ): com.zcam.audio.AudioCommandResult {
+            return com.zcam.audio.AudioCommandResult.Success(snapshotState(), "ok")
+        }
+
+        override suspend fun playStoredAudio(
+            request: com.zcam.audio.AudioPlaybackRequest
+        ): com.zcam.audio.AudioCommandResult {
+            return com.zcam.audio.AudioCommandResult.Success(snapshotState(), "ok")
+        }
+
+        override suspend fun setVolume(levelPercent: Int): com.zcam.audio.AudioCommandResult {
+            return com.zcam.audio.AudioCommandResult.Success(snapshotState(), "ok")
+        }
+
+        override fun snapshotState(): com.zcam.audio.AudioStateSnapshot {
+            return com.zcam.audio.AudioStateSnapshot(
+                engineStarted = true,
+                transmitting = false,
+                liveListening = false,
+                playingBack = false,
+                activeClipId = null,
+                volumePercent = 40,
+                minVolumePercent = 0,
+                maxVolumePercent = 85,
+                aversiveCooldownMs = 10_000L,
+                aversiveCooldownRemainingMs = 0L
+            )
+        }
     }
 
     private class NoopLoopRecordingManager : LoopRecordingManager {

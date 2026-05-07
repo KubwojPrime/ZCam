@@ -1,10 +1,15 @@
-﻿package com.zcam.audio
+package com.zcam.audio
 
 import com.zcam.core.dispatchers.DispatcherProvider
 import com.zcam.core.domain.audio.PlaybackSource
+import com.zcam.core.logging.LogEventId
 import com.zcam.core.logging.ZCamLogger
+import com.zcam.core.logging.i
+import com.zcam.core.logging.w
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -14,61 +19,259 @@ class AndroidPushToTalkManager @Inject constructor(
     private val logger: ZCamLogger
 ) : PushToTalkManager {
 
-    private val engineStarted = AtomicBoolean(false)
-    private val transmitting = AtomicBoolean(false)
-    private val liveListening = AtomicBoolean(false)
-    private val playingBack = AtomicBoolean(false)
+    private val stateMutex = Mutex()
+    private val snapshot = AtomicReference(
+        AudioStateSnapshot(
+            engineStarted = false,
+            transmitting = false,
+            liveListening = false,
+            playingBack = false,
+            activeClipId = null,
+            volumePercent = DEFAULT_VOLUME_PERCENT,
+            minVolumePercent = MIN_VOLUME_PERCENT,
+            maxVolumePercent = MAX_VOLUME_PERCENT,
+            aversiveCooldownMs = AVERSIVE_COOLDOWN_MS,
+            aversiveCooldownRemainingMs = 0L
+        )
+    )
+
+    private var engineStarted: Boolean = false
+    private var transmitting: Boolean = false
+    private var liveListening: Boolean = false
+    private var playingBack: Boolean = false
+    private var activeClipId: String? = null
+    private var volumePercent: Int = DEFAULT_VOLUME_PERCENT
+    private var lastAversivePlaybackAtEpochMs: Long = 0L
 
     override suspend fun start() = withContext(dispatchers.io) {
-        engineStarted.set(true)
-        logger.i("Audio engine started")
+        stateMutex.withLock {
+            if (engineStarted) return@withLock
+            engineStarted = true
+            transmitting = false
+            liveListening = false
+            playingBack = false
+            activeClipId = null
+            updateSnapshotLocked()
+            logger.i(LogEventId.AUDIO_ENGINE_STARTED, "Audio engine started")
+        }
     }
 
     override suspend fun stop() = withContext(dispatchers.io) {
-        engineStarted.set(false)
-        transmitting.set(false)
-        liveListening.set(false)
-        playingBack.set(false)
-        logger.i("Audio engine stopped")
+        stateMutex.withLock {
+            engineStarted = false
+            transmitting = false
+            liveListening = false
+            playingBack = false
+            activeClipId = null
+            updateSnapshotLocked()
+            logger.i(LogEventId.AUDIO_ENGINE_STOPPED, "Audio engine stopped")
+        }
     }
 
     override suspend fun isHealthy(): Boolean = withContext(dispatchers.io) {
-        engineStarted.get()
+        snapshot.get().engineStarted
     }
 
-    override suspend fun beginPushToTalk() = withContext(dispatchers.io) {
-        if (transmitting.compareAndSet(false, true)) {
-            logger.d("PTT transmit begin")
-        }
+    override suspend fun beginPushToTalk() {
+        handleLiveMode(AudioLiveMode.PUSH_TO_TALK, enabled = true)
     }
 
-    override suspend fun endPushToTalk() = withContext(dispatchers.io) {
-        if (transmitting.compareAndSet(true, false)) {
-            logger.d("PTT transmit end")
-        }
+    override suspend fun endPushToTalk() {
+        handleLiveMode(AudioLiveMode.PUSH_TO_TALK, enabled = false)
     }
 
-    override suspend fun beginLiveListen() = withContext(dispatchers.io) {
-        if (liveListening.compareAndSet(false, true)) {
-            logger.d("Audio live listen begin")
-        }
+    override suspend fun beginLiveListen() {
+        handleLiveMode(AudioLiveMode.LIVE_MONITOR, enabled = true)
     }
 
-    override suspend fun stopLiveListen() = withContext(dispatchers.io) {
-        if (liveListening.compareAndSet(true, false)) {
-            logger.d("Audio live listen end")
-        }
+    override suspend fun stopLiveListen() {
+        handleLiveMode(AudioLiveMode.LIVE_MONITOR, enabled = false)
     }
 
-    override suspend fun startPlayback(source: PlaybackSource) = withContext(dispatchers.io) {
-        if (playingBack.compareAndSet(false, true)) {
-            logger.d("Audio playback start from $source")
+    override suspend fun startPlayback(source: PlaybackSource) {
+        val clipId = when (source) {
+            PlaybackSource.LIVE -> "legacy_live"
+            PlaybackSource.ARCHIVE -> "legacy_archive"
         }
+        playStoredAudio(
+            AudioPlaybackRequest(
+                clipId = clipId,
+                category = AudioPlaybackCategory.STANDARD
+            )
+        )
     }
 
     override suspend fun stopPlayback() = withContext(dispatchers.io) {
-        if (playingBack.compareAndSet(true, false)) {
-            logger.d("Audio playback stop")
+        stateMutex.withLock {
+            if (!engineStarted) return@withLock
+            if (playingBack) {
+                playingBack = false
+                activeClipId = null
+                updateSnapshotLocked()
+                logger.i(LogEventId.AUDIO_PLAYBACK_STOPPED, "Audio playback stopped")
+            }
         }
+    }
+
+    override suspend fun handleLiveMode(mode: AudioLiveMode, enabled: Boolean): AudioCommandResult =
+        withContext(dispatchers.io) {
+            stateMutex.withLock {
+                if (!engineStarted) {
+                    return@withLock rejectLocked(
+                        code = AudioCommandErrorCode.ENGINE_NOT_READY,
+                        message = "audio engine not started"
+                    )
+                }
+
+                when (mode) {
+                    AudioLiveMode.PUSH_TO_TALK -> {
+                        if (enabled && liveListening) {
+                            return@withLock rejectLocked(
+                                code = AudioCommandErrorCode.CONFLICT,
+                                message = "cannot start push-to-talk while live monitoring is active"
+                            )
+                        }
+                        transmitting = enabled
+                    }
+                    AudioLiveMode.LIVE_MONITOR -> {
+                        if (enabled && transmitting) {
+                            return@withLock rejectLocked(
+                                code = AudioCommandErrorCode.CONFLICT,
+                                message = "cannot start live monitoring while push-to-talk is active"
+                            )
+                        }
+                        liveListening = enabled
+                    }
+                }
+
+                val updated = updateSnapshotLocked()
+                logger.i(
+                    LogEventId.AUDIO_LIVE_MODE_CHANGED,
+                    "Live mode ${mode.name.lowercase()} set to enabled=$enabled"
+                )
+                AudioCommandResult.Success(
+                    state = updated,
+                    message = "live mode updated"
+                )
+            }
+        }
+
+    override suspend fun playStoredAudio(request: AudioPlaybackRequest): AudioCommandResult =
+        withContext(dispatchers.io) {
+            stateMutex.withLock {
+                if (!engineStarted) {
+                    return@withLock rejectLocked(
+                        code = AudioCommandErrorCode.ENGINE_NOT_READY,
+                        message = "audio engine not started"
+                    )
+                }
+                if (!CLIP_ID_REGEX.matches(request.clipId)) {
+                    return@withLock rejectLocked(
+                        code = AudioCommandErrorCode.INVALID_ARGUMENT,
+                        message = "invalid clip id format"
+                    )
+                }
+
+                val now = System.currentTimeMillis()
+                if (request.category == AudioPlaybackCategory.AVERSIVE) {
+                    val remainingMs = remainingAversiveCooldownLocked(now)
+                    if (remainingMs > 0L) {
+                        logger.w(
+                            LogEventId.AUDIO_AVERSIVE_COOLDOWN_ACTIVE,
+                            "Aversive playback rejected for ${request.clipId}, cooldown remaining ${remainingMs}ms"
+                        )
+                        return@withLock rejectLocked(
+                            code = AudioCommandErrorCode.COOLDOWN_ACTIVE,
+                            message = "aversive playback cooldown active for ${remainingMs}ms",
+                            now = now
+                        )
+                    }
+                    lastAversivePlaybackAtEpochMs = now
+                }
+
+                playingBack = true
+                activeClipId = request.clipId
+                val updated = updateSnapshotLocked(now = now)
+                logger.i(
+                    LogEventId.AUDIO_PLAYBACK_STARTED,
+                    "Audio playback started clip=${request.clipId} category=${request.category.name.lowercase()}"
+                )
+                AudioCommandResult.Success(
+                    state = updated,
+                    message = "playback started"
+                )
+            }
+        }
+
+    override suspend fun setVolume(levelPercent: Int): AudioCommandResult = withContext(dispatchers.io) {
+        stateMutex.withLock {
+            if (!engineStarted) {
+                return@withLock rejectLocked(
+                    code = AudioCommandErrorCode.ENGINE_NOT_READY,
+                    message = "audio engine not started"
+                )
+            }
+            if (levelPercent !in MIN_VOLUME_PERCENT..MAX_VOLUME_PERCENT) {
+                return@withLock rejectLocked(
+                    code = AudioCommandErrorCode.INVALID_ARGUMENT,
+                    message = "volume must be between $MIN_VOLUME_PERCENT and $MAX_VOLUME_PERCENT"
+                )
+            }
+
+            volumePercent = levelPercent
+            val updated = updateSnapshotLocked()
+            logger.i(LogEventId.AUDIO_VOLUME_UPDATED, "Audio volume set to $levelPercent%")
+            AudioCommandResult.Success(
+                state = updated,
+                message = "volume updated"
+            )
+        }
+    }
+
+    override fun snapshotState(): AudioStateSnapshot = snapshot.get()
+
+    private fun rejectLocked(
+        code: AudioCommandErrorCode,
+        message: String,
+        now: Long = System.currentTimeMillis()
+    ): AudioCommandResult.Failure {
+        val current = updateSnapshotLocked(now = now)
+        return AudioCommandResult.Failure(
+            code = code,
+            state = current,
+            message = message
+        )
+    }
+
+    private fun updateSnapshotLocked(now: Long = System.currentTimeMillis()): AudioStateSnapshot {
+        val updated = AudioStateSnapshot(
+            engineStarted = engineStarted,
+            transmitting = transmitting,
+            liveListening = liveListening,
+            playingBack = playingBack,
+            activeClipId = activeClipId,
+            volumePercent = volumePercent,
+            minVolumePercent = MIN_VOLUME_PERCENT,
+            maxVolumePercent = MAX_VOLUME_PERCENT,
+            aversiveCooldownMs = AVERSIVE_COOLDOWN_MS,
+            aversiveCooldownRemainingMs = remainingAversiveCooldownLocked(now)
+        )
+        snapshot.set(updated)
+        return updated
+    }
+
+    private fun remainingAversiveCooldownLocked(now: Long): Long {
+        if (lastAversivePlaybackAtEpochMs <= 0L) return 0L
+        val elapsed = (now - lastAversivePlaybackAtEpochMs).coerceAtLeast(0L)
+        return (AVERSIVE_COOLDOWN_MS - elapsed).coerceAtLeast(0L)
+    }
+
+    private companion object {
+        val CLIP_ID_REGEX = Regex("^[A-Za-z0-9._-]{1,64}$")
+
+        const val MIN_VOLUME_PERCENT = 0
+        const val MAX_VOLUME_PERCENT = 85
+        const val DEFAULT_VOLUME_PERCENT = 40
+        const val AVERSIVE_COOLDOWN_MS = 10_000L
     }
 }
