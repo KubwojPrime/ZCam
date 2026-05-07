@@ -35,6 +35,9 @@ data class PairingUiState(
     val sessionId: String = "",
     val pairingCode: String = "",
     val qrPayload: String = "",
+    val payloadInput: String = "",
+    val resolvedHostPort: String = "",
+    val sourceLabel: String = "No pairing challenge loaded",
     val expiresAtEpochMs: Long = 0L,
     val pin: String = "",
     val deviceId: String = "",
@@ -57,6 +60,8 @@ data class ZCamUiState(
     val thermalTone: StatusTone = StatusTone.NEUTRAL,
     val recoveryLabel: String = "No active recovery",
     val recoveryTone: StatusTone = StatusTone.NEUTRAL,
+    val permissionsReady: Boolean = true,
+    val permissionsLabel: String = "Permissions ready",
     val componentStatuses: List<ComponentStatusUi> = emptyList(),
     val pttPressed: Boolean = false,
     val liveListenEnabled: Boolean = false,
@@ -70,6 +75,7 @@ data class ZCamUiState(
     val clientPort: String = "8080",
     val clientReachable: Boolean = false,
     val clientStatusLabel: String = "Client disconnected",
+    val serverLanHost: String = "",
     val pairing: PairingUiState = PairingUiState(
         pin = "",
         deviceId = "android-client",
@@ -82,6 +88,7 @@ data class ZCamUiState(
 sealed interface ZCamUiAction {
     data class ScreenChanged(val screen: ZCamScreen) : ZCamUiAction
     data class ModeChanged(val mode: ZCamMode) : ZCamUiAction
+    data object RequestPermissions : ZCamUiAction
     data object StartRuntime : ZCamUiAction
     data object StopRuntime : ZCamUiAction
     data object RefreshClientStatus : ZCamUiAction
@@ -94,6 +101,10 @@ sealed interface ZCamUiAction {
     data class VolumeChanged(val levelPercent: Int) : ZCamUiAction
 
     data object RequestPairingQr : ZCamUiAction
+    data class PairingPayloadChanged(val value: String) : ZCamUiAction
+    data object ApplyPairingPayload : ZCamUiAction
+    data class PairingSessionIdChanged(val value: String) : ZCamUiAction
+    data class PairingCodeChanged(val value: String) : ZCamUiAction
     data class PairingPinChanged(val value: String) : ZCamUiAction
     data class PairingDeviceIdChanged(val value: String) : ZCamUiAction
     data class PairingDisplayNameChanged(val value: String) : ZCamUiAction
