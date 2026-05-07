@@ -37,8 +37,10 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.net.URLDecoder
 import java.net.Inet4Address
 import java.net.NetworkInterface
+import java.nio.charset.StandardCharsets
 import javax.inject.Inject
 
 @HiltViewModel
@@ -120,6 +122,19 @@ class ZCamMainViewModel @Inject constructor(
 
             ZCamUiAction.SubmitPairing -> submitPairing()
             ZCamUiAction.ClearError -> _state.update { it.copy(errorMessage = null) }
+        }
+    }
+
+    fun onExternalPairingPayload(payload: String) {
+        viewModelScope.launch(dispatchers.io) {
+            _state.update { current ->
+                current.copy(
+                    mode = ZCamMode.CLIENT,
+                    screen = com.zcam.ui.ZCamScreen.PAIRING,
+                    pairing = current.pairing.copy(payloadInput = payload)
+                )
+            }
+            applyPairingPayloadFromInput()
         }
     }
 
@@ -420,6 +435,10 @@ class ZCamMainViewModel @Inject constructor(
                 _state.update { it.copy(errorMessage = "PIN, sessionId and pairingCode are required.") }
                 return@launch
             }
+            if (state.value.mode == ZCamMode.CLIENT && state.value.clientHost.isBlank()) {
+                _state.update { it.copy(errorMessage = "Set server host before pairing.") }
+                return@launch
+            }
 
             _state.update {
                 it.copy(pairing = it.pairing.copy(loading = true, resultMessage = "", resultTone = StatusTone.NEUTRAL))
@@ -570,23 +589,48 @@ class ZCamMainViewModel @Inject constructor(
     }
 
     private fun parsePairingPayload(payload: String): ParsedPairingPayload? {
-        val trimmed = payload.trim()
-        if (trimmed.isBlank()) return null
-        val uri = runCatching { Uri.parse(trimmed) }.getOrNull() ?: return null
-        if (!uri.scheme.equals("zcam", ignoreCase = true)) return null
-        if (!uri.host.equals("pair", ignoreCase = true)) return null
+        return runCatching {
+            val trimmed = payload.trim()
+            if (trimmed.isBlank()) return null
+            if (!trimmed.startsWith("zcam://", ignoreCase = true)) return null
+            val payloadWithoutScheme = trimmed.substringAfter("://", "")
+            if (!payloadWithoutScheme.startsWith("pair", ignoreCase = true)) return null
 
-        val sid = uri.getQueryParameter("sid") ?: uri.getQueryParameter("sessionId")
-        val code = uri.getQueryParameter("code") ?: uri.getQueryParameter("pairingCode")
-        val hostPortRaw = uri.getQueryParameter("host").orEmpty()
-        val (host, port) = parseHostPort(hostPortRaw)
+            val query = trimmed.substringAfter('?', "")
+            if (query.isBlank()) return null
+            val params = parseQueryParams(query)
 
-        return ParsedPairingPayload(
-            sessionId = sid?.ifBlank { null },
-            pairingCode = code?.ifBlank { null },
-            host = host,
-            port = port
-        )
+            val sid = params["sid"] ?: params["sessionid"] ?: params["session_id"]
+            val code = params["code"] ?: params["pairingcode"] ?: params["pairing_code"]
+            val hostPortRaw = params["host"].orEmpty()
+            val (host, port) = parseHostPort(hostPortRaw)
+            if (sid.isNullOrBlank() && code.isNullOrBlank()) return null
+
+            ParsedPairingPayload(
+                sessionId = sid?.ifBlank { null },
+                pairingCode = code?.ifBlank { null },
+                host = host,
+                port = port
+            )
+        }.getOrNull()
+    }
+
+    private fun parseQueryParams(query: String): Map<String, String> {
+        return query.split('&')
+            .mapNotNull { part ->
+                val separator = part.indexOf('=')
+                if (separator <= 0) return@mapNotNull null
+                val key = decodeComponent(part.substring(0, separator)).trim().lowercase()
+                val value = decodeComponent(part.substring(separator + 1)).trim()
+                if (key.isBlank()) null else key to value
+            }
+            .toMap()
+    }
+
+    private fun decodeComponent(value: String): String {
+        return runCatching {
+            URLDecoder.decode(value, StandardCharsets.UTF_8.name())
+        }.getOrDefault(value)
     }
 
     private fun parseHostPort(hostPort: String): Pair<String?, Int?> {

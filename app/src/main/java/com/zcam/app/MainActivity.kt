@@ -1,6 +1,7 @@
 package com.zcam.app
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -26,9 +27,11 @@ import dagger.hilt.android.AndroidEntryPoint
 class MainActivity : ComponentActivity() {
 
     private val viewModel: ZCamMainViewModel by viewModels()
+    private var lastHandledPayload: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        handlePairingIntent(intent)
 
         setContent {
             val state by viewModel.state.collectAsState()
@@ -77,6 +80,12 @@ class MainActivity : ComponentActivity() {
 
             ZCamHomeScreen(state = uiState, onAction = onAction)
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handlePairingIntent(intent)
     }
 
     private fun requiredPermissionsForMode(mode: ZCamMode): List<String> {
@@ -142,5 +151,13 @@ class MainActivity : ComponentActivity() {
             Manifest.permission.WRITE_EXTERNAL_STORAGE -> "Files"
             else -> permission
         }
+    }
+
+    private fun handlePairingIntent(intent: Intent?) {
+        val payload = intent?.dataString?.trim().orEmpty()
+        if (payload.isBlank()) return
+        if (payload == lastHandledPayload) return
+        lastHandledPayload = payload
+        viewModel.onExternalPairingPayload(payload)
     }
 }

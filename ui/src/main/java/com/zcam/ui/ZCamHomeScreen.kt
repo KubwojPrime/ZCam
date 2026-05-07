@@ -235,7 +235,7 @@ private fun ClientPairingScreen(
 ) {
     InfoCard(
         title = "Client pairing",
-        body = "Pair using QR or manually. Manual flow: enter Session ID and Pairing Code from server, then PIN, Device ID and Display name."
+        body = "Pair using QR or manually. Manual flow: set Server Host/Port, enter Session ID (ID), Pairing Code (CODE) and server PIN, then tap Pair device."
     )
     ClientSection(state = state, onAction = onAction)
 
@@ -254,6 +254,7 @@ private fun ClientPairingScreen(
             modifier = Modifier
                 .weight(1f)
                 .height(52.dp),
+            enabled = !state.pairing.loading,
             onClick = { onAction(ZCamUiAction.ApplyPairingPayload) }
         ) {
             Text("Apply payload")
@@ -262,6 +263,7 @@ private fun ClientPairingScreen(
             modifier = Modifier
                 .weight(1f)
                 .height(52.dp),
+            enabled = !state.pairing.loading,
             onClick = { onAction(ZCamUiAction.RequestPairingQr) }
         ) {
             Text("Fetch challenge")
@@ -278,14 +280,14 @@ private fun ClientPairingScreen(
         modifier = Modifier.fillMaxWidth(),
         value = state.pairing.sessionId,
         onValueChange = { onAction(ZCamUiAction.PairingSessionIdChanged(it)) },
-        label = { Text("Session ID") },
+        label = { Text("Session ID (ID)") },
         singleLine = true
     )
     OutlinedTextField(
         modifier = Modifier.fillMaxWidth(),
         value = state.pairing.pairingCode,
         onValueChange = { onAction(ZCamUiAction.PairingCodeChanged(it)) },
-        label = { Text("Pairing code") },
+        label = { Text("Pairing code (CODE)") },
         singleLine = true
     )
     OutlinedTextField(
@@ -317,9 +319,10 @@ private fun ClientPairingScreen(
         modifier = Modifier
             .fillMaxWidth()
             .height(56.dp),
+        enabled = !state.pairing.loading,
         onClick = { onAction(ZCamUiAction.SubmitPairing) }
     ) {
-        Text("Pair device")
+        Text(if (state.pairing.loading) "Pairing..." else "Pair device")
     }
 }
 
