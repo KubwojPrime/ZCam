@@ -1,31 +1,25 @@
 ﻿package com.zcam.app
 
-import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.viewModels
 import androidx.activity.compose.setContent
-import androidx.core.content.ContextCompat
-import com.zcam.service.ZCamForegroundService
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.collectAsState
 import com.zcam.ui.ZCamHomeScreen
 import dagger.hilt.android.AndroidEntryPoint
 
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
 
+    private val viewModel: ZCamMainViewModel by viewModels()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         setContent {
-            ZCamHomeScreen(
-                onStartService = {
-                    val intent = ZCamForegroundService.startIntent(this)
-                    ContextCompat.startForegroundService(this, intent)
-                },
-                onStopService = {
-                    val intent: Intent = ZCamForegroundService.stopIntent(this)
-                    startService(intent)
-                }
-            )
+            val state by viewModel.state.collectAsState()
+            ZCamHomeScreen(state = state, onAction = viewModel::onAction)
         }
     }
 }

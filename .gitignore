@@ -1,4 +1,11 @@
-﻿.gradle/
+.gradle/
+.gradle-user/
+.android-user/
+.android-prefs/
+.home/
+.tools/
+.idea/
+.kotlin/
 local.properties
 *.iml
 /build/

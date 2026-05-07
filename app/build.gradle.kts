@@ -59,6 +59,7 @@ dependencies {
     implementation(project(":ui"))
     implementation(project(":service"))
     implementation(project(":data"))
+    implementation(project(":client"))
     implementation(project(":security"))
     implementation(project(":watchdog"))
 
