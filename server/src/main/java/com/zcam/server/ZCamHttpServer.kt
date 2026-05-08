@@ -6,6 +6,9 @@ import com.zcam.audio.AudioLiveMode
 import com.zcam.audio.AudioPlaybackCategory
 import com.zcam.audio.AudioPlaybackRequest
 import com.zcam.audio.PushToTalkManager
+import com.zcam.camera.CameraControlCommandResult
+import com.zcam.camera.CameraControlErrorCode
+import com.zcam.camera.CameraControlManager
 import com.zcam.camera.FramePipelineStatusSource
 import com.zcam.camera.MjpegFrameSource
 import com.zcam.core.dispatchers.DispatcherProvider
@@ -19,13 +22,18 @@ import com.zcam.security.PairingResult
 import com.zcam.security.SecurityManager
 import com.zcam.security.TokenRevocationResult
 import com.zcam.security.TokenRotationResult
+import com.zcam.storage.LoopRecordingManager
+import com.zcam.storage.RecordingClipSummary
 import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
 import java.io.InputStream
+import java.net.Inet4Address
+import java.net.NetworkInterface
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
+import java.time.Instant
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
@@ -35,7 +43,9 @@ import javax.inject.Singleton
 class ZCamHttpServer @Inject constructor(
     private val frameSource: MjpegFrameSource,
     private val frameStatusSource: FramePipelineStatusSource,
+    private val cameraControlManager: CameraControlManager,
     private val pushToTalkManager: PushToTalkManager,
+    private val loopRecordingManager: LoopRecordingManager,
     private val securityManager: SecurityManager,
     private val dispatchers: DispatcherProvider,
     private val logger: ZCamLogger,
@@ -58,13 +68,17 @@ class ZCamHttpServer @Inject constructor(
         activePort = port
         val httpServer = object : NanoHTTPD(port) {
             override fun serve(session: IHTTPSession): Response {
+                val uri = session.uri.orEmpty()
+                val isPublic = isPublicEndpoint(uri, session.method)
                 val remoteIp = session.remoteIpAddress
-                if (!lanAccessPolicy.isLanClient(remoteIp)) {
+                val isLanOrVpnClient = lanAccessPolicy.isLanClient(remoteIp)
+                val allowPublicOverVpn = uri == "/api/security/pair/qr" || uri == "/api/security/pair"
+
+                if (!isLanOrVpnClient && isPublic && !allowPublicOverVpn) {
                     return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "LAN only")
                 }
 
-                val uri = session.uri.orEmpty()
-                if (!isPublicEndpoint(uri, session.method)) {
+                if (!isPublic) {
                     val auth = runBlocking {
                         securityManager.authorizeRequest(
                             tokenCandidate = extractToken(session),
@@ -76,6 +90,12 @@ class ZCamHttpServer @Inject constructor(
                             toStatus(auth.statusCode),
                             JSON_UTF8,
                             "{\"status\":\"error\",\"reason\":${jsonString(auth.reason)}}"
+                        )
+                    }
+                    if (!isLanOrVpnClient) {
+                        logger.w(
+                            LogEventId.SECURITY_AUTH_REJECTED,
+                            "Allowing authenticated request from non-LAN address $remoteIp for $uri"
                         )
                     }
                 }
@@ -108,12 +128,18 @@ class ZCamHttpServer @Inject constructor(
     }
 
     private fun routeRequest(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
-        return when (session.uri.orEmpty()) {
+        val uri = session.uri.orEmpty()
+        return when {
+            uri.startsWith("/api/recordings/") -> handleRecordingDownloadEndpoint(session)
+            else -> when (uri) {
             "/" -> buildPanelResponse()
             "/health" -> NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, NanoHTTPD.MIME_PLAINTEXT, "ok")
             "/api/status" -> buildStatusResponse()
+            "/api/recordings" -> handleRecordingsListEndpoint(session)
             "/video", "/mjpeg" -> buildVideoResponse()
             "/snapshot.jpg" -> buildSnapshotResponse()
+            "/api/torch" -> handleTorchEndpoint(session)
+            "/api/nightmode" -> handleNightModeEndpoint(session)
             "/api/audio/live" -> handleAudioLiveEndpoint(session)
             "/api/audio/play" -> handleAudioPlayEndpoint(session)
             "/api/volume" -> handleVolumeEndpoint(session)
@@ -122,6 +148,7 @@ class ZCamHttpServer @Inject constructor(
             "/api/security/token/rotate" -> handleTokenRotateEndpoint(session)
             "/api/security/token/revoke" -> handleTokenRevokeEndpoint(session)
             else -> NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.NOT_FOUND, NanoHTTPD.MIME_PLAINTEXT, "not found")
+            }
         }
     }
 
@@ -131,7 +158,7 @@ class ZCamHttpServer @Inject constructor(
         }
 
         val challenge = runBlocking { securityManager.createPairingChallenge() }
-        val host = session.headers["host"].orEmpty()
+        val host = resolvePairingHost(session.headers["host"])
         val payload = buildString {
             append("zcam://pair?")
             append("sid=").append(challenge.sessionId)
@@ -260,6 +287,34 @@ class ZCamHttpServer @Inject constructor(
         }
     }
 
+    private fun handleTorchEndpoint(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
+        if (session.method != NanoHTTPD.Method.POST) {
+            return methodNotAllowed("POST")
+        }
+
+        val payload = parsePostPayload(session) ?: return badRequest("request body is required")
+        val enabled = parseBoolean(valueOf(payload, "enabled"))
+            ?: parseActionToEnabled(valueOf(payload, "action"))
+            ?: return badRequest("missing enabled/action. expected enabled=true|false or action=start|stop")
+
+        val result = runBlocking { cameraControlManager.setTorch(enabled) }
+        return cameraControlResponse(result)
+    }
+
+    private fun handleNightModeEndpoint(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
+        if (session.method != NanoHTTPD.Method.POST) {
+            return methodNotAllowed("POST")
+        }
+
+        val payload = parsePostPayload(session) ?: return badRequest("request body is required")
+        val enabled = parseBoolean(valueOf(payload, "enabled"))
+            ?: parseActionToEnabled(valueOf(payload, "action"))
+            ?: return badRequest("missing enabled/action. expected enabled=true|false or action=start|stop")
+
+        val result = runBlocking { cameraControlManager.setNightMode(enabled) }
+        return cameraControlResponse(result)
+    }
+
     private fun handleAudioLiveEndpoint(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
         if (session.method != NanoHTTPD.Method.POST) {
             return methodNotAllowed("POST")
@@ -280,6 +335,42 @@ class ZCamHttpServer @Inject constructor(
 
         val result = runBlocking { pushToTalkManager.handleLiveMode(mode, enabled) }
         return audioCommandResponse(result)
+    }
+
+    private fun cameraControlResponse(result: CameraControlCommandResult): NanoHTTPD.Response {
+        val body = when (result) {
+            is CameraControlCommandResult.Success -> buildCameraControlResponseJson(
+                status = "ok",
+                code = null,
+                message = result.message,
+                snapshot = result.snapshot
+            )
+            is CameraControlCommandResult.Failure -> buildCameraControlResponseJson(
+                status = "error",
+                code = result.code.name.lowercase(),
+                message = result.message,
+                snapshot = result.snapshot
+            )
+        }
+
+        val status = when (result) {
+            is CameraControlCommandResult.Success -> NanoHTTPD.Response.Status.OK
+            is CameraControlCommandResult.Failure -> when (result.code) {
+                CameraControlErrorCode.ENGINE_NOT_READY -> NanoHTTPD.Response.Status.SERVICE_UNAVAILABLE
+                CameraControlErrorCode.UNSUPPORTED,
+                CameraControlErrorCode.CONFLICT -> NanoHTTPD.Response.Status.CONFLICT
+                CameraControlErrorCode.INTERNAL_ERROR -> NanoHTTPD.Response.Status.INTERNAL_ERROR
+            }
+        }
+
+        if (result is CameraControlCommandResult.Failure) {
+            logger.w(
+                LogEventId.COMPONENT_FAILED,
+                "Camera control rejected code=${result.code.name} message=${result.message}"
+            )
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(status, JSON_UTF8, body)
     }
 
     private fun handleAudioPlayEndpoint(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
@@ -327,6 +418,93 @@ class ZCamHttpServer @Inject constructor(
 
         val result = runBlocking { pushToTalkManager.setVolume(level) }
         return audioCommandResponse(result)
+    }
+
+    private fun handleRecordingsListEndpoint(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
+        if (session.method != NanoHTTPD.Method.GET) {
+            return methodNotAllowed("GET")
+        }
+        val rawFrom = firstQueryValue(session, "fromEpochMs")
+            ?: firstQueryValue(session, "from")
+            ?: firstQueryValue(session, "start")
+        val fromEpochMs = parseEpochParam(rawFrom)
+        if (rawFrom != null && fromEpochMs == null) {
+            return badRequest("invalid fromEpochMs/from/start")
+        }
+
+        val rawTo = firstQueryValue(session, "toEpochMs")
+            ?: firstQueryValue(session, "to")
+            ?: firstQueryValue(session, "end")
+        val toEpochMs = parseEpochParam(rawTo)
+        if (rawTo != null && toEpochMs == null) {
+            return badRequest("invalid toEpochMs/to/end")
+        }
+
+        if (fromEpochMs != null && toEpochMs != null && fromEpochMs > toEpochMs) {
+            return badRequest("from must be <= to")
+        }
+        val limit = (firstQueryValue(session, "limit")?.toIntOrNull() ?: DEFAULT_RECORDINGS_LIST_LIMIT)
+            .coerceIn(1, MAX_RECORDINGS_LIST_LIMIT)
+
+        val recordings = runBlocking {
+            loopRecordingManager.queryRecordings(
+                fromEpochMs = fromEpochMs,
+                toEpochMs = toEpochMs,
+                limit = limit
+            )
+        }
+
+        val body = buildString(capacity = 512 + recordings.size * 128) {
+            append('{')
+            append("\"status\":\"ok\",")
+            append("\"count\":").append(recordings.size).append(',')
+            append("\"recordings\":[")
+            recordings.forEachIndexed { index, clip ->
+                if (index > 0) append(',')
+                append(recordingClipJson(clip))
+            }
+            append("]")
+            append('}')
+        }
+        return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, JSON_UTF8, body)
+    }
+
+    private fun handleRecordingDownloadEndpoint(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
+        if (session.method != NanoHTTPD.Method.GET) {
+            return methodNotAllowed("GET")
+        }
+        val prefix = "/api/recordings/"
+        val encodedName = session.uri.orEmpty().removePrefix(prefix)
+        if (encodedName.isBlank()) return badRequest("recording file name is required")
+        val fileName = decodeComponent(encodedName).substringBefore('/')
+        if (fileName.isBlank()) return badRequest("recording file name is required")
+
+        val file = runBlocking { loopRecordingManager.resolveRecordingFile(fileName) }
+            ?: return NanoHTTPD.newFixedLengthResponse(
+                NanoHTTPD.Response.Status.NOT_FOUND,
+                JSON_UTF8,
+                "{\"status\":\"error\",\"reason\":\"recording_not_found\"}"
+            )
+
+        return runCatching {
+            NanoHTTPD.newFixedLengthResponse(
+                NanoHTTPD.Response.Status.OK,
+                "video/mp4",
+                file.inputStream(),
+                file.length()
+            ).apply {
+                addHeader("Cache-Control", "no-store")
+                addHeader("Content-Disposition", "inline; filename=\"${file.name}\"")
+                addHeader("Accept-Ranges", "bytes")
+            }
+        }.getOrElse { error ->
+            logger.e(LogEventId.COMPONENT_FAILED, error, "Failed to stream recording ${file.name}")
+            NanoHTTPD.newFixedLengthResponse(
+                NanoHTTPD.Response.Status.INTERNAL_ERROR,
+                JSON_UTF8,
+                "{\"status\":\"error\",\"reason\":\"recording_stream_failed\"}"
+            )
+        }
     }
 
     private fun audioCommandResponse(result: AudioCommandResult): NanoHTTPD.Response {
@@ -445,24 +623,109 @@ class ZCamHttpServer @Inject constructor(
         }
     }
 
+    private fun parseEpochParam(raw: String?): Long? {
+        val value = raw?.trim().orEmpty()
+        if (value.isEmpty()) return null
+        return value.toLongOrNull()?.takeIf { it >= 0L }
+            ?: runCatching { Instant.parse(value).toEpochMilli() }.getOrNull()
+    }
+
+    private fun recordingClipJson(clip: RecordingClipSummary): String {
+        return buildString(capacity = 192) {
+            append('{')
+            append("\"fileName\":").append(jsonString(clip.fileName)).append(',')
+            append("\"startedAtEpochMs\":").append(clip.startedAtEpochMs).append(',')
+            append("\"endedAtEpochMs\":").append(clip.endedAtEpochMs).append(',')
+            append("\"durationMs\":").append(clip.durationMs).append(',')
+            append("\"sizeBytes\":").append(clip.sizeBytes).append(',')
+            append("\"container\":").append(jsonString(clip.container)).append(',')
+            append("\"codec\":").append(jsonString(clip.codec))
+            append('}')
+        }
+    }
+
+    private fun resolvePairingHost(hostHeader: String?): String {
+        val normalized = hostHeader?.trim().orEmpty()
+        if (normalized.isBlank()) {
+            return fallbackPairingHost()
+        }
+
+        val host = normalized.substringBefore(':').trim()
+        val port = normalized.substringAfter(':', "")
+            .toIntOrNull()
+            ?.takeIf { it in 1..65535 }
+            ?: activePort
+
+        if (isLoopbackHost(host)) {
+            return fallbackPairingHost()
+        }
+        return "$host:$port"
+    }
+
+    private fun fallbackPairingHost(): String {
+        val lanHost = runCatching {
+            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return@runCatching null
+            while (interfaces.hasMoreElements()) {
+                val iface = interfaces.nextElement()
+                if (!iface.isUp || iface.isLoopback) continue
+
+                val addresses = iface.inetAddresses
+                while (addresses.hasMoreElements()) {
+                    val address = addresses.nextElement()
+                    if (address is Inet4Address && !address.isLoopbackAddress && address.isSiteLocalAddress) {
+                        return@runCatching address.hostAddress
+                    }
+                }
+            }
+            null
+        }.getOrNull()
+
+        return if (lanHost.isNullOrBlank()) {
+            "127.0.0.1:$activePort"
+        } else {
+            "$lanHost:$activePort"
+        }
+    }
+
+    private fun isLoopbackHost(host: String): Boolean {
+        val normalized = host.trim().lowercase()
+        return normalized == "127.0.0.1" ||
+            normalized == "localhost" ||
+            normalized == "0.0.0.0" ||
+            normalized == "::1"
+    }
+
     private fun extractToken(session: NanoHTTPD.IHTTPSession): String? {
         val headerLookup = session.headers.entries.associate { it.key.lowercase() to it.value }
         val bearer = headerLookup["authorization"]
             ?.takeIf { it.startsWith("Bearer ", ignoreCase = true) }
             ?.substring(7)
             ?.trim()
-        val token = bearer ?: headerLookup["x-zcam-token"] ?: headerLookup["x-api-token"]
+        val queryToken = firstQueryValue(session, "token")
+            ?: firstQueryValue(session, "x-zcam-token")
+            ?: firstQueryValue(session, "apiToken")
+        val token = bearer ?: headerLookup["x-zcam-token"] ?: headerLookup["x-api-token"] ?: queryToken
         return token?.trim()?.ifBlank { null }
     }
 
     private fun extractDeviceId(session: NanoHTTPD.IHTTPSession): String? {
         val headerLookup = session.headers.entries.associate { it.key.lowercase() to it.value }
-        return (headerLookup["x-zcam-device-id"] ?: headerLookup["x-device-id"])
+        val queryDeviceId = firstQueryValue(session, "deviceId")
+            ?: firstQueryValue(session, "x-zcam-device-id")
+        return (headerLookup["x-zcam-device-id"] ?: headerLookup["x-device-id"] ?: queryDeviceId)
+            ?.trim()
+            ?.ifBlank { null }
+    }
+
+    private fun firstQueryValue(session: NanoHTTPD.IHTTPSession, key: String): String? {
+        return session.parameters[key]
+            ?.firstOrNull()
             ?.trim()
             ?.ifBlank { null }
     }
 
     private fun isPublicEndpoint(uri: String, method: NanoHTTPD.Method): Boolean {
+        if (uri == "/") return true
         if (uri == "/health") return true
         if (uri == "/api/security/pair/qr" && method == NanoHTTPD.Method.GET) return true
         if (uri == "/api/security/pair" && method == NanoHTTPD.Method.POST) return true
@@ -553,6 +816,7 @@ class ZCamHttpServer @Inject constructor(
         val now = System.currentTimeMillis()
         val uptimeMs = (now - startedAtEpochMs.get()).coerceAtLeast(0L)
         val frame = frameStatusSource.snapshot()
+        val cameraControls = cameraControlManager.controlsSnapshot()
         val lastFrameAgeMs = if (frame.lastFrameEpochMs > 0L) {
             (now - frame.lastFrameEpochMs).coerceAtLeast(0L)
         } else {
@@ -579,7 +843,24 @@ class ZCamHttpServer @Inject constructor(
             append("\"lastFrameEpochMs\":").append(frame.lastFrameEpochMs).append(',')
             append("\"lastFrameAgeMs\":").append(lastFrameAgeMs)
             append("},")
+            append("\"cameraControls\":").append(cameraControlStateJson(cameraControls)).append(',')
             append("\"audio\":").append(audioStateJson(audio))
+            append('}')
+        }
+    }
+
+    private fun buildCameraControlResponseJson(
+        status: String,
+        code: String?,
+        message: String,
+        snapshot: com.zcam.camera.CameraControlsSnapshot
+    ): String {
+        return buildString(capacity = 384) {
+            append('{')
+            append("\"status\":\"").append(status).append("\",")
+            append("\"code\":").append(jsonString(code)).append(',')
+            append("\"message\":").append(jsonString(message)).append(',')
+            append("\"cameraControls\":").append(cameraControlStateJson(snapshot))
             append('}')
         }
     }
@@ -613,6 +894,18 @@ class ZCamHttpServer @Inject constructor(
             append("\"maxVolumePercent\":").append(state.maxVolumePercent).append(',')
             append("\"aversiveCooldownMs\":").append(state.aversiveCooldownMs).append(',')
             append("\"aversiveCooldownRemainingMs\":").append(state.aversiveCooldownRemainingMs)
+            append('}')
+        }
+    }
+
+    private fun cameraControlStateJson(state: com.zcam.camera.CameraControlsSnapshot): String {
+        return buildString(capacity = 192) {
+            append('{')
+            append("\"running\":").append(state.running).append(',')
+            append("\"torchEnabled\":").append(state.torchEnabled).append(',')
+            append("\"nightModeEnabled\":").append(state.nightModeEnabled).append(',')
+            append("\"lowLightBoostSupported\":").append(state.lowLightBoostSupported).append(',')
+            append("\"lastError\":").append(jsonString(state.lastError))
             append('}')
         }
     }
@@ -665,35 +958,307 @@ class ZCamHttpServer @Inject constructor(
             <head>
               <meta charset="utf-8">
               <meta name="viewport" content="width=device-width,initial-scale=1">
-              <title>ZCam</title>
+              <title>ZCam Local Panel</title>
               <style>
-                body { font-family: sans-serif; margin: 16px; background: #111; color: #eee; }
-                .card { max-width: 980px; margin: 0 auto; padding: 16px; background: #1b1b1b; border-radius: 8px; }
-                img { width: 100%; height: auto; border-radius: 6px; background: #000; }
-                a { color: #82cfff; }
-                pre { white-space: pre-wrap; word-break: break-word; background: #101010; padding: 12px; border-radius: 6px; }
+                :root {
+                  --bg: #0f1115;
+                  --card: #171a22;
+                  --card2: #11141b;
+                  --text: #e8ecf4;
+                  --muted: #9aa5b1;
+                  --accent: #2f8cff;
+                  --ok: #22c55e;
+                  --warn: #f59e0b;
+                  --err: #ef4444;
+                  --border: #2a3140;
+                }
+                * { box-sizing: border-box; }
+                body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--text); }
+                .wrap { max-width: 1080px; margin: 0 auto; padding: 14px; display: grid; gap: 12px; }
+                .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+                .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+                .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
+                .grid3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; }
+                .title { font-size: 18px; font-weight: 700; margin: 0 0 8px 0; }
+                .sub { color: var(--muted); font-size: 13px; margin: 0 0 10px 0; }
+                label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 4px; }
+                input, select, button { border-radius: 8px; border: 1px solid var(--border); background: var(--card2); color: var(--text); padding: 8px 10px; font-size: 14px; }
+                input[type=range] { padding: 0; }
+                button { cursor: pointer; }
+                button.primary { background: var(--accent); border-color: var(--accent); color: white; font-weight: 600; }
+                button.ok { border-color: #1f7a3f; }
+                button.warn { border-color: #8a5e00; }
+                button.err { border-color: #8a2424; }
+                img { width: 100%; height: auto; border-radius: 8px; background: #000; border: 1px solid var(--border); }
+                pre { margin: 0; background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; max-height: 260px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 12px; }
+                .chip { display: inline-block; border-radius: 999px; border: 1px solid var(--border); padding: 3px 8px; font-size: 12px; color: var(--muted); }
+                .okText { color: var(--ok); }
+                .warnText { color: var(--warn); }
+                .errText { color: var(--err); }
+                .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
               </style>
             </head>
             <body>
-              <div class="card">
-                <h1>ZCam</h1>
-                <p><a href="/snapshot.jpg" target="_blank">Open snapshot</a> | <a href="/api/status" target="_blank">Open status JSON</a></p>
-                <img src="/video" alt="ZCam stream">
-                <h2>Status</h2>
-                <pre id="status">loading...</pre>
+              <div class="wrap">
+                <div class="card">
+                  <h1 class="title">ZCam Local Emergency Panel</h1>
+                  <p class="sub">Local-only control panel. API auth: token + device ID (if trusted-devices policy requires it).</p>
+                  <div class="grid3">
+                    <div>
+                      <label for="tokenInput">API token</label>
+                      <input id="tokenInput" type="text" placeholder="zcam_..." />
+                    </div>
+                    <div>
+                      <label for="deviceIdInput">Device ID</label>
+                      <input id="deviceIdInput" type="text" placeholder="browser-console" />
+                    </div>
+                    <div>
+                      <label>&nbsp;</label>
+                      <div class="row">
+                        <button id="applyAuthBtn" class="primary" type="button">Apply Auth</button>
+                        <button id="clearAuthBtn" type="button">Clear</button>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="row" style="margin-top:8px;">
+                    <span class="chip mono" id="authState">auth: not set</span>
+                    <span class="chip mono" id="statusLine">status: unknown</span>
+                  </div>
+                </div>
+
+                <div class="grid2">
+                  <div class="card">
+                    <h2 class="title">Video</h2>
+                    <p class="sub">Preview stream uses query auth. For best stability keep one viewer open.</p>
+                    <div class="row" style="margin-bottom:8px;">
+                      <button id="reloadPreviewBtn" type="button">Reload preview</button>
+                      <a id="snapshotLink" class="chip" href="/snapshot.jpg" target="_blank">Open snapshot</a>
+                    </div>
+                    <img id="videoPreview" src="/video" alt="ZCam stream" />
+                  </div>
+
+                  <div class="card">
+                    <h2 class="title">Camera Controls</h2>
+                    <div class="row">
+                      <button class="ok" type="button" onclick="setTorch(true)">Torch ON</button>
+                      <button type="button" onclick="setTorch(false)">Torch OFF</button>
+                    </div>
+                    <div class="row" style="margin-top:8px;">
+                      <button class="ok" type="button" onclick="setNightMode(true)">Night mode ON</button>
+                      <button type="button" onclick="setNightMode(false)">Night mode OFF</button>
+                    </div>
+                    <p class="sub" style="margin-top:10px;">Night mode maps to CameraX low-light boost; may require FPS <= 30.</p>
+                  </div>
+                </div>
+
+                <div class="grid2">
+                  <div class="card">
+                    <h2 class="title">Audio Live</h2>
+                    <div class="row">
+                      <button class="ok" type="button" onclick="setAudioLive('ptt', true)">PTT ON</button>
+                      <button type="button" onclick="setAudioLive('ptt', false)">PTT OFF</button>
+                    </div>
+                    <div class="row" style="margin-top:8px;">
+                      <button class="ok" type="button" onclick="setAudioLive('live', true)">Live listen ON</button>
+                      <button type="button" onclick="setAudioLive('live', false)">Live listen OFF</button>
+                    </div>
+                  </div>
+
+                  <div class="card">
+                    <h2 class="title">Playback & Volume</h2>
+                    <div class="row">
+                      <button type="button" onclick="playSound('alert_chime', false)">Alert</button>
+                      <button type="button" onclick="playSound('door_knock', false)">Knock</button>
+                      <button class="warn" type="button" onclick="playSound('deterrent_1', true)">Deterrent</button>
+                    </div>
+                    <div class="row" style="margin-top:10px;">
+                      <input id="volumeRange" type="range" min="0" max="85" value="40" />
+                      <span id="volumeLabel" class="mono">40%</span>
+                      <button type="button" onclick="setVolumeNow()">Set volume</button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="card">
+                  <h2 class="title">Status JSON</h2>
+                  <pre id="statusJson">loading...</pre>
+                </div>
+
+                <div class="card">
+                  <h2 class="title">API Log</h2>
+                  <pre id="apiLog">ready</pre>
+                </div>
               </div>
               <script>
+                const tokenInput = document.getElementById('tokenInput');
+                const deviceIdInput = document.getElementById('deviceIdInput');
+                const authState = document.getElementById('authState');
+                const statusLine = document.getElementById('statusLine');
+                const statusJson = document.getElementById('statusJson');
+                const apiLog = document.getElementById('apiLog');
+                const videoPreview = document.getElementById('videoPreview');
+                const snapshotLink = document.getElementById('snapshotLink');
+                const volumeRange = document.getElementById('volumeRange');
+                const volumeLabel = document.getElementById('volumeLabel');
+
+                function readAuth() {
+                  return {
+                    token: tokenInput.value.trim(),
+                    deviceId: deviceIdInput.value.trim()
+                  };
+                }
+
+                function updateAuthState() {
+                  const auth = readAuth();
+                  const hasToken = !!auth.token;
+                  authState.textContent = hasToken
+                    ? 'auth: token set, device=' + (auth.deviceId || '-')
+                    : 'auth: not set';
+                }
+
+                function authHeaders() {
+                  const auth = readAuth();
+                  const headers = { 'Accept': 'application/json' };
+                  if (auth.token) headers['X-ZCam-Token'] = auth.token;
+                  if (auth.deviceId) headers['X-ZCam-Device-Id'] = auth.deviceId;
+                  return headers;
+                }
+
+                function authQuery() {
+                  const auth = readAuth();
+                  const query = new URLSearchParams();
+                  if (auth.token) query.set('token', auth.token);
+                  if (auth.deviceId) query.set('deviceId', auth.deviceId);
+                  const serialized = query.toString();
+                  return serialized ? ('?' + serialized) : '';
+                }
+
+                function applyPreviewSources() {
+                  const query = authQuery();
+                  videoPreview.src = '/video' + query;
+                  snapshotLink.href = '/snapshot.jpg' + query;
+                }
+
+                function appendLog(line) {
+                  const stamp = new Date().toISOString();
+                  apiLog.textContent = '[' + stamp + '] ' + line + '\n' + apiLog.textContent;
+                }
+
+                async function apiPost(path, payload) {
+                  const response = await fetch(path, {
+                    method: 'POST',
+                    headers: {
+                      ...authHeaders(),
+                      'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(payload)
+                  });
+                  const text = await response.text();
+                  let parsed = null;
+                  try {
+                    parsed = JSON.parse(text);
+                  } catch (_) {}
+                  appendLog(path + ' -> ' + response.status + ' ' + response.statusText + ' | ' + text.substring(0, 220));
+                  return { response, parsed, text };
+                }
+
                 async function refreshStatus() {
                   try {
-                    const response = await fetch('/api/status', { cache: 'no-store' });
-                    const data = await response.json();
-                    document.getElementById('status').textContent = JSON.stringify(data, null, 2);
+                    const response = await fetch('/api/status', {
+                      headers: authHeaders(),
+                      cache: 'no-store'
+                    });
+                    const text = await response.text();
+                    let data = {};
+                    try { data = JSON.parse(text); } catch (_) { data = { raw: text }; }
+                    statusJson.textContent = JSON.stringify(data, null, 2);
+                    const serverAlive = data?.server?.alive === true;
+                    const streamClients = data?.server?.streamClients ?? '?';
+                    const torch = data?.cameraControls?.torchEnabled;
+                    const night = data?.cameraControls?.nightModeEnabled;
+                    statusLine.textContent = 'status: http=' + response.status + ' alive=' + serverAlive + ' clients=' + streamClients + ' torch=' + torch + ' night=' + night;
+                    statusLine.className = 'chip mono ' + (response.ok ? 'okText' : 'errText');
                   } catch (error) {
-                    document.getElementById('status').textContent = 'status error: ' + error;
+                    statusJson.textContent = 'status error: ' + error;
+                    statusLine.textContent = 'status: request failed';
+                    statusLine.className = 'chip mono errText';
                   }
                 }
+
+                async function setTorch(enabled) {
+                  const { response, parsed } = await apiPost('/api/torch', { enabled });
+                  if (!response.ok) return;
+                  if (parsed && parsed.cameraControls) {
+                    statusLine.textContent = 'status: torch=' + parsed.cameraControls.torchEnabled + ' night=' + parsed.cameraControls.nightModeEnabled;
+                  }
+                  await refreshStatus();
+                }
+
+                async function setNightMode(enabled) {
+                  const { response, parsed } = await apiPost('/api/nightmode', { enabled });
+                  if (!response.ok) return;
+                  if (parsed && parsed.cameraControls) {
+                    statusLine.textContent = 'status: torch=' + parsed.cameraControls.torchEnabled + ' night=' + parsed.cameraControls.nightModeEnabled;
+                  }
+                  await refreshStatus();
+                }
+
+                async function setAudioLive(mode, enabled) {
+                  await apiPost('/api/audio/live', { mode, enabled });
+                  await refreshStatus();
+                }
+
+                async function playSound(clipId, aversive) {
+                  await apiPost('/api/audio/play', {
+                    clipId,
+                    category: aversive ? 'aversive' : 'standard'
+                  });
+                  await refreshStatus();
+                }
+
+                async function setVolumeNow() {
+                  await apiPost('/api/volume', { level: Number(volumeRange.value || '0') });
+                  await refreshStatus();
+                }
+
+                document.getElementById('applyAuthBtn').addEventListener('click', () => {
+                  localStorage.setItem('zcam.panel.token', tokenInput.value);
+                  localStorage.setItem('zcam.panel.deviceId', deviceIdInput.value);
+                  updateAuthState();
+                  applyPreviewSources();
+                  refreshStatus();
+                });
+
+                document.getElementById('clearAuthBtn').addEventListener('click', () => {
+                  tokenInput.value = '';
+                  deviceIdInput.value = '';
+                  localStorage.removeItem('zcam.panel.token');
+                  localStorage.removeItem('zcam.panel.deviceId');
+                  updateAuthState();
+                  applyPreviewSources();
+                  refreshStatus();
+                });
+
+                document.getElementById('reloadPreviewBtn').addEventListener('click', () => {
+                  applyPreviewSources();
+                });
+
+                volumeRange.addEventListener('input', () => {
+                  volumeLabel.textContent = volumeRange.value + '%';
+                });
+
+                // Boot
+                tokenInput.value = localStorage.getItem('zcam.panel.token') || '';
+                deviceIdInput.value = localStorage.getItem('zcam.panel.deviceId') || '';
+                updateAuthState();
+                applyPreviewSources();
                 refreshStatus();
-                setInterval(refreshStatus, 2000);
+                setInterval(refreshStatus, 3000);
+                window.setTorch = setTorch;
+                window.setNightMode = setNightMode;
+                window.setAudioLive = setAudioLive;
+                window.playSound = playSound;
+                window.setVolumeNow = setVolumeNow;
               </script>
             </body>
             </html>
@@ -712,6 +1277,8 @@ class ZCamHttpServer @Inject constructor(
         const val DEFAULT_PORT = 8080
         const val BOUNDARY = "zcamframe"
         const val JSON_UTF8 = "application/json; charset=utf-8"
+        const val DEFAULT_RECORDINGS_LIST_LIMIT = 120
+        const val MAX_RECORDINGS_LIST_LIMIT = 500
 
         val JSON_PAIR_REGEX =
             Regex("\"([^\"]+)\"\\s*:\\s*(\"(?:\\\\.|[^\"])*\"|true|false|null|-?\\d+(?:\\.\\d+)?)")

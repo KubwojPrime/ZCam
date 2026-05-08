@@ -7,7 +7,11 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.json.JSONObject
+import org.json.JSONArray
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -158,6 +162,85 @@ class OkHttpLocalClient @Inject constructor(
         }
     }
 
+    override suspend fun fetchRecordings(
+        target: ClientTarget,
+        fromEpochMs: Long?,
+        toEpochMs: Long?,
+        limit: Int
+    ): ClientCallResult<List<ClientRecordingSummary>> {
+        val base = "http://${target.host}:${target.port}/api/recordings"
+        val httpUrl = base.toHttpUrlOrNull()
+            ?: return ClientCallResult.Failure(code = null, reason = "invalid_target")
+        val urlBuilder = httpUrl.newBuilder()
+        fromEpochMs?.let { urlBuilder.addQueryParameter("fromEpochMs", it.toString()) }
+        toEpochMs?.let { urlBuilder.addQueryParameter("toEpochMs", it.toString()) }
+        urlBuilder.addQueryParameter("limit", limit.coerceIn(1, 500).toString())
+
+        val requestBuilder = Request.Builder()
+            .url(urlBuilder.build())
+            .header("Accept", "application/json")
+            .header("Connection", "close")
+
+        target.token?.takeIf { it.isNotBlank() }?.let { requestBuilder.header("X-ZCam-Token", it) }
+        target.deviceId?.takeIf { it.isNotBlank() }?.let { requestBuilder.header("X-ZCam-Device-Id", it) }
+
+        return withContext(dispatchers.io) {
+            runCatching {
+                client.newCall(requestBuilder.get().build()).execute().use { response ->
+                    val bodyString = response.body?.string().orEmpty()
+                    if (!response.isSuccessful) {
+                        return@use ClientCallResult.Failure(
+                            code = response.code,
+                            reason = extractErrorReason(bodyString) ?: "http_${response.code}",
+                            responseBody = bodyString
+                        )
+                    }
+
+                    val payload = if (bodyString.isBlank()) JSONObject() else JSONObject(bodyString)
+                    val items = payload.optJSONArray("recordings") ?: JSONArray()
+                    val recordings = buildList {
+                        for (index in 0 until items.length()) {
+                            val item = items.optJSONObject(index) ?: continue
+                            add(
+                                ClientRecordingSummary(
+                                    fileName = item.optString("fileName"),
+                                    startedAtEpochMs = item.optLong("startedAtEpochMs"),
+                                    endedAtEpochMs = item.optLong("endedAtEpochMs"),
+                                    durationMs = item.optLong("durationMs"),
+                                    sizeBytes = item.optLong("sizeBytes"),
+                                    container = item.optString("container"),
+                                    codec = item.optString("codec")
+                                )
+                            )
+                        }
+                    }
+                    ClientCallResult.Success(recordings)
+                }
+            }.getOrElse { error ->
+                logger.w("Fetch recordings failed: ${error.message}")
+                ClientCallResult.Failure(
+                    code = null,
+                    reason = "io_error",
+                    responseBody = error.message
+                )
+            }
+        }
+    }
+
+    override fun buildRecordingPlaybackUrl(target: ClientTarget, fileName: String): String {
+        val encodedName = URLEncoder.encode(fileName, StandardCharsets.UTF_8.name())
+        val base = "http://${target.host}:${target.port}/api/recordings/$encodedName"
+        val query = buildList {
+            target.token?.takeIf { it.isNotBlank() }?.let {
+                add("token=" + URLEncoder.encode(it, StandardCharsets.UTF_8.name()))
+            }
+            target.deviceId?.takeIf { it.isNotBlank() }?.let {
+                add("deviceId=" + URLEncoder.encode(it, StandardCharsets.UTF_8.name()))
+            }
+        }.joinToString("&")
+        return if (query.isBlank()) base else "$base?$query"
+    }
+
     private suspend fun executeAction(
         target: ClientTarget,
         path: String,
@@ -202,9 +285,15 @@ class OkHttpLocalClient @Inject constructor(
             }
         }.getOrElse { error ->
             logger.w("HTTP call failed path=$path error=${error.message}")
+            val reason = when (error) {
+                is java.net.UnknownHostException -> "host_not_found"
+                is java.net.ConnectException -> "connect_error"
+                is java.net.SocketTimeoutException -> "timeout"
+                else -> "io_error"
+            }
             ClientCallResult.Failure(
                 code = null,
-                reason = "io_error",
+                reason = reason,
                 responseBody = error.message
             )
         }

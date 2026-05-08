@@ -8,6 +8,8 @@ import com.zcam.core.domain.config.RuntimeSettings
 import com.zcam.core.domain.config.RuntimeSettingsDefaults
 import com.zcam.core.domain.config.TrustedDevice
 import com.zcam.core.domain.settings.RuntimeDesiredState
+import com.zcam.core.domain.settings.RuntimeCrashRepository
+import com.zcam.core.domain.settings.RuntimeCrashState
 import com.zcam.core.domain.settings.RuntimeSettingsRepository
 import com.zcam.core.domain.settings.RuntimeSettingsUpdateResult
 import com.zcam.core.domain.settings.RuntimeStateRepository
@@ -19,6 +21,7 @@ import com.zcam.core.logging.ZCamLogger
 import com.zcam.server.LocalHttpServer
 import com.zcam.service.ZCamRuntimeCoordinator
 import com.zcam.storage.LoopRecordingManager
+import com.zcam.storage.RecordingClipSummary
 import com.zcam.watchdog.WatchdogManager
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -32,10 +35,13 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.seconds
 
 class ZCamRuntimeCoordinatorRecoveryTest {
@@ -49,6 +55,8 @@ class ZCamRuntimeCoordinatorRecoveryTest {
         val flakyServer = FlakyServer(failuresBeforeSuccess = 2)
         val watchdog = FakeWatchdogManager()
         val runtimeState = FakeRuntimeStateRepository()
+        val runtimeCrash = FakeRuntimeCrashRepository()
+        val environmentMonitor = FakeRuntimeEnvironmentMonitor()
         val runtimeSettings = FakeRuntimeSettingsRepository(
             RuntimeSettingsDefaults.value.copy(
                 featureFlags = FeatureFlags(
@@ -69,7 +77,9 @@ class ZCamRuntimeCoordinatorRecoveryTest {
             pushToTalkManager = NoopAudioManager(),
             loopRecordingManager = NoopLoopRecordingManager(),
             watchdogManager = watchdog,
+            runtimeEnvironmentMonitor = environmentMonitor,
             runtimeSettingsRepository = runtimeSettings,
+            runtimeCrashRepository = runtimeCrash,
             runtimeStateRepository = runtimeState,
             runtimeHealthRepository = InMemoryRuntimeHealthRepository(),
             recoveryPolicy = RecoveryPolicy(baseDelayMs = 5, maxDelayMs = 40, maxAttemptsBeforeCooldown = 4, cooldownMs = 100),
@@ -107,6 +117,8 @@ class ZCamRuntimeCoordinatorRecoveryTest {
         val flakyStorage = FlakyLoopRecordingManager(failuresBeforeSuccess = 2)
         val watchdog = FakeWatchdogManager()
         val runtimeState = FakeRuntimeStateRepository()
+        val runtimeCrash = FakeRuntimeCrashRepository()
+        val environmentMonitor = FakeRuntimeEnvironmentMonitor()
         val runtimeSettings = FakeRuntimeSettingsRepository(
             RuntimeSettingsDefaults.value.copy(
                 featureFlags = FeatureFlags(
@@ -127,7 +139,9 @@ class ZCamRuntimeCoordinatorRecoveryTest {
             pushToTalkManager = NoopAudioManager(),
             loopRecordingManager = flakyStorage,
             watchdogManager = watchdog,
+            runtimeEnvironmentMonitor = environmentMonitor,
             runtimeSettingsRepository = runtimeSettings,
+            runtimeCrashRepository = runtimeCrash,
             runtimeStateRepository = runtimeState,
             runtimeHealthRepository = InMemoryRuntimeHealthRepository(),
             recoveryPolicy = RecoveryPolicy(baseDelayMs = 5, maxDelayMs = 40, maxAttemptsBeforeCooldown = 4, cooldownMs = 100),
@@ -150,6 +164,239 @@ class ZCamRuntimeCoordinatorRecoveryTest {
             coordinator.stop(persistDesiredState = true)
             advanceUntilIdle()
         }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun reconnect_event_triggers_server_recovery() = runTest(timeout = 20.seconds) {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val dispatchers = TestDispatcherProvider(dispatcher)
+
+        val server = FlakyServer(failuresBeforeSuccess = 0)
+        val watchdog = FakeWatchdogManager()
+        val runtimeState = FakeRuntimeStateRepository()
+        val runtimeCrash = FakeRuntimeCrashRepository()
+        val environmentMonitor = FakeRuntimeEnvironmentMonitor(
+            initialConnectivity = NetworkConnectivity(connected = true, transport = "wifi")
+        )
+        val runtimeSettings = FakeRuntimeSettingsRepository(
+            RuntimeSettingsDefaults.value.copy(
+                featureFlags = FeatureFlags(
+                    mjpegStreaming = false,
+                    loopRecording = false,
+                    audioPushToTalk = false,
+                    audioLive = false,
+                    audioPlayback = false,
+                    trustedDevices = true,
+                    watchdogRecovery = true
+                )
+            )
+        )
+        val coordinator = ZCamRuntimeCoordinator(
+            cameraRuntime = NoopCameraRuntime(),
+            localHttpServer = server,
+            pushToTalkManager = NoopAudioManager(),
+            loopRecordingManager = NoopLoopRecordingManager(),
+            watchdogManager = watchdog,
+            runtimeEnvironmentMonitor = environmentMonitor,
+            runtimeSettingsRepository = runtimeSettings,
+            runtimeCrashRepository = runtimeCrash,
+            runtimeStateRepository = runtimeState,
+            runtimeHealthRepository = InMemoryRuntimeHealthRepository(),
+            recoveryPolicy = RecoveryPolicy(baseDelayMs = 5, maxDelayMs = 40, maxAttemptsBeforeCooldown = 4, cooldownMs = 100),
+            retryBackoffScheduler = RecordingBackoffScheduler(),
+            dispatchers = dispatchers,
+            logger = NoopLogger()
+        )
+
+        coordinator.start()
+        try {
+            runCurrent()
+            environmentMonitor.setConnectivity(NetworkConnectivity(connected = false, transport = "none"))
+            runCurrent()
+            environmentMonitor.setConnectivity(NetworkConnectivity(connected = true, transport = "wifi"))
+            advanceTimeBy(120)
+            runCurrent()
+
+            assertTrue(server.startCalls >= 2)
+            assertEquals(
+                ComponentHealthStatus.HEALTHY,
+                coordinator.health.value.components.getValue(RuntimeComponent.NETWORK).status
+            )
+        } finally {
+            coordinator.stop(persistDesiredState = true)
+            advanceUntilIdle()
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun thermal_transitions_throttle_stream_and_suspend_recording() = runTest(timeout = 20.seconds) {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val dispatchers = TestDispatcherProvider(dispatcher)
+
+        val camera = TrackingCameraRuntime()
+        val recording = TrackingLoopRecordingManager()
+        val watchdog = FakeWatchdogManager()
+        val runtimeState = FakeRuntimeStateRepository()
+        val runtimeCrash = FakeRuntimeCrashRepository()
+        val environmentMonitor = FakeRuntimeEnvironmentMonitor(
+            initialThermal = ThermalBand.NOMINAL
+        )
+        val runtimeSettings = FakeRuntimeSettingsRepository(
+            RuntimeSettingsDefaults.value.copy(
+                stream = RuntimeSettingsDefaults.value.stream.copy(fps = 15),
+                featureFlags = FeatureFlags(
+                    mjpegStreaming = true,
+                    loopRecording = true,
+                    audioPushToTalk = false,
+                    audioLive = false,
+                    audioPlayback = false,
+                    trustedDevices = true,
+                    watchdogRecovery = true
+                )
+            )
+        )
+        val coordinator = ZCamRuntimeCoordinator(
+            cameraRuntime = camera,
+            localHttpServer = FlakyServer(failuresBeforeSuccess = 0),
+            pushToTalkManager = NoopAudioManager(),
+            loopRecordingManager = recording,
+            watchdogManager = watchdog,
+            runtimeEnvironmentMonitor = environmentMonitor,
+            runtimeSettingsRepository = runtimeSettings,
+            runtimeCrashRepository = runtimeCrash,
+            runtimeStateRepository = runtimeState,
+            runtimeHealthRepository = InMemoryRuntimeHealthRepository(),
+            recoveryPolicy = RecoveryPolicy(baseDelayMs = 5, maxDelayMs = 40, maxAttemptsBeforeCooldown = 4, cooldownMs = 100),
+            retryBackoffScheduler = RecordingBackoffScheduler(),
+            dispatchers = dispatchers,
+            logger = NoopLogger()
+        )
+
+        coordinator.start()
+        try {
+            runCurrent()
+            environmentMonitor.setThermal(ThermalBand.THROTTLED)
+            advanceTimeBy(100)
+            environmentMonitor.setThermal(ThermalBand.CRITICAL)
+            advanceTimeBy(100)
+            environmentMonitor.setThermal(ThermalBand.NOMINAL)
+            advanceTimeBy(120)
+
+            assertTrue(camera.startConfigs.size >= 3)
+            val throttled = camera.startConfigs.firstOrNull { it.fps <= 10 }
+            assertTrue(throttled != null)
+            assertTrue(recording.stopCalls >= 1)
+            assertTrue(recording.startCalls >= 2)
+            assertEquals(
+                ComponentHealthStatus.HEALTHY,
+                coordinator.health.value.components.getValue(RuntimeComponent.THERMAL).status
+            )
+        } finally {
+            coordinator.stop(persistDesiredState = true)
+            advanceUntilIdle()
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun remains_stable_over_24h_virtual_runtime() = runTest(timeout = 30.seconds) {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val dispatchers = TestDispatcherProvider(dispatcher)
+
+        val server = FlakyServer(failuresBeforeSuccess = 0)
+        val watchdog = FakeWatchdogManager()
+        val runtimeState = FakeRuntimeStateRepository()
+        val runtimeCrash = FakeRuntimeCrashRepository()
+        val environmentMonitor = FakeRuntimeEnvironmentMonitor()
+        val runtimeSettings = FakeRuntimeSettingsRepository(
+            RuntimeSettingsDefaults.value.copy(
+                featureFlags = FeatureFlags(
+                    mjpegStreaming = false,
+                    loopRecording = false,
+                    audioPushToTalk = false,
+                    audioLive = false,
+                    audioPlayback = false,
+                    trustedDevices = true,
+                    watchdogRecovery = true
+                )
+            )
+        )
+        val scheduler = RecordingBackoffScheduler()
+        val coordinator = ZCamRuntimeCoordinator(
+            cameraRuntime = NoopCameraRuntime(),
+            localHttpServer = server,
+            pushToTalkManager = NoopAudioManager(),
+            loopRecordingManager = NoopLoopRecordingManager(),
+            watchdogManager = watchdog,
+            runtimeEnvironmentMonitor = environmentMonitor,
+            runtimeSettingsRepository = runtimeSettings,
+            runtimeCrashRepository = runtimeCrash,
+            runtimeStateRepository = runtimeState,
+            runtimeHealthRepository = InMemoryRuntimeHealthRepository(),
+            recoveryPolicy = RecoveryPolicy(baseDelayMs = 5, maxDelayMs = 40, maxAttemptsBeforeCooldown = 4, cooldownMs = 100),
+            retryBackoffScheduler = scheduler,
+            dispatchers = dispatchers,
+            logger = NoopLogger()
+        )
+
+        coordinator.start()
+        try {
+            advanceTimeBy(24.hours.inWholeMilliseconds)
+            assertEquals(1, server.startCalls)
+            assertEquals(
+                ComponentHealthStatus.HEALTHY,
+                coordinator.health.value.components.getValue(RuntimeComponent.SERVER).status
+            )
+        } finally {
+            coordinator.stop(persistDesiredState = true)
+            advanceUntilIdle()
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun marks_runtime_dirty_on_start_and_clean_on_stop() = runTest(timeout = 20.seconds) {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val dispatchers = TestDispatcherProvider(dispatcher)
+        val runtimeCrash = FakeRuntimeCrashRepository()
+        val coordinator = ZCamRuntimeCoordinator(
+            cameraRuntime = NoopCameraRuntime(),
+            localHttpServer = FlakyServer(failuresBeforeSuccess = 0),
+            pushToTalkManager = NoopAudioManager(),
+            loopRecordingManager = NoopLoopRecordingManager(),
+            watchdogManager = FakeWatchdogManager(),
+            runtimeEnvironmentMonitor = FakeRuntimeEnvironmentMonitor(),
+            runtimeSettingsRepository = FakeRuntimeSettingsRepository(
+                RuntimeSettingsDefaults.value.copy(
+                    featureFlags = FeatureFlags(
+                        mjpegStreaming = false,
+                        loopRecording = false,
+                        audioPushToTalk = false,
+                        audioLive = false,
+                        audioPlayback = false,
+                        trustedDevices = true,
+                        watchdogRecovery = true
+                    )
+                )
+            ),
+            runtimeCrashRepository = runtimeCrash,
+            runtimeStateRepository = FakeRuntimeStateRepository(),
+            runtimeHealthRepository = InMemoryRuntimeHealthRepository(),
+            recoveryPolicy = RecoveryPolicy(baseDelayMs = 5, maxDelayMs = 40, maxAttemptsBeforeCooldown = 4, cooldownMs = 100),
+            retryBackoffScheduler = RecordingBackoffScheduler(),
+            dispatchers = dispatchers,
+            logger = NoopLogger()
+        )
+
+        coordinator.start()
+        runCurrent()
+        assertTrue(runtimeCrash.state.value.runtimeDirty)
+
+        coordinator.stop(persistDesiredState = true)
+        advanceUntilIdle()
+        assertFalse(runtimeCrash.state.value.runtimeDirty)
     }
 
     private class TestDispatcherProvider(
@@ -279,6 +526,14 @@ class ZCamRuntimeCoordinatorRecoveryTest {
         override suspend fun isHealthy(): Boolean = healthy
 
         override suspend fun forceRetentionSweep() = Unit
+
+        override suspend fun queryRecordings(
+            fromEpochMs: Long?,
+            toEpochMs: Long?,
+            limit: Int
+        ): List<RecordingClipSummary> = emptyList()
+
+        override suspend fun resolveRecordingFile(fileName: String): java.io.File? = null
     }
 
     private class FakeRuntimeStateRepository : RuntimeStateRepository {
@@ -291,6 +546,62 @@ class ZCamRuntimeCoordinatorRecoveryTest {
 
         override suspend fun setDesiredRunning(shouldRun: Boolean) {
             desiredState.value = RuntimeDesiredState(shouldRun, System.currentTimeMillis())
+        }
+    }
+
+    private class FakeRuntimeCrashRepository : RuntimeCrashRepository {
+        private val _state = MutableStateFlow(RuntimeCrashState())
+        override val state: StateFlow<RuntimeCrashState> = _state.asStateFlow()
+
+        override suspend fun markRuntimeDirty() {
+            _state.value = _state.value.copy(
+                runtimeDirty = true,
+                lastRuntimeMarkerEpochMs = System.currentTimeMillis()
+            )
+        }
+
+        override suspend fun markRuntimeClean() {
+            _state.value = _state.value.copy(
+                runtimeDirty = false,
+                lastRuntimeMarkerEpochMs = System.currentTimeMillis()
+            )
+        }
+
+        override suspend fun markCrash(reason: String) {
+            _state.value = _state.value.copy(
+                runtimeDirty = true,
+                lastRuntimeMarkerEpochMs = System.currentTimeMillis(),
+                lastCrashEpochMs = System.currentTimeMillis(),
+                lastCrashReason = reason
+            )
+        }
+
+        override suspend fun markRecovered() {
+            _state.value = _state.value.copy(
+                lastRecoveryEpochMs = System.currentTimeMillis()
+            )
+        }
+    }
+
+    private class FakeRuntimeEnvironmentMonitor(
+        initialThermal: ThermalBand = ThermalBand.NOMINAL,
+        initialConnectivity: NetworkConnectivity = NetworkConnectivity(connected = true, transport = "wifi")
+    ) : RuntimeEnvironmentMonitor {
+        private val _thermal = MutableStateFlow(initialThermal)
+        private val _network = MutableStateFlow(initialConnectivity)
+
+        override val thermalBand: StateFlow<ThermalBand> = _thermal.asStateFlow()
+        override val networkConnectivity: StateFlow<NetworkConnectivity> = _network.asStateFlow()
+
+        override suspend fun start() = Unit
+        override suspend fun stop() = Unit
+
+        suspend fun setThermal(value: ThermalBand) {
+            _thermal.emit(value)
+        }
+
+        suspend fun setConnectivity(value: NetworkConnectivity) {
+            _network.emit(value)
         }
     }
 
@@ -345,6 +656,71 @@ class ZCamRuntimeCoordinatorRecoveryTest {
         override suspend fun isHealthy(): Boolean = true
 
         override fun latestFrame(): ByteArray = byteArrayOf(0)
+
+        override suspend fun setTorch(enabled: Boolean): com.zcam.camera.CameraControlCommandResult {
+            return com.zcam.camera.CameraControlCommandResult.Success(
+                snapshot = controlsSnapshot(),
+                message = "ok"
+            )
+        }
+
+        override suspend fun setNightMode(enabled: Boolean): com.zcam.camera.CameraControlCommandResult {
+            return com.zcam.camera.CameraControlCommandResult.Success(
+                snapshot = controlsSnapshot(),
+                message = "ok"
+            )
+        }
+
+        override fun controlsSnapshot(): com.zcam.camera.CameraControlsSnapshot {
+            return com.zcam.camera.CameraControlsSnapshot(
+                running = true,
+                torchEnabled = false,
+                nightModeEnabled = false,
+                lowLightBoostSupported = true,
+                lastError = null
+            )
+        }
+    }
+
+    private class TrackingCameraRuntime : CameraRuntime {
+        val startConfigs = mutableListOf<com.zcam.core.domain.config.StreamConfig>()
+        private var healthy = false
+
+        override suspend fun start(config: com.zcam.core.domain.config.StreamConfig) {
+            startConfigs += config
+            healthy = true
+        }
+
+        override suspend fun stop() {
+            healthy = false
+        }
+
+        override suspend fun isHealthy(): Boolean = healthy
+
+        override fun latestFrame(): ByteArray = byteArrayOf(1)
+
+        override suspend fun setTorch(enabled: Boolean): com.zcam.camera.CameraControlCommandResult {
+            return com.zcam.camera.CameraControlCommandResult.Success(
+                snapshot = controlsSnapshot(),
+                message = "ok"
+            )
+        }
+
+        override suspend fun setNightMode(enabled: Boolean): com.zcam.camera.CameraControlCommandResult {
+            return com.zcam.camera.CameraControlCommandResult.Success(
+                snapshot = controlsSnapshot(),
+                message = "ok"
+            )
+        }
+
+        override fun controlsSnapshot(): com.zcam.camera.CameraControlsSnapshot {
+            return com.zcam.camera.CameraControlsSnapshot(
+                running = healthy,
+                torchEnabled = false,
+                nightModeEnabled = false,
+                lowLightBoostSupported = true
+            )
+        }
     }
 
     private class NoopAudioManager : PushToTalkManager {
@@ -395,6 +771,41 @@ class ZCamRuntimeCoordinatorRecoveryTest {
         override suspend fun stop() = Unit
         override suspend fun isHealthy() = true
         override suspend fun forceRetentionSweep() = Unit
+        override suspend fun queryRecordings(
+            fromEpochMs: Long?,
+            toEpochMs: Long?,
+            limit: Int
+        ): List<RecordingClipSummary> = emptyList()
+
+        override suspend fun resolveRecordingFile(fileName: String): java.io.File? = null
+    }
+
+    private class TrackingLoopRecordingManager : LoopRecordingManager {
+        var startCalls: Int = 0
+            private set
+        var stopCalls: Int = 0
+            private set
+        private var healthy = false
+
+        override suspend fun start(config: com.zcam.core.domain.config.LoopRecordingConfig) {
+            startCalls += 1
+            healthy = true
+        }
+
+        override suspend fun stop() {
+            stopCalls += 1
+            healthy = false
+        }
+
+        override suspend fun isHealthy(): Boolean = healthy
+        override suspend fun forceRetentionSweep() = Unit
+        override suspend fun queryRecordings(
+            fromEpochMs: Long?,
+            toEpochMs: Long?,
+            limit: Int
+        ): List<RecordingClipSummary> = emptyList()
+
+        override suspend fun resolveRecordingFile(fileName: String): java.io.File? = null
     }
 
     private class NoopLogger : ZCamLogger {

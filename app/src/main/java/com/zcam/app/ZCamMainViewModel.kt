@@ -1,6 +1,7 @@
 package com.zcam.app
 
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
@@ -47,6 +48,9 @@ import java.net.URLDecoder
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.nio.charset.StandardCharsets
+import java.time.LocalDateTime
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import javax.inject.Inject
 
 @HiltViewModel
@@ -104,6 +108,14 @@ class ZCamMainViewModel @Inject constructor(
             ZCamUiAction.ToggleLiveListen -> toggleLiveListen()
             is ZCamUiAction.PlayQuickSound -> playQuickSound(action.clipId, action.aversive)
             is ZCamUiAction.VolumeChanged -> updateVolume(action.levelPercent)
+            is ZCamUiAction.RecordingsFromChanged -> _state.update {
+                it.copy(recordings = it.recordings.copy(fromInput = action.value))
+            }
+            is ZCamUiAction.RecordingsToChanged -> _state.update {
+                it.copy(recordings = it.recordings.copy(toInput = action.value))
+            }
+            ZCamUiAction.FetchRecordings -> fetchRecordingsForRange()
+            is ZCamUiAction.PlayRecording -> playRecording(action.fileName)
 
             ZCamUiAction.RequestPairingQr -> requestPairingQr()
             is ZCamUiAction.PairingPayloadChanged -> _state.update {
@@ -340,7 +352,9 @@ class ZCamMainViewModel @Inject constructor(
             _state.update { current ->
                 when (result) {
                     is ClientCallResult.Success -> current.copy(pttPressed = pressed, errorMessage = null)
-                    is ClientCallResult.Failure -> current.copy(errorMessage = "Push-to-talk failed: ${result.reason}")
+                    is ClientCallResult.Failure -> current.copy(
+                        errorMessage = "Push-to-talk failed: ${result.reason}${result.responseBody?.let { " ($it)" } ?: ""}"
+                    )
                 }
             }
         }
@@ -353,7 +367,9 @@ class ZCamMainViewModel @Inject constructor(
             _state.update { current ->
                 when (result) {
                     is ClientCallResult.Success -> current.copy(liveListenEnabled = enabled, errorMessage = null)
-                    is ClientCallResult.Failure -> current.copy(errorMessage = "Live listen failed: ${result.reason}")
+                    is ClientCallResult.Failure -> current.copy(
+                        errorMessage = "Live listen failed: ${result.reason}${result.responseBody?.let { " ($it)" } ?: ""}"
+                    )
                 }
             }
         }
@@ -383,6 +399,97 @@ class ZCamMainViewModel @Inject constructor(
         }
     }
 
+    private fun fetchRecordingsForRange() {
+        viewModelScope.launch(dispatchers.io) {
+            val current = state.value
+            val fromParsed = parseRecordingTimeInput(current.recordings.fromInput)
+            val toParsed = parseRecordingTimeInput(current.recordings.toInput)
+
+            if (fromParsed == INVALID_TIME_INPUT || toParsed == INVALID_TIME_INPUT) {
+                _state.update {
+                    it.copy(errorMessage = "Invalid date format. Use YYYY-MM-DD HH:mm or epoch ms.")
+                }
+                return@launch
+            }
+            if (fromParsed != null && toParsed != null && fromParsed > toParsed) {
+                _state.update { it.copy(errorMessage = "Recordings range invalid: from must be <= to.") }
+                return@launch
+            }
+
+            _state.update {
+                it.copy(
+                    recordings = it.recordings.copy(
+                        loading = true,
+                        resultMessage = "Loading recordings..."
+                    ),
+                    errorMessage = null
+                )
+            }
+
+            when (
+                val result = localClient.fetchRecordings(
+                    target = currentTargetForCommands(),
+                    fromEpochMs = fromParsed,
+                    toEpochMs = toParsed,
+                    limit = 200
+                )
+            ) {
+                is ClientCallResult.Success -> {
+                    val items = result.value.map { clip ->
+                        com.zcam.ui.RecordingItemUi(
+                            fileName = clip.fileName,
+                            startedAtEpochMs = clip.startedAtEpochMs,
+                            endedAtEpochMs = clip.endedAtEpochMs,
+                            durationMs = clip.durationMs,
+                            sizeBytes = clip.sizeBytes
+                        )
+                    }
+                    _state.update {
+                        it.copy(
+                            recordings = it.recordings.copy(
+                                loading = false,
+                                resultMessage = "Found ${items.size} recording(s)",
+                                items = items
+                            ),
+                            errorMessage = null
+                        )
+                    }
+                }
+                is ClientCallResult.Failure -> {
+                    _state.update {
+                        it.copy(
+                            recordings = it.recordings.copy(
+                                loading = false,
+                                resultMessage = "Recordings request failed: ${result.reason}"
+                            ),
+                            errorMessage = "Recordings request failed: ${result.reason}${result.responseBody?.let { body -> " ($body)" } ?: ""}"
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private fun playRecording(fileName: String) {
+        viewModelScope.launch(dispatchers.io) {
+            if (fileName.isBlank()) return@launch
+            val url = localClient.buildRecordingPlaybackUrl(currentTargetForCommands(), fileName)
+            val uri = Uri.parse(url)
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "video/mp4")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            runCatching {
+                appContext.startActivity(intent)
+                _state.update { it.copy(errorMessage = null) }
+            }.onFailure { error ->
+                _state.update {
+                    it.copy(errorMessage = "Cannot open recording player: ${error.message}")
+                }
+            }
+        }
+    }
+
     private fun requestPairingQr() {
         viewModelScope.launch(dispatchers.io) {
             _state.update {
@@ -402,10 +509,16 @@ class ZCamMainViewModel @Inject constructor(
                     val parsed = parsePairingPayload(normalizedPayload)
 
                     _state.update { current ->
-                        val nextHost = parsed?.host ?: current.clientHost
+                        val parsedHost = parsed?.host
+                        val nextHost = when {
+                            current.mode != ZCamMode.CLIENT -> current.clientHost
+                            parsedHost.isNullOrBlank() -> current.clientHost
+                            isLoopbackHost(parsedHost) && current.clientHost.isNotBlank() -> current.clientHost
+                            else -> parsedHost
+                        }
                         val nextPort = parsed?.port?.toString() ?: current.clientPort
                         current.copy(
-                            clientHost = if (current.mode == ZCamMode.CLIENT && parsed?.host != null) nextHost else current.clientHost,
+                            clientHost = if (current.mode == ZCamMode.CLIENT) nextHost else current.clientHost,
                             clientPort = if (current.mode == ZCamMode.CLIENT && parsed?.port != null) nextPort else current.clientPort,
                             pairing = current.pairing.copy(
                                 loading = false,
@@ -448,7 +561,8 @@ class ZCamMainViewModel @Inject constructor(
             return
         }
 
-        val parsed = parsePairingPayload(rawPayload)
+        val normalizedPayload = normalizePairingPayloadHost(rawPayload, preferredPairingHostPort())
+        val parsed = parsePairingPayload(normalizedPayload)
         if (parsed == null) {
             _state.update {
                 it.copy(errorMessage = "Unable to parse pairing payload. Expected: zcam://pair?sid=...&code=...&host=...")
@@ -457,8 +571,15 @@ class ZCamMainViewModel @Inject constructor(
         }
 
         _state.update { current ->
+            val parsedHost = parsed.host
+            val nextHost = when {
+                current.mode != ZCamMode.CLIENT -> current.clientHost
+                parsedHost.isNullOrBlank() -> current.clientHost
+                isLoopbackHost(parsedHost) && current.clientHost.isNotBlank() -> current.clientHost
+                else -> parsedHost
+            }
             current.copy(
-                clientHost = if (current.mode == ZCamMode.CLIENT && parsed.host != null) parsed.host else current.clientHost,
+                clientHost = if (current.mode == ZCamMode.CLIENT) nextHost else current.clientHost,
                 clientPort = if (current.mode == ZCamMode.CLIENT && parsed.port != null) parsed.port.toString() else current.clientPort,
                 pairing = current.pairing.copy(
                     sessionId = parsed.sessionId ?: current.pairing.sessionId,
@@ -832,7 +953,11 @@ class ZCamMainViewModel @Inject constructor(
     private fun preferredPairingHostPort(): String {
         val current = state.value
         return if (current.mode == ZCamMode.CLIENT) {
-            "${current.clientHost.ifBlank { "127.0.0.1" }}:${current.clientPort.ifBlank { settingsSnapshot.serverPort.toString() }}"
+            if (current.clientHost.isBlank()) {
+                ""
+            } else {
+                "${current.clientHost}:${current.clientPort.ifBlank { settingsSnapshot.serverPort.toString() }}"
+            }
         } else {
             val host = current.serverLanHost.ifBlank { findLocalLanHost().orEmpty() }
             if (host.isBlank()) "" else "$host:${settingsSnapshot.serverPort}"
@@ -904,6 +1029,18 @@ class ZCamMainViewModel @Inject constructor(
         }.getOrDefault(value)
     }
 
+    private fun parseRecordingTimeInput(raw: String): Long? {
+        val value = raw.trim()
+        if (value.isBlank()) return null
+        value.toLongOrNull()?.let { epoch ->
+            return if (epoch >= 0L) epoch else INVALID_TIME_INPUT
+        }
+        val parsedLocal = runCatching {
+            LocalDateTime.parse(value, RECORDINGS_DATE_TIME_FORMATTER)
+        }.getOrNull() ?: return INVALID_TIME_INPUT
+        return parsedLocal.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+    }
+
     private fun parseHostPort(hostPort: String): Pair<String?, Int?> {
         val trimmed = hostPort.trim()
         if (trimmed.isBlank()) return null to null
@@ -928,7 +1065,15 @@ class ZCamMainViewModel @Inject constructor(
 
     private fun isLoopbackHostPort(hostPort: String): Boolean {
         val host = hostPort.substringBefore(':').trim().lowercase()
-        return host == "127.0.0.1" || host == "localhost" || host == "0.0.0.0"
+        return isLoopbackHost(host)
+    }
+
+    private fun isLoopbackHost(host: String): Boolean {
+        val normalized = host.trim().lowercase()
+        return normalized == "127.0.0.1" ||
+            normalized == "localhost" ||
+            normalized == "0.0.0.0" ||
+            normalized == "::1"
     }
 
     private fun findLocalLanHost(): String? {
@@ -974,5 +1119,7 @@ class ZCamMainViewModel @Inject constructor(
         const val CLIENT_STATUS_REFRESH_MS = 2_000L
         const val THERMAL_REFRESH_MS = 2_500L
         const val VOLUME_DEBOUNCE_MS = 180L
+        val RECORDINGS_DATE_TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+        const val INVALID_TIME_INPUT = Long.MIN_VALUE
     }
 }

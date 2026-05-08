@@ -4,9 +4,11 @@ import android.content.Context
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
+import android.os.Environment
 import android.os.SystemClock
 import android.util.Size
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.CameraControl
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
@@ -22,6 +24,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
+import com.google.common.util.concurrent.ListenableFuture
 import com.zcam.core.dispatchers.DispatcherProvider
 import com.zcam.core.domain.config.StreamConfig
 import com.zcam.core.logging.ZCamLogger
@@ -69,6 +72,10 @@ class CameraRuntimeImpl @Inject constructor(
     private val droppedFrames = AtomicLong(0L)
     private val lastFrameEpochMs = AtomicLong(0L)
     private val analysisEnabled = AtomicBoolean(true)
+    private val torchEnabled = AtomicBoolean(false)
+    private val nightModeEnabled = AtomicBoolean(false)
+    private val lowLightBoostSupported = AtomicBoolean(false)
+    private val lastControlError = AtomicReference<String?>(null)
 
     @Volatile
     private var cameraProvider: ProcessCameraProvider? = null
@@ -78,6 +85,8 @@ class CameraRuntimeImpl @Inject constructor(
     private var analysisUseCase: ImageAnalysis? = null
     @Volatile
     private var videoCaptureUseCase: VideoCapture<Recorder>? = null
+    @Volatile
+    private var boundCamera: androidx.camera.core.Camera? = null
 
     private val recordingMutex = Mutex()
     @Volatile
@@ -99,6 +108,10 @@ class CameraRuntimeImpl @Inject constructor(
             droppedFrames.set(0L)
             lastFrameEpochMs.set(0L)
             analysisEnabled.set(true)
+            torchEnabled.set(false)
+            nightModeEnabled.set(false)
+            lowLightBoostSupported.set(false)
+            lastControlError.set(null)
 
             val provider = awaitCameraProvider()
             val encoder = Nv21JpegEncoder()
@@ -134,7 +147,7 @@ class CameraRuntimeImpl @Inject constructor(
                     analyzeFrame(image, encoder, minFrameIntervalMs)
                 }
 
-                runCatching {
+                val camera = runCatching {
                     provider.bindToLifecycle(
                         lifecycleOwner,
                         CameraSelector.DEFAULT_BACK_CAMERA,
@@ -158,6 +171,10 @@ class CameraRuntimeImpl @Inject constructor(
                 previewUseCase = preview
                 analysisUseCase = analysis
                 videoCaptureUseCase = videoCapture
+                boundCamera = camera
+                lowLightBoostSupported.set(
+                    runCatching { camera.cameraInfo.isLowLightBoostSupported }.getOrDefault(false)
+                )
             }
 
             cameraProvider = provider
@@ -190,9 +207,13 @@ class CameraRuntimeImpl @Inject constructor(
                 previewUseCase = null
                 analysisUseCase = null
                 videoCaptureUseCase = null
+                boundCamera = null
                 cameraProvider = null
             }
             analysisEnabled.set(false)
+            torchEnabled.set(false)
+            nightModeEnabled.set(false)
+            lowLightBoostSupported.set(false)
             running.set(false)
         }
     }
@@ -203,6 +224,85 @@ class CameraRuntimeImpl @Inject constructor(
         val lastFrameAt = lastFrameEpochMs.get()
         if (lastFrameAt == 0L) return false
         return (System.currentTimeMillis() - lastFrameAt) <= HEALTHY_FRAME_AGE_MS
+    }
+
+    override fun controlsSnapshot(): CameraControlsSnapshot {
+        return CameraControlsSnapshot(
+            running = running.get(),
+            torchEnabled = torchEnabled.get(),
+            nightModeEnabled = nightModeEnabled.get(),
+            lowLightBoostSupported = lowLightBoostSupported.get(),
+            lastError = lastControlError.get()
+        )
+    }
+
+    override suspend fun setTorch(enabled: Boolean): CameraControlCommandResult = withContext(dispatchers.io) {
+        val camera = boundCamera
+        if (!running.get() || camera == null) {
+            return@withContext failureResult(
+                code = CameraControlErrorCode.ENGINE_NOT_READY,
+                message = "camera runtime is not active"
+            )
+        }
+        if (enabled && nightModeEnabled.get()) {
+            return@withContext failureResult(
+                code = CameraControlErrorCode.CONFLICT,
+                message = "night mode is enabled; disable night mode before torch"
+            )
+        }
+
+        runCatching {
+            awaitFuture(camera.cameraControl.enableTorch(enabled))
+            torchEnabled.set(enabled)
+            lastControlError.set(null)
+            CameraControlCommandResult.Success(
+                snapshot = controlsSnapshot(),
+                message = if (enabled) "torch enabled" else "torch disabled"
+            )
+        }.getOrElse { error ->
+            mapCameraControlFailure(error, fallbackCode = CameraControlErrorCode.INTERNAL_ERROR)
+        }
+    }
+
+    override suspend fun setNightMode(enabled: Boolean): CameraControlCommandResult = withContext(dispatchers.io) {
+        val camera = boundCamera
+        if (!running.get() || camera == null) {
+            return@withContext failureResult(
+                code = CameraControlErrorCode.ENGINE_NOT_READY,
+                message = "camera runtime is not active"
+            )
+        }
+        if (enabled && !lowLightBoostSupported.get()) {
+            return@withContext failureResult(
+                code = CameraControlErrorCode.UNSUPPORTED,
+                message = "night mode is not supported by this camera"
+            )
+        }
+        if (enabled && targetFps.get() > 30) {
+            return@withContext failureResult(
+                code = CameraControlErrorCode.CONFLICT,
+                message = "night mode requires stream FPS <= 30"
+            )
+        }
+        if (enabled && torchEnabled.get()) {
+            return@withContext failureResult(
+                code = CameraControlErrorCode.CONFLICT,
+                message = "torch is enabled; disable torch before night mode"
+            )
+        }
+
+        runCatching {
+            awaitFuture(camera.cameraControl.enableLowLightBoostAsync(enabled))
+            nightModeEnabled.set(enabled)
+            lastControlError.set(null)
+            CameraControlCommandResult.Success(
+                snapshot = controlsSnapshot(),
+                message = if (enabled) "night mode enabled" else "night mode disabled"
+            )
+        }.getOrElse { error ->
+            val fallbackCode = if (enabled) CameraControlErrorCode.CONFLICT else CameraControlErrorCode.INTERNAL_ERROR
+            mapCameraControlFailure(error, fallbackCode = fallbackCode)
+        }
     }
 
     override fun latestFrame(): ByteArray = latest.get()
@@ -326,7 +426,58 @@ class CameraRuntimeImpl @Inject constructor(
         )
     }
 
-    private fun recordingDirFallback(): File = File(appContext.filesDir, "zcam_recordings")
+    private fun recordingDirFallback(): File {
+        val externalBase = appContext.getExternalFilesDir(Environment.DIRECTORY_MOVIES)
+        return if (externalBase != null) {
+            File(externalBase, "ZCam/recordings")
+        } else {
+            File(appContext.filesDir, "zcam_recordings")
+        }
+    }
+
+    private fun failureResult(
+        code: CameraControlErrorCode,
+        message: String
+    ): CameraControlCommandResult.Failure {
+        lastControlError.set(message)
+        return CameraControlCommandResult.Failure(
+            code = code,
+            message = message,
+            snapshot = controlsSnapshot()
+        )
+    }
+
+    private fun mapCameraControlFailure(
+        error: Throwable,
+        fallbackCode: CameraControlErrorCode
+    ): CameraControlCommandResult.Failure {
+        logger.w("Camera control failed: ${error.message}")
+        val code = when (error) {
+            is CameraControl.OperationCanceledException -> CameraControlErrorCode.ENGINE_NOT_READY
+            is IllegalStateException -> CameraControlErrorCode.CONFLICT
+            else -> fallbackCode
+        }
+        return failureResult(
+            code = code,
+            message = error.message ?: "camera control failure"
+        )
+    }
+
+    private suspend fun <T> awaitFuture(future: ListenableFuture<T>): T {
+        return suspendCancellableCoroutine { continuation ->
+            future.addListener(
+                {
+                    runCatching { future.get() }
+                        .onSuccess { value -> continuation.resume(value) }
+                        .onFailure { error -> continuation.resumeWithException(error) }
+                },
+                mainExecutor
+            )
+            continuation.invokeOnCancellation {
+                future.cancel(true)
+            }
+        }
+    }
 
     private suspend fun <T> runOnMainExecutor(block: () -> T): T {
         return suspendCancellableCoroutine { continuation ->

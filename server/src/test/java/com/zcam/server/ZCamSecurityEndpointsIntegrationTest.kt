@@ -5,6 +5,9 @@ import com.zcam.audio.AudioLiveMode
 import com.zcam.audio.AudioPlaybackRequest
 import com.zcam.audio.AudioStateSnapshot
 import com.zcam.audio.PushToTalkManager
+import com.zcam.camera.CameraControlCommandResult
+import com.zcam.camera.CameraControlManager
+import com.zcam.camera.CameraControlsSnapshot
 import com.zcam.camera.FramePipelineStatus
 import com.zcam.camera.FramePipelineStatusSource
 import com.zcam.camera.MjpegFrameSource
@@ -21,6 +24,8 @@ import com.zcam.security.LanAccessPolicy
 import com.zcam.security.LocalSecurityManager
 import com.zcam.security.SecurityTokenStore
 import com.zcam.security.StoredApiToken
+import com.zcam.storage.LoopRecordingManager
+import com.zcam.storage.RecordingClipSummary
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -59,7 +64,9 @@ class ZCamSecurityEndpointsIntegrationTest {
         httpServer = ZCamHttpServer(
             frameSource = FakeFrameSource(),
             frameStatusSource = FakeFramePipelineStatusSource(),
+            cameraControlManager = FakeCameraControlManager(),
             pushToTalkManager = FakeAudioManager(),
+            loopRecordingManager = NoopLoopRecordingManager(),
             securityManager = securityManager,
             dispatchers = dispatchers,
             logger = logger,
@@ -182,6 +189,28 @@ class ZCamSecurityEndpointsIntegrationTest {
         )
     }
 
+    private class FakeCameraControlManager : CameraControlManager {
+        private var snapshot = CameraControlsSnapshot(
+            running = true,
+            torchEnabled = false,
+            nightModeEnabled = false,
+            lowLightBoostSupported = true,
+            lastError = null
+        )
+
+        override suspend fun setTorch(enabled: Boolean): CameraControlCommandResult {
+            snapshot = snapshot.copy(torchEnabled = enabled, lastError = null)
+            return CameraControlCommandResult.Success(snapshot, "ok")
+        }
+
+        override suspend fun setNightMode(enabled: Boolean): CameraControlCommandResult {
+            snapshot = snapshot.copy(nightModeEnabled = enabled, lastError = null)
+            return CameraControlCommandResult.Success(snapshot, "ok")
+        }
+
+        override fun controlsSnapshot(): CameraControlsSnapshot = snapshot
+    }
+
     private class FakeAudioManager : PushToTalkManager {
         override suspend fun start() = Unit
         override suspend fun stop() = Unit
@@ -276,6 +305,20 @@ class ZCamSecurityEndpointsIntegrationTest {
         override fun i(message: String) = Unit
         override fun w(message: String) = Unit
         override fun e(throwable: Throwable?, message: String) = Unit
+    }
+
+    private class NoopLoopRecordingManager : LoopRecordingManager {
+        override suspend fun start(config: com.zcam.core.domain.config.LoopRecordingConfig) = Unit
+        override suspend fun stop() = Unit
+        override suspend fun forceRetentionSweep() = Unit
+        override suspend fun isHealthy(): Boolean = true
+        override suspend fun queryRecordings(
+            fromEpochMs: Long?,
+            toEpochMs: Long?,
+            limit: Int
+        ): List<RecordingClipSummary> = emptyList()
+
+        override suspend fun resolveRecordingFile(fileName: String): java.io.File? = null
     }
 
     private companion object {

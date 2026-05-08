@@ -196,6 +196,7 @@ private fun MainScreen(
                 PreviewCard(state = state)
                 PushToTalkControls(state = state, onAction = onAction)
                 QuickSoundsSection(state = state, onAction = onAction)
+                RecordingsSection(state = state, onAction = onAction)
             }
         }
 
@@ -912,6 +913,109 @@ private fun QuickSoundsSection(
                 ) {
                     Text(sound.label)
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RecordingsSection(
+    state: ZCamUiState,
+    onAction: (ZCamUiAction) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                text = "Recordings",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold
+            )
+            Text(
+                text = "Time range format: YYYY-MM-DD HH:mm (local) or epoch ms",
+                style = MaterialTheme.typography.bodySmall
+            )
+            OutlinedTextField(
+                modifier = Modifier.fillMaxWidth(),
+                value = state.recordings.fromInput,
+                onValueChange = { onAction(ZCamUiAction.RecordingsFromChanged(it)) },
+                label = { Text("From") },
+                singleLine = true
+            )
+            OutlinedTextField(
+                modifier = Modifier.fillMaxWidth(),
+                value = state.recordings.toInput,
+                onValueChange = { onAction(ZCamUiAction.RecordingsToChanged(it)) },
+                label = { Text("To") },
+                singleLine = true
+            )
+            Button(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp),
+                enabled = !state.recordings.loading,
+                onClick = { onAction(ZCamUiAction.FetchRecordings) }
+            ) {
+                Text(if (state.recordings.loading) "Loading..." else "Load recordings")
+            }
+            if (state.recordings.resultMessage.isNotBlank()) {
+                StatusChip(
+                    label = state.recordings.resultMessage,
+                    tone = StatusTone.NEUTRAL
+                )
+            }
+            if (state.recordings.items.isEmpty()) {
+                Text(
+                    text = "No recordings in selected range.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            } else {
+                state.recordings.items.forEach { item ->
+                    RecordingItemRow(item = item, onPlay = { onAction(ZCamUiAction.PlayRecording(item.fileName)) })
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RecordingItemRow(
+    item: RecordingItemUi,
+    onPlay: () -> Unit
+) {
+    val startedAt = remember(item.startedAtEpochMs) {
+        DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.MEDIUM)
+            .format(Date(item.startedAtEpochMs))
+    }
+    val endedAt = remember(item.endedAtEpochMs) {
+        DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.MEDIUM)
+            .format(Date(item.endedAtEpochMs))
+    }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(
+            modifier = Modifier.padding(10.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Text(item.fileName, fontWeight = FontWeight.SemiBold)
+            Text("Start: $startedAt", style = MaterialTheme.typography.bodySmall)
+            Text("End: $endedAt", style = MaterialTheme.typography.bodySmall)
+            Text(
+                "Duration: ${item.durationMs / 1000}s • Size: ${item.sizeBytes / (1024 * 1024)} MB",
+                style = MaterialTheme.typography.bodySmall
+            )
+            OutlinedButton(
+                modifier = Modifier.fillMaxWidth(),
+                onClick = onPlay
+            ) {
+                Text("Play recording")
             }
         }
     }

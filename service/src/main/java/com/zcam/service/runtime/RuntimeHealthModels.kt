@@ -5,7 +5,9 @@ enum class RuntimeComponent {
     SERVER,
     AUDIO,
     STORAGE,
-    WATCHDOG
+    WATCHDOG,
+    THERMAL,
+    NETWORK
 }
 
 enum class ComponentHealthStatus {

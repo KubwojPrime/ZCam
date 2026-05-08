@@ -1,6 +1,10 @@
 package com.zcam.server
 
 import com.zcam.audio.AndroidPushToTalkManager
+import com.zcam.camera.CameraControlCommandResult
+import com.zcam.camera.CameraControlErrorCode
+import com.zcam.camera.CameraControlManager
+import com.zcam.camera.CameraControlsSnapshot
 import com.zcam.camera.FramePipelineStatus
 import com.zcam.camera.FramePipelineStatusSource
 import com.zcam.camera.MjpegFrameSource
@@ -14,6 +18,8 @@ import com.zcam.security.SecurityAuthDecision
 import com.zcam.security.SecurityManager
 import com.zcam.security.TokenRevocationResult
 import com.zcam.security.TokenRotationResult
+import com.zcam.storage.LoopRecordingManager
+import com.zcam.storage.RecordingClipSummary
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
@@ -35,6 +41,7 @@ class ZCamAudioEndpointsIntegrationTest {
     private val dispatchers = TestDispatcherProvider()
 
     private lateinit var audioManager: AndroidPushToTalkManager
+    private lateinit var cameraControlManager: FakeCameraControlManager
     private val securityManager = AllowAllSecurityManager()
     private lateinit var httpServer: ZCamHttpServer
     private var port: Int = 0
@@ -45,10 +52,13 @@ class ZCamAudioEndpointsIntegrationTest {
             dispatchers = dispatchers,
             logger = logger
         )
+        cameraControlManager = FakeCameraControlManager()
         httpServer = ZCamHttpServer(
             frameSource = FakeFrameSource(),
             frameStatusSource = FakeFramePipelineStatusSource(),
+            cameraControlManager = cameraControlManager,
             pushToTalkManager = audioManager,
+            loopRecordingManager = NoopLoopRecordingManager(),
             securityManager = securityManager,
             dispatchers = dispatchers,
             logger = logger,
@@ -150,6 +160,41 @@ class ZCamAudioEndpointsIntegrationTest {
         }
     }
 
+    @Test
+    fun torch_endpoint_updates_camera_controls_state() {
+        val response = postJson(
+            path = "/api/torch",
+            body = """{"enabled":true}"""
+        )
+
+        response.use {
+            val payload = it.body?.string().orEmpty()
+            assertEquals(200, it.code)
+            assertTrue(payload.contains("\"status\":\"ok\""))
+            assertTrue(payload.contains("\"torchEnabled\":true"))
+        }
+    }
+
+    @Test
+    fun nightmode_endpoint_maps_conflict_error_to_http_409() {
+        cameraControlManager.nextNightModeFailure = CameraControlCommandResult.Failure(
+            code = CameraControlErrorCode.CONFLICT,
+            message = "night mode conflict",
+            snapshot = cameraControlManager.controlsSnapshot()
+        )
+
+        val response = postJson(
+            path = "/api/nightmode",
+            body = """{"enabled":true}"""
+        )
+        response.use {
+            val payload = it.body?.string().orEmpty()
+            assertEquals(409, it.code)
+            assertTrue(payload.contains("\"code\":\"conflict\""))
+            assertTrue(payload.contains("night mode conflict"))
+        }
+    }
+
     private fun postJson(path: String, body: String): okhttp3.Response {
         val request = Request.Builder()
             .url("http://127.0.0.1:$port$path")
@@ -178,6 +223,35 @@ class ZCamAudioEndpointsIntegrationTest {
         )
     }
 
+    private class FakeCameraControlManager : CameraControlManager {
+        private var snapshot = CameraControlsSnapshot(
+            running = true,
+            torchEnabled = false,
+            nightModeEnabled = false,
+            lowLightBoostSupported = true,
+            lastError = null
+        )
+        var nextNightModeFailure: CameraControlCommandResult.Failure? = null
+
+        override suspend fun setTorch(enabled: Boolean): CameraControlCommandResult {
+            snapshot = snapshot.copy(torchEnabled = enabled, lastError = null)
+            return CameraControlCommandResult.Success(snapshot, "torch updated")
+        }
+
+        override suspend fun setNightMode(enabled: Boolean): CameraControlCommandResult {
+            val failure = nextNightModeFailure
+            if (failure != null) {
+                nextNightModeFailure = null
+                snapshot = failure.snapshot
+                return failure
+            }
+            snapshot = snapshot.copy(nightModeEnabled = enabled, lastError = null)
+            return CameraControlCommandResult.Success(snapshot, "night mode updated")
+        }
+
+        override fun controlsSnapshot(): CameraControlsSnapshot = snapshot
+    }
+
     private class TestDispatcherProvider : DispatcherProvider {
         override val io: CoroutineDispatcher = Dispatchers.IO
         override val default: CoroutineDispatcher = Dispatchers.Default
@@ -188,6 +262,20 @@ class ZCamAudioEndpointsIntegrationTest {
         override fun i(message: String) = Unit
         override fun w(message: String) = Unit
         override fun e(throwable: Throwable?, message: String) = Unit
+    }
+
+    private class NoopLoopRecordingManager : LoopRecordingManager {
+        override suspend fun start(config: com.zcam.core.domain.config.LoopRecordingConfig) = Unit
+        override suspend fun stop() = Unit
+        override suspend fun forceRetentionSweep() = Unit
+        override suspend fun isHealthy(): Boolean = true
+        override suspend fun queryRecordings(
+            fromEpochMs: Long?,
+            toEpochMs: Long?,
+            limit: Int
+        ): List<RecordingClipSummary> = emptyList()
+
+        override suspend fun resolveRecordingFile(fileName: String): java.io.File? = null
     }
 
     private class AllowAllSecurityManager : SecurityManager {

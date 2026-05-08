@@ -32,6 +32,16 @@ data class ClientPairingResult(
     val deviceId: String
 )
 
+data class ClientRecordingSummary(
+    val fileName: String,
+    val startedAtEpochMs: Long,
+    val endedAtEpochMs: Long,
+    val durationMs: Long,
+    val sizeBytes: Long,
+    val container: String,
+    val codec: String
+)
+
 sealed interface ClientCallResult<out T> {
     data class Success<T>(val value: T) : ClientCallResult<T>
 
@@ -64,4 +74,13 @@ interface LocalClient {
         deviceId: String,
         displayName: String
     ): ClientCallResult<ClientPairingResult>
+
+    suspend fun fetchRecordings(
+        target: ClientTarget,
+        fromEpochMs: Long? = null,
+        toEpochMs: Long? = null,
+        limit: Int = 120
+    ): ClientCallResult<List<ClientRecordingSummary>>
+
+    fun buildRecordingPlaybackUrl(target: ClientTarget, fileName: String): String
 }

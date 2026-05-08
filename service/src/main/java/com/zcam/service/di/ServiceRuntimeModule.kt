@@ -2,8 +2,10 @@
 
 import com.zcam.service.runtime.DefaultRetryBackoffScheduler
 import com.zcam.service.runtime.InMemoryRuntimeHealthRepository
+import com.zcam.service.runtime.AndroidRuntimeEnvironmentMonitor
 import com.zcam.service.runtime.RecoveryPolicy
 import com.zcam.service.runtime.RetryBackoffScheduler
+import com.zcam.service.runtime.RuntimeEnvironmentMonitor
 import com.zcam.service.runtime.RuntimeHealthRepository
 import dagger.Binds
 import dagger.Module
@@ -23,6 +25,10 @@ abstract class ServiceBindingsModule {
     @Binds
     @Singleton
     abstract fun bindRetryBackoffScheduler(impl: DefaultRetryBackoffScheduler): RetryBackoffScheduler
+
+    @Binds
+    @Singleton
+    abstract fun bindRuntimeEnvironmentMonitor(impl: AndroidRuntimeEnvironmentMonitor): RuntimeEnvironmentMonitor
 }
 
 @Module

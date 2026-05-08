@@ -2,6 +2,7 @@
 
 import com.zcam.camera.CameraRuntime
 import com.zcam.camera.CameraRuntimeImpl
+import com.zcam.camera.CameraControlManager
 import com.zcam.camera.FramePipelineStatusSource
 import com.zcam.camera.MjpegFrameSource
 import com.zcam.camera.VideoRecordingPipeline
@@ -18,6 +19,10 @@ abstract class CameraModule {
     @Binds
     @Singleton
     abstract fun bindCameraRuntime(impl: CameraRuntimeImpl): CameraRuntime
+
+    @Binds
+    @Singleton
+    abstract fun bindCameraControlManager(impl: CameraRuntimeImpl): CameraControlManager
 
     @Binds
     @Singleton

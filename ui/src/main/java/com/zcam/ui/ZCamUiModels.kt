@@ -34,6 +34,22 @@ data class QuickSoundUi(
     val aversive: Boolean
 )
 
+data class RecordingItemUi(
+    val fileName: String,
+    val startedAtEpochMs: Long,
+    val endedAtEpochMs: Long,
+    val durationMs: Long,
+    val sizeBytes: Long
+)
+
+data class RecordingsUiState(
+    val fromInput: String = "",
+    val toInput: String = "",
+    val loading: Boolean = false,
+    val resultMessage: String = "",
+    val items: List<RecordingItemUi> = emptyList()
+)
+
 data class TrustedDeviceUi(
     val deviceId: String,
     val displayName: String,
@@ -114,6 +130,7 @@ data class ZCamUiState(
         deviceId = "android-client",
         displayName = "Android Client"
     ),
+    val recordings: RecordingsUiState = RecordingsUiState(),
     val settings: SettingsUiState = SettingsUiState(),
     val showPairingSuggestionDialog: Boolean = false,
     val errorMessage: String? = null,
@@ -134,6 +151,10 @@ sealed interface ZCamUiAction {
     data object ToggleLiveListen : ZCamUiAction
     data class PlayQuickSound(val clipId: String, val aversive: Boolean) : ZCamUiAction
     data class VolumeChanged(val levelPercent: Int) : ZCamUiAction
+    data class RecordingsFromChanged(val value: String) : ZCamUiAction
+    data class RecordingsToChanged(val value: String) : ZCamUiAction
+    data object FetchRecordings : ZCamUiAction
+    data class PlayRecording(val fileName: String) : ZCamUiAction
 
     data object RequestPairingQr : ZCamUiAction
     data class PairingPayloadChanged(val value: String) : ZCamUiAction

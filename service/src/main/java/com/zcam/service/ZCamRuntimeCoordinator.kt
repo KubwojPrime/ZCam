@@ -3,7 +3,12 @@
 import com.zcam.audio.PushToTalkManager
 import com.zcam.camera.CameraRuntime
 import com.zcam.core.dispatchers.DispatcherProvider
+import com.zcam.core.domain.config.RuntimeSettings
+import com.zcam.core.domain.config.RuntimeSettingsDefaults
+import com.zcam.core.domain.config.StreamConfig
+import com.zcam.core.domain.config.VideoResolution
 import com.zcam.core.domain.settings.RuntimeSettingsRepository
+import com.zcam.core.domain.settings.RuntimeCrashRepository
 import com.zcam.core.domain.settings.RuntimeStateRepository
 import com.zcam.core.domain.watchdog.RecoveryReason
 import com.zcam.core.domain.watchdog.RecoveryRequest
@@ -16,10 +21,13 @@ import com.zcam.core.logging.i
 import com.zcam.core.logging.w
 import com.zcam.server.LocalHttpServer
 import com.zcam.service.runtime.ComponentHealthStatus
+import com.zcam.service.runtime.NetworkConnectivity
 import com.zcam.service.runtime.RecoveryPolicy
 import com.zcam.service.runtime.RetryBackoffScheduler
+import com.zcam.service.runtime.RuntimeEnvironmentMonitor
 import com.zcam.service.runtime.RuntimeComponent
 import com.zcam.service.runtime.RuntimeHealthRepository
+import com.zcam.service.runtime.ThermalBand
 import com.zcam.storage.LoopRecordingManager
 import com.zcam.watchdog.WatchdogManager
 import kotlinx.coroutines.CoroutineScope
@@ -45,7 +53,9 @@ class ZCamRuntimeCoordinator @Inject constructor(
     private val pushToTalkManager: PushToTalkManager,
     private val loopRecordingManager: LoopRecordingManager,
     private val watchdogManager: WatchdogManager,
+    private val runtimeEnvironmentMonitor: RuntimeEnvironmentMonitor,
     private val runtimeSettingsRepository: RuntimeSettingsRepository,
+    private val runtimeCrashRepository: RuntimeCrashRepository,
     private val runtimeStateRepository: RuntimeStateRepository,
     private val runtimeHealthRepository: RuntimeHealthRepository,
     private val recoveryPolicy: RecoveryPolicy,
@@ -66,11 +76,23 @@ class ZCamRuntimeCoordinator @Inject constructor(
 
     private var heartbeatJob: Job? = null
     private var recoveryCollectorJob: Job? = null
+    private var thermalCollectorJob: Job? = null
+    private var networkCollectorJob: Job? = null
 
     @Volatile
     private var activeComponents: Map<RuntimeComponent, ManagedComponent> = emptyMap()
     @Volatile
     private var watchdogRecoveryEnabled: Boolean = true
+    @Volatile
+    private var activeRuntimeSettings: RuntimeSettings = RuntimeSettingsDefaults.value
+    @Volatile
+    private var activeStreamConfig: StreamConfig = RuntimeSettingsDefaults.value.stream
+    @Volatile
+    private var activeThermalBand: ThermalBand = ThermalBand.NOMINAL
+    @Volatile
+    private var lastNetworkConnectivity: NetworkConnectivity = NetworkConnectivity(connected = true)
+    @Volatile
+    private var storageSuspendedByThermal: Boolean = false
 
     suspend fun start() = withContext(dispatchers.io) {
         if (!isRunning.compareAndSet(false, true)) {
@@ -80,10 +102,14 @@ class ZCamRuntimeCoordinator @Inject constructor(
 
         runCatching {
             runtimeStateRepository.setDesiredRunning(true)
+            runtimeCrashRepository.markRuntimeDirty()
             runtimeHealthRepository.reset()
             recoveryAttempts.clear()
+            storageSuspendedByThermal = false
 
             val settings = runtimeSettingsRepository.settings.first()
+            activeRuntimeSettings = settings
+            activeStreamConfig = settings.stream
             watchdogRecoveryEnabled = settings.featureFlags.watchdogRecovery
             activeComponents = buildActiveComponents(settings)
             componentByKey.clear()
@@ -91,16 +117,26 @@ class ZCamRuntimeCoordinator @Inject constructor(
 
             logger.i(LogEventId.RUNTIME_START_SEQUENCE, "Runtime start sequence")
 
+            runtimeEnvironmentMonitor.start()
+            lastNetworkConnectivity = runtimeEnvironmentMonitor.networkConnectivity.value
+            activeThermalBand = runtimeEnvironmentMonitor.thermalBand.value
+
             watchdogManager.start()
             registerWatchdogComponents()
             startRecoveryCollector()
+            startEnvironmentCollectors()
 
             for (component in startOrder()) {
                 startComponent(component)
             }
 
+            applyThermalPolicy(activeThermalBand)
+
             startHeartbeatLoop()
         }.onFailure { error ->
+            runCatching {
+                runtimeCrashRepository.markCrash("runtime startup failed: ${error.message}")
+            }
             logger.e(LogEventId.COMPONENT_FAILED, error, "Runtime startup failed")
             isRunning.set(false)
             stopInternal(persistDesiredState = false)
@@ -132,8 +168,20 @@ class ZCamRuntimeCoordinator @Inject constructor(
         recoveryCollectorJob?.cancel()
         recoveryCollectorJob = null
 
+        thermalCollectorJob?.cancel()
+        thermalCollectorJob = null
+
+        networkCollectorJob?.cancel()
+        networkCollectorJob = null
+
         for (component in stopOrder()) {
             stopComponent(component)
+        }
+
+        runCatching {
+            runtimeEnvironmentMonitor.stop()
+        }.onFailure { error ->
+            logger.w(LogEventId.COMPONENT_FAILED, "Failed to stop runtime environment monitor: ${error.message}")
         }
 
         watchdogManager.stop()
@@ -143,11 +191,32 @@ class ZCamRuntimeCoordinator @Inject constructor(
             eventId = LogEventId.WATCHDOG_STOPPED,
             message = "watchdog stopped"
         )
+        runtimeHealthRepository.mark(
+            component = RuntimeComponent.THERMAL,
+            status = ComponentHealthStatus.STOPPED,
+            eventId = LogEventId.RUNTIME_STOP_SEQUENCE,
+            message = "thermal monitor stopped"
+        )
+        runtimeHealthRepository.mark(
+            component = RuntimeComponent.NETWORK,
+            status = ComponentHealthStatus.STOPPED,
+            eventId = LogEventId.RUNTIME_STOP_SEQUENCE,
+            message = "network monitor stopped"
+        )
 
         activeComponents = emptyMap()
         componentByKey.clear()
         recoveryAttempts.clear()
         watchdogRecoveryEnabled = true
+        storageSuspendedByThermal = false
+        activeRuntimeSettings = RuntimeSettingsDefaults.value
+        activeStreamConfig = RuntimeSettingsDefaults.value.stream
+        activeThermalBand = ThermalBand.NOMINAL
+        lastNetworkConnectivity = NetworkConnectivity(connected = true)
+
+        runCatching {
+            runtimeCrashRepository.markRuntimeClean()
+        }
     }
 
     private fun startRecoveryCollector() {
@@ -157,12 +226,162 @@ class ZCamRuntimeCoordinator @Inject constructor(
             watchdogManager.recoveryEvents.collect { request ->
                 if (!watchdogRecoveryEnabled) return@collect
                 val component = componentByKey[request.component] ?: return@collect
+                if (component == RuntimeComponent.STORAGE && storageSuspendedByThermal) {
+                    return@collect
+                }
                 launch {
                     recoverComponent(component, request)
                 }
             }
         }
     }
+
+    private fun startEnvironmentCollectors() {
+        if (thermalCollectorJob?.isActive != true) {
+            thermalCollectorJob = runtimeScope.launch {
+                runtimeEnvironmentMonitor.thermalBand.collect { band ->
+                    if (band == activeThermalBand) return@collect
+                    handleThermalBandChanged(band)
+                }
+            }
+        }
+
+        if (networkCollectorJob?.isActive != true) {
+            networkCollectorJob = runtimeScope.launch {
+                runtimeEnvironmentMonitor.networkConnectivity.collect { connectivity ->
+                    handleNetworkConnectivityChanged(connectivity)
+                }
+            }
+        }
+    }
+
+    private suspend fun handleThermalBandChanged(band: ThermalBand) {
+        activeThermalBand = band
+        val status = when (band) {
+            ThermalBand.NOMINAL -> ComponentHealthStatus.HEALTHY
+            ThermalBand.THROTTLED -> ComponentHealthStatus.RECOVERING
+            ThermalBand.CRITICAL -> ComponentHealthStatus.FAILED
+        }
+        runtimeHealthRepository.mark(
+            component = RuntimeComponent.THERMAL,
+            status = status,
+            eventId = LogEventId.THERMAL_BAND_CHANGED,
+            message = "thermal band=${band.name.lowercase()}"
+        )
+        logger.w(LogEventId.THERMAL_BAND_CHANGED, "Thermal band changed to ${band.name}")
+        applyThermalPolicy(band)
+    }
+
+    private suspend fun handleNetworkConnectivityChanged(connectivity: NetworkConnectivity) {
+        val previous = lastNetworkConnectivity
+        lastNetworkConnectivity = connectivity
+        if (previous == connectivity) return
+
+        if (connectivity.connected) {
+            runtimeHealthRepository.mark(
+                component = RuntimeComponent.NETWORK,
+                status = ComponentHealthStatus.HEALTHY,
+                eventId = LogEventId.NETWORK_RECONNECTED,
+                message = "network connected via ${connectivity.transport}"
+            )
+            logger.i(LogEventId.NETWORK_RECONNECTED, "Network connected via ${connectivity.transport}")
+            if (!previous.connected && isRunning.get()) {
+                logger.w(LogEventId.RECOVERY_RECONNECT_TRIGGERED, "Triggering server reconnect recovery")
+                runtimeScope.launch {
+                    recoverComponent(
+                        component = RuntimeComponent.SERVER,
+                        request = RecoveryRequest(
+                            component = SERVER_KEY,
+                            reason = RecoveryReason.RESOURCE_LOST,
+                            details = "network reconnected on ${connectivity.transport}",
+                            attempt = 0
+                        )
+                    )
+                }
+            }
+        } else {
+            runtimeHealthRepository.mark(
+                component = RuntimeComponent.NETWORK,
+                status = ComponentHealthStatus.RECOVERING,
+                eventId = LogEventId.NETWORK_LOST,
+                message = "network unavailable"
+            )
+            logger.w(LogEventId.NETWORK_LOST, "Network connectivity lost")
+        }
+    }
+
+    private suspend fun applyThermalPolicy(band: ThermalBand) {
+        val desiredStream = thermalAdjustedStream(activeRuntimeSettings.stream, band)
+        val shouldSuspendStorage = band == ThermalBand.CRITICAL
+        val hasCamera = activeComponents.containsKey(RuntimeComponent.CAMERA)
+
+        val streamChanged = desiredStream != activeStreamConfig
+        if (hasCamera && streamChanged) {
+            val storageWasRunning = isStorageRuntimeActive()
+            if (storageWasRunning) {
+                stopComponent(RuntimeComponent.STORAGE)
+            }
+            stopComponent(RuntimeComponent.CAMERA)
+            activeStreamConfig = desiredStream
+            startComponent(RuntimeComponent.CAMERA)
+            logger.w(
+                LogEventId.THERMAL_THROTTLE_APPLIED,
+                "Applied thermal stream profile ${desiredStream.resolution.width}x${desiredStream.resolution.height}@${desiredStream.fps}"
+            )
+            if (storageWasRunning && !shouldSuspendStorage) {
+                startComponent(RuntimeComponent.STORAGE)
+            }
+        } else {
+            activeStreamConfig = desiredStream
+        }
+
+        if (!activeComponents.containsKey(RuntimeComponent.STORAGE)) return
+
+        if (shouldSuspendStorage) {
+            if (isStorageRuntimeActive()) {
+                stopComponent(RuntimeComponent.STORAGE)
+                logger.w(LogEventId.THERMAL_RECORDING_SUSPENDED, "Recording suspended due to critical thermal state")
+            }
+            storageSuspendedByThermal = true
+        } else if (storageSuspendedByThermal) {
+            startComponent(RuntimeComponent.STORAGE)
+            storageSuspendedByThermal = false
+            logger.i(LogEventId.THERMAL_RECORDING_RESUMED, "Recording resumed after thermal recovery")
+        }
+    }
+
+    private fun isStorageRuntimeActive(): Boolean {
+        val status = health.value.components[RuntimeComponent.STORAGE]?.status ?: return false
+        return status == ComponentHealthStatus.HEALTHY ||
+            status == ComponentHealthStatus.STARTING ||
+            status == ComponentHealthStatus.RECOVERING
+    }
+
+    private fun thermalAdjustedStream(base: StreamConfig, band: ThermalBand): StreamConfig {
+        return when (band) {
+            ThermalBand.NOMINAL -> base
+            ThermalBand.THROTTLED -> {
+                val fps = base.fps.coerceAtMost(10)
+                val width = even((base.resolution.width * 3 / 4).coerceAtLeast(640))
+                val height = even((base.resolution.height * 3 / 4).coerceAtLeast(360))
+                base.copy(
+                    fps = fps,
+                    resolution = VideoResolution(width = width, height = height)
+                )
+            }
+            ThermalBand.CRITICAL -> {
+                val fps = base.fps.coerceAtMost(6)
+                val width = even(base.resolution.width.coerceAtMost(640))
+                val height = even(base.resolution.height.coerceAtMost(360))
+                base.copy(
+                    fps = fps,
+                    resolution = VideoResolution(width = width, height = height)
+                )
+            }
+        }
+    }
+
+    private fun even(value: Int): Int = if (value % 2 == 0) value else (value - 1).coerceAtLeast(2)
 
     private fun startHeartbeatLoop() {
         if (heartbeatJob?.isActive == true) return
@@ -230,6 +449,28 @@ class ZCamRuntimeCoordinator @Inject constructor(
                 details = "component registered"
             )
         }
+
+        runtimeHealthRepository.mark(
+            component = RuntimeComponent.THERMAL,
+            status = ComponentHealthStatus.HEALTHY,
+            eventId = LogEventId.THERMAL_BAND_CHANGED,
+            message = "thermal band=${activeThermalBand.name.lowercase()}"
+        )
+        val networkStatus = if (lastNetworkConnectivity.connected) {
+            ComponentHealthStatus.HEALTHY
+        } else {
+            ComponentHealthStatus.RECOVERING
+        }
+        runtimeHealthRepository.mark(
+            component = RuntimeComponent.NETWORK,
+            status = networkStatus,
+            eventId = if (lastNetworkConnectivity.connected) LogEventId.NETWORK_RECONNECTED else LogEventId.NETWORK_LOST,
+            message = if (lastNetworkConnectivity.connected) {
+                "network connected via ${lastNetworkConnectivity.transport}"
+            } else {
+                "network unavailable"
+            }
+        )
     }
 
     private suspend fun startComponent(component: RuntimeComponent) {
@@ -405,7 +646,7 @@ class ZCamRuntimeCoordinator @Inject constructor(
     }
 
     private fun buildActiveComponents(
-        settings: com.zcam.core.domain.config.RuntimeSettings
+        settings: RuntimeSettings
     ): Map<RuntimeComponent, ManagedComponent> {
         val flags = settings.featureFlags
         val map = linkedMapOf<RuntimeComponent, ManagedComponent>()
@@ -424,7 +665,7 @@ class ZCamRuntimeCoordinator @Inject constructor(
                 component = RuntimeComponent.CAMERA,
                 watchdogKey = CAMERA_KEY,
                 timeoutMs = 25_000L,
-                start = { cameraRuntime.start(settings.stream) },
+                start = { cameraRuntime.start(activeStreamConfig) },
                 stop = { cameraRuntime.stop() },
                 healthCheck = { cameraRuntime.isHealthy() }
             )

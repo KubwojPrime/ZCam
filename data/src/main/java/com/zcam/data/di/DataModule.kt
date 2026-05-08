@@ -2,6 +2,8 @@
 
 import com.zcam.core.domain.settings.RuntimeSettingsRepository
 import com.zcam.core.domain.settings.RuntimeStateRepository
+import com.zcam.core.domain.settings.RuntimeCrashRepository
+import com.zcam.data.DataStoreRuntimeCrashRepository
 import com.zcam.data.DataStoreRuntimeSettingsRepository
 import com.zcam.data.DataStoreRuntimeStateRepository
 import dagger.Binds
@@ -25,4 +27,10 @@ abstract class DataModule {
     abstract fun bindRuntimeStateRepository(
         impl: DataStoreRuntimeStateRepository
     ): RuntimeStateRepository
+
+    @Binds
+    @Singleton
+    abstract fun bindRuntimeCrashRepository(
+        impl: DataStoreRuntimeCrashRepository
+    ): RuntimeCrashRepository
 }

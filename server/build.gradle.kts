@@ -27,6 +27,7 @@ dependencies {
     implementation(project(":core"))
     implementation(project(":camera"))
     implementation(project(":audio"))
+    implementation(project(":storage"))
     implementation(project(":security"))
 
     implementation(libs.nanohttpd)
