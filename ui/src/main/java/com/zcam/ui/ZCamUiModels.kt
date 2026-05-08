@@ -1,5 +1,7 @@
 package com.zcam.ui
 
+import com.zcam.core.domain.config.FeatureFlag
+
 enum class ZCamMode {
     SERVER,
     CLIENT
@@ -7,7 +9,8 @@ enum class ZCamMode {
 
 enum class ZCamScreen {
     MAIN,
-    PAIRING
+    PAIRING,
+    SETTINGS
 }
 
 enum class StatusTone {
@@ -29,6 +32,36 @@ data class QuickSoundUi(
     val clipId: String,
     val label: String,
     val aversive: Boolean
+)
+
+data class TrustedDeviceUi(
+    val deviceId: String,
+    val displayName: String,
+    val addedAtEpochMillis: Long
+)
+
+data class SettingsUiState(
+    val serverPortInput: String = "8080",
+    val streamWidthInput: String = "1280",
+    val streamHeightInput: String = "720",
+    val streamFpsInput: String = "15",
+    val streamCodecLabel: String = "H264",
+    val segmentMinutesInput: String = "5",
+    val maxStorageGbInput: String = "32",
+    val minFreeStorageGbInput: String = "5",
+    val pinInput: String = "0000",
+    val apiTokenInput: String = "local-token",
+    val mjpegStreamingEnabled: Boolean = true,
+    val loopRecordingEnabled: Boolean = true,
+    val audioPushToTalkEnabled: Boolean = true,
+    val audioLiveEnabled: Boolean = true,
+    val audioPlaybackEnabled: Boolean = true,
+    val trustedDevicesEnabled: Boolean = true,
+    val watchdogRecoveryEnabled: Boolean = true,
+    val trustedDevices: List<TrustedDeviceUi> = emptyList(),
+    val saving: Boolean = false,
+    val resultMessage: String = "",
+    val resultTone: StatusTone = StatusTone.NEUTRAL
 )
 
 data class PairingUiState(
@@ -77,10 +110,12 @@ data class ZCamUiState(
     val clientStatusLabel: String = "Client disconnected",
     val serverLanHost: String = "",
     val pairing: PairingUiState = PairingUiState(
-        pin = "",
+        pin = "0000",
         deviceId = "android-client",
         displayName = "Android Client"
     ),
+    val settings: SettingsUiState = SettingsUiState(),
+    val showPairingSuggestionDialog: Boolean = false,
     val errorMessage: String? = null,
     val working: Boolean = false
 )
@@ -109,6 +144,22 @@ sealed interface ZCamUiAction {
     data class PairingDeviceIdChanged(val value: String) : ZCamUiAction
     data class PairingDisplayNameChanged(val value: String) : ZCamUiAction
     data object SubmitPairing : ZCamUiAction
+
+    data class SettingsServerPortChanged(val value: String) : ZCamUiAction
+    data class SettingsStreamWidthChanged(val value: String) : ZCamUiAction
+    data class SettingsStreamHeightChanged(val value: String) : ZCamUiAction
+    data class SettingsStreamFpsChanged(val value: String) : ZCamUiAction
+    data class SettingsSegmentMinutesChanged(val value: String) : ZCamUiAction
+    data class SettingsMaxStorageGbChanged(val value: String) : ZCamUiAction
+    data class SettingsMinFreeStorageGbChanged(val value: String) : ZCamUiAction
+    data class SettingsPinChanged(val value: String) : ZCamUiAction
+    data class SettingsApiTokenChanged(val value: String) : ZCamUiAction
+    data class SettingsFlagChanged(val flag: FeatureFlag, val enabled: Boolean) : ZCamUiAction
+    data class RevokeTrustedDevice(val deviceId: String) : ZCamUiAction
+    data object SaveSettings : ZCamUiAction
+
+    data object OpenPairingFromSuggestion : ZCamUiAction
+    data object DismissPairingSuggestion : ZCamUiAction
 
     data object ClearError : ZCamUiAction
 }

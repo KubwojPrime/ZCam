@@ -11,9 +11,12 @@ import com.zcam.client.ClientCallResult
 import com.zcam.client.ClientTarget
 import com.zcam.client.LocalClient
 import com.zcam.core.dispatchers.DispatcherProvider
+import com.zcam.core.domain.config.FeatureFlag
 import com.zcam.core.domain.config.RuntimeSettings
 import com.zcam.core.domain.config.RuntimeSettingsDefaults
+import com.zcam.core.domain.config.TrustedDevice
 import com.zcam.core.domain.settings.RuntimeSettingsRepository
+import com.zcam.core.domain.settings.RuntimeSettingsUpdateResult
 import com.zcam.core.domain.settings.RuntimeStateRepository
 import com.zcam.core.logging.ZCamLogger
 import com.zcam.service.ZCamForegroundService
@@ -22,8 +25,11 @@ import com.zcam.service.runtime.ComponentHealthStatus
 import com.zcam.service.runtime.RuntimeHealthRepository
 import com.zcam.service.runtime.RuntimeOverallStatus
 import com.zcam.ui.ComponentStatusUi
+import com.zcam.ui.SettingsUiState
 import com.zcam.ui.StatusTone
+import com.zcam.ui.TrustedDeviceUi
 import com.zcam.ui.ZCamMode
+import com.zcam.ui.ZCamScreen
 import com.zcam.ui.ZCamUiAction
 import com.zcam.ui.ZCamUiState
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -76,6 +82,11 @@ class ZCamMainViewModel @Inject constructor(
                 _state.update { current ->
                     current.copy(
                         mode = action.mode,
+                        pairing = if (action.mode == ZCamMode.SERVER) {
+                            current.pairing.copy(pin = settingsSnapshot.security.pinCode)
+                        } else {
+                            current.pairing
+                        },
                         errorMessage = null
                     )
                 }
@@ -121,6 +132,25 @@ class ZCamMainViewModel @Inject constructor(
             }
 
             ZCamUiAction.SubmitPairing -> submitPairing()
+            is ZCamUiAction.SettingsServerPortChanged -> updateSettingsDraft { copy(serverPortInput = action.value.filter(Char::isDigit).take(5)) }
+            is ZCamUiAction.SettingsStreamWidthChanged -> updateSettingsDraft { copy(streamWidthInput = action.value.filter(Char::isDigit).take(5)) }
+            is ZCamUiAction.SettingsStreamHeightChanged -> updateSettingsDraft { copy(streamHeightInput = action.value.filter(Char::isDigit).take(5)) }
+            is ZCamUiAction.SettingsStreamFpsChanged -> updateSettingsDraft { copy(streamFpsInput = action.value.filter(Char::isDigit).take(2)) }
+            is ZCamUiAction.SettingsSegmentMinutesChanged -> updateSettingsDraft { copy(segmentMinutesInput = action.value.filter(Char::isDigit).take(2)) }
+            is ZCamUiAction.SettingsMaxStorageGbChanged -> updateSettingsDraft { copy(maxStorageGbInput = action.value.filter(Char::isDigit).take(3)) }
+            is ZCamUiAction.SettingsMinFreeStorageGbChanged -> updateSettingsDraft { copy(minFreeStorageGbInput = action.value.filter(Char::isDigit).take(3)) }
+            is ZCamUiAction.SettingsPinChanged -> updateSettingsDraft { copy(pinInput = action.value.filter(Char::isDigit).take(10)) }
+            is ZCamUiAction.SettingsApiTokenChanged -> updateSettingsDraft { copy(apiTokenInput = action.value.trim().take(128)) }
+            is ZCamUiAction.SettingsFlagChanged -> updateSettingsFeatureFlag(action.flag, action.enabled)
+            is ZCamUiAction.RevokeTrustedDevice -> revokeTrustedDevice(action.deviceId)
+            ZCamUiAction.SaveSettings -> saveSettings()
+            ZCamUiAction.OpenPairingFromSuggestion -> _state.update {
+                it.copy(
+                    screen = ZCamScreen.PAIRING,
+                    showPairingSuggestionDialog = false
+                )
+            }
+            ZCamUiAction.DismissPairingSuggestion -> _state.update { it.copy(showPairingSuggestionDialog = false) }
             ZCamUiAction.ClearError -> _state.update { it.copy(errorMessage = null) }
         }
     }
@@ -130,7 +160,7 @@ class ZCamMainViewModel @Inject constructor(
             _state.update { current ->
                 current.copy(
                     mode = ZCamMode.CLIENT,
-                    screen = com.zcam.ui.ZCamScreen.PAIRING,
+                    screen = ZCamScreen.PAIRING,
                     pairing = current.pairing.copy(payloadInput = payload)
                 )
             }
@@ -149,7 +179,13 @@ class ZCamMainViewModel @Inject constructor(
                             nextPort
                         } else {
                             state.clientPort
-                        }
+                        },
+                        settings = settings.toUiSettings(
+                            previous = state.settings
+                        ),
+                        pairing = state.pairing.copy(
+                            pin = if (state.mode == ZCamMode.SERVER) settings.security.pinCode else state.pairing.pin
+                        )
                     )
                 }
                 refreshServerLanHost()
@@ -263,16 +299,25 @@ class ZCamMainViewModel @Inject constructor(
     private fun startRuntime() {
         viewModelScope.launch(dispatchers.io) {
             _state.update { it.copy(working = true, errorMessage = null) }
+            var started = false
             runCatching {
                 ContextCompat.startForegroundService(
                     appContext,
                     ZCamForegroundService.startIntent(appContext)
                 )
+                started = true
             }.onFailure { error ->
                 logger.w("Start runtime failed: ${error.message}")
                 _state.update { it.copy(errorMessage = "Failed to start runtime: ${error.message}") }
             }
-            _state.update { it.copy(working = false) }
+            _state.update { current ->
+                current.copy(
+                    working = false,
+                    showPairingSuggestionDialog = started &&
+                        current.mode == ZCamMode.SERVER &&
+                        settingsSnapshot.security.trustedDevices.isEmpty()
+                )
+            }
         }
     }
 
@@ -285,7 +330,7 @@ class ZCamMainViewModel @Inject constructor(
                 logger.w("Stop runtime failed: ${error.message}")
                 _state.update { it.copy(errorMessage = "Failed to stop runtime: ${error.message}") }
             }
-            _state.update { it.copy(working = false) }
+            _state.update { it.copy(working = false, showPairingSuggestionDialog = false) }
         }
     }
 
@@ -479,6 +524,200 @@ class ZCamMainViewModel @Inject constructor(
         }
     }
 
+    private fun updateSettingsDraft(transform: SettingsUiState.() -> SettingsUiState) {
+        _state.update { current ->
+            current.copy(
+                settings = current.settings.transform().copy(
+                    resultMessage = "",
+                    resultTone = StatusTone.NEUTRAL
+                ),
+                errorMessage = null
+            )
+        }
+    }
+
+    private fun updateSettingsFeatureFlag(flag: FeatureFlag, enabled: Boolean) {
+        updateSettingsDraft {
+            when (flag) {
+                FeatureFlag.MJPEG_STREAMING -> copy(mjpegStreamingEnabled = enabled)
+                FeatureFlag.LOOP_RECORDING -> copy(loopRecordingEnabled = enabled)
+                FeatureFlag.AUDIO_PUSH_TO_TALK -> copy(audioPushToTalkEnabled = enabled)
+                FeatureFlag.AUDIO_LIVE -> copy(audioLiveEnabled = enabled)
+                FeatureFlag.AUDIO_PLAYBACK -> copy(audioPlaybackEnabled = enabled)
+                FeatureFlag.TRUSTED_DEVICES -> copy(trustedDevicesEnabled = enabled)
+                FeatureFlag.WATCHDOG_RECOVERY -> copy(watchdogRecoveryEnabled = enabled)
+            }
+        }
+    }
+
+    private fun saveSettings() {
+        viewModelScope.launch(dispatchers.io) {
+            val current = state.value
+            val draft = current.settings
+            val serverPort = draft.serverPortInput.toIntOrNull()
+            val streamWidth = draft.streamWidthInput.toIntOrNull()
+            val streamHeight = draft.streamHeightInput.toIntOrNull()
+            val streamFps = draft.streamFpsInput.toIntOrNull()
+            val segmentMinutes = draft.segmentMinutesInput.toIntOrNull()
+            val maxStorage = draft.maxStorageGbInput.toIntOrNull()
+            val minFree = draft.minFreeStorageGbInput.toIntOrNull()
+
+            val invalidFieldMessage = when {
+                serverPort == null -> "Invalid server port"
+                streamWidth == null -> "Invalid stream width"
+                streamHeight == null -> "Invalid stream height"
+                streamFps == null -> "Invalid stream FPS"
+                segmentMinutes == null -> "Invalid segment duration"
+                maxStorage == null -> "Invalid max storage value"
+                minFree == null -> "Invalid min free storage value"
+                draft.pinInput.isBlank() -> "PIN is required"
+                draft.apiTokenInput.isBlank() -> "API token is required"
+                else -> null
+            }
+
+            if (invalidFieldMessage != null) {
+                _state.update {
+                    it.copy(
+                        settings = it.settings.copy(
+                            saving = false,
+                            resultMessage = invalidFieldMessage,
+                            resultTone = StatusTone.ERROR
+                        ),
+                        errorMessage = invalidFieldMessage
+                    )
+                }
+                return@launch
+            }
+
+            _state.update {
+                it.copy(
+                    settings = it.settings.copy(
+                        saving = true,
+                        resultMessage = "",
+                        resultTone = StatusTone.NEUTRAL
+                    ),
+                    errorMessage = null
+                )
+            }
+
+            val candidate = settingsSnapshot.copy(
+                serverPort = serverPort!!,
+                stream = settingsSnapshot.stream.copy(
+                    resolution = settingsSnapshot.stream.resolution.copy(
+                        width = streamWidth!!,
+                        height = streamHeight!!
+                    ),
+                    fps = streamFps!!
+                ),
+                recording = settingsSnapshot.recording.copy(
+                    segmentMinutes = segmentMinutes!!,
+                    maxStorageGb = maxStorage!!,
+                    minFreeStorageGb = minFree!!
+                ),
+                security = settingsSnapshot.security.copy(
+                    pinCode = draft.pinInput,
+                    apiToken = draft.apiTokenInput
+                ),
+                featureFlags = settingsSnapshot.featureFlags.copy(
+                    mjpegStreaming = draft.mjpegStreamingEnabled,
+                    loopRecording = draft.loopRecordingEnabled,
+                    audioPushToTalk = draft.audioPushToTalkEnabled,
+                    audioLive = draft.audioLiveEnabled,
+                    audioPlayback = draft.audioPlaybackEnabled,
+                    trustedDevices = draft.trustedDevicesEnabled,
+                    watchdogRecovery = draft.watchdogRecoveryEnabled
+                )
+            )
+
+            when (val result = runtimeSettingsRepository.updateSettings(candidate)) {
+                is RuntimeSettingsUpdateResult.Success -> {
+                    _state.update {
+                        it.copy(
+                            settings = it.settings.copy(
+                                saving = false,
+                                resultMessage = "Settings saved",
+                                resultTone = StatusTone.HEALTHY
+                            ),
+                            pairing = if (it.mode == ZCamMode.SERVER) {
+                                it.pairing.copy(pin = candidate.security.pinCode)
+                            } else {
+                                it.pairing
+                            },
+                            errorMessage = null
+                        )
+                    }
+                }
+                is RuntimeSettingsUpdateResult.ValidationFailed -> {
+                    val reason = result.errors.joinToString(separator = "; ")
+                    _state.update {
+                        it.copy(
+                            settings = it.settings.copy(
+                                saving = false,
+                                resultMessage = "Validation failed: $reason",
+                                resultTone = StatusTone.ERROR
+                            ),
+                            errorMessage = "Validation failed: $reason"
+                        )
+                    }
+                }
+                is RuntimeSettingsUpdateResult.Forbidden -> {
+                    _state.update {
+                        it.copy(
+                            settings = it.settings.copy(
+                                saving = false,
+                                resultMessage = "Forbidden: ${result.reason}",
+                                resultTone = StatusTone.ERROR
+                            ),
+                            errorMessage = "Forbidden: ${result.reason}"
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private fun revokeTrustedDevice(deviceId: String) {
+        viewModelScope.launch(dispatchers.io) {
+            if (deviceId.isBlank()) return@launch
+            when (val result = runtimeSettingsRepository.removeTrustedDevice(deviceId)) {
+                is RuntimeSettingsUpdateResult.Success -> {
+                    _state.update {
+                        it.copy(
+                            settings = it.settings.copy(
+                                resultMessage = "Device revoked: $deviceId",
+                                resultTone = StatusTone.HEALTHY
+                            ),
+                            errorMessage = null
+                        )
+                    }
+                }
+                is RuntimeSettingsUpdateResult.ValidationFailed -> {
+                    val reason = result.errors.joinToString(separator = "; ")
+                    _state.update {
+                        it.copy(
+                            settings = it.settings.copy(
+                                resultMessage = "Revoke failed: $reason",
+                                resultTone = StatusTone.ERROR
+                            ),
+                            errorMessage = "Revoke failed: $reason"
+                        )
+                    }
+                }
+                is RuntimeSettingsUpdateResult.Forbidden -> {
+                    _state.update {
+                        it.copy(
+                            settings = it.settings.copy(
+                                resultMessage = "Revoke forbidden: ${result.reason}",
+                                resultTone = StatusTone.ERROR
+                            ),
+                            errorMessage = "Revoke forbidden: ${result.reason}"
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     private fun currentTargetForCommands(): ClientTarget {
         val currentState = state.value
         return if (currentState.mode == ZCamMode.SERVER) {
@@ -548,6 +787,38 @@ class ZCamMainViewModel @Inject constructor(
             details = lastMessage,
             recoveryAttempts = recoveryAttempts,
             tone = tone
+        )
+    }
+
+    private fun RuntimeSettings.toUiSettings(previous: SettingsUiState): SettingsUiState {
+        return previous.copy(
+            serverPortInput = serverPort.toString(),
+            streamWidthInput = stream.resolution.width.toString(),
+            streamHeightInput = stream.resolution.height.toString(),
+            streamFpsInput = stream.fps.toString(),
+            streamCodecLabel = stream.codec.name,
+            segmentMinutesInput = recording.segmentMinutes.toString(),
+            maxStorageGbInput = recording.maxStorageGb.toString(),
+            minFreeStorageGbInput = recording.minFreeStorageGb.toString(),
+            pinInput = security.pinCode,
+            apiTokenInput = security.apiToken,
+            mjpegStreamingEnabled = featureFlags.mjpegStreaming,
+            loopRecordingEnabled = featureFlags.loopRecording,
+            audioPushToTalkEnabled = featureFlags.audioPushToTalk,
+            audioLiveEnabled = featureFlags.audioLive,
+            audioPlaybackEnabled = featureFlags.audioPlayback,
+            trustedDevicesEnabled = featureFlags.trustedDevices,
+            watchdogRecoveryEnabled = featureFlags.watchdogRecovery,
+            trustedDevices = security.trustedDevices
+                .sortedByDescending(TrustedDevice::addedAtEpochMillis)
+                .map { device ->
+                    TrustedDeviceUi(
+                        deviceId = device.deviceId,
+                        displayName = device.displayName,
+                        addedAtEpochMillis = device.addedAtEpochMillis
+                    )
+                },
+            saving = false
         )
     }
 
