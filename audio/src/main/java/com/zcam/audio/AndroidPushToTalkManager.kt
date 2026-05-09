@@ -16,7 +16,8 @@ import javax.inject.Singleton
 @Singleton
 class AndroidPushToTalkManager @Inject constructor(
     private val dispatchers: DispatcherProvider,
-    private val logger: ZCamLogger
+    private val logger: ZCamLogger,
+    private val systemVolumeController: SystemVolumeController
 ) : PushToTalkManager {
 
     private val stateMutex = Mutex()
@@ -51,6 +52,11 @@ class AndroidPushToTalkManager @Inject constructor(
             liveListening = false
             playingBack = false
             activeClipId = null
+            systemVolumeController.currentMusicVolumePercent()
+                ?.coerceIn(MIN_VOLUME_PERCENT, MAX_VOLUME_PERCENT)
+                ?.let { detectedVolume ->
+                    volumePercent = detectedVolume
+                }
             updateSnapshotLocked()
             logger.i(LogEventId.AUDIO_ENGINE_STARTED, "Audio engine started")
         }
@@ -218,9 +224,21 @@ class AndroidPushToTalkManager @Inject constructor(
                 )
             }
 
-            volumePercent = levelPercent
+            val systemVolumeResult = systemVolumeController.setMusicVolumePercent(levelPercent)
+            if (!systemVolumeResult.applied) {
+                return@withLock rejectLocked(
+                    code = AudioCommandErrorCode.SYSTEM_VOLUME_UNAVAILABLE,
+                    message = systemVolumeResult.reason ?: "system volume control unavailable"
+                )
+            }
+
+            volumePercent = (systemVolumeResult.actualPercent ?: levelPercent)
+                .coerceIn(MIN_VOLUME_PERCENT, MAX_VOLUME_PERCENT)
             val updated = updateSnapshotLocked()
-            logger.i(LogEventId.AUDIO_VOLUME_UPDATED, "Audio volume set to $levelPercent%")
+            logger.i(
+                LogEventId.AUDIO_VOLUME_UPDATED,
+                "Audio volume set to $volumePercent% (requested=$levelPercent stream=${systemVolumeResult.streamVolume}/${systemVolumeResult.streamMaxVolume})"
+            )
             AudioCommandResult.Success(
                 state = updated,
                 message = "volume updated"

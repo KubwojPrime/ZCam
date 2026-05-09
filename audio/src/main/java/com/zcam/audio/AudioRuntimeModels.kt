@@ -32,7 +32,8 @@ enum class AudioCommandErrorCode {
     ENGINE_NOT_READY,
     INVALID_ARGUMENT,
     COOLDOWN_ACTIVE,
-    CONFLICT
+    CONFLICT,
+    SYSTEM_VOLUME_UNAVAILABLE
 }
 
 sealed interface AudioCommandResult {

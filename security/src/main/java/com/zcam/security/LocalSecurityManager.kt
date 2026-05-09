@@ -8,6 +8,8 @@ import com.zcam.core.logging.LogEventId
 import com.zcam.core.logging.ZCamLogger
 import com.zcam.core.logging.i
 import com.zcam.core.logging.w
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -24,12 +26,16 @@ class LocalSecurityManager @Inject constructor(
     private val logger: ZCamLogger
 ) : SecurityManager {
 
+    private val pendingPairingRequestsState = MutableStateFlow<List<PendingPairingRequest>>(emptyList())
+    override val pendingPairingRequests = pendingPairingRequestsState.asStateFlow()
+
     private val sanityMutex = Mutex()
     private val tokenMutex = Mutex()
     private val pairingMutex = Mutex()
     private val random = SecureRandom()
 
     private var sanityChecked: Boolean = false
+    private val pendingRequestsById = LinkedHashMap<String, PendingPairingRequest>()
     private val pairingSessions = LinkedHashMap<String, PairingSession>()
 
     override suspend fun validateToken(candidate: String): Boolean {
@@ -136,11 +142,141 @@ class LocalSecurityManager @Inject constructor(
         )
     }
 
+    override suspend fun requestPairing(
+        deviceId: String,
+        displayName: String,
+        clientType: PairingClientType
+    ): PairingRequestStartResult {
+        ensureSanityCheck()
+
+        val normalizedDeviceId = deviceId.trim()
+        val normalizedName = displayName.trim()
+        if (!DEVICE_ID_REGEX.matches(normalizedDeviceId)) {
+            return PairingRequestStartResult.Failure(STATUS_BAD_REQUEST, "invalid_device_id")
+        }
+        if (normalizedName.isBlank()) {
+            return PairingRequestStartResult.Failure(STATUS_BAD_REQUEST, "invalid_display_name")
+        }
+
+        val now = System.currentTimeMillis()
+        return pairingMutex.withLock {
+            purgeExpiredPairingState(now)
+
+            val requestId = randomId(REQUEST_ID_BYTES)
+            val request = PendingPairingRequest(
+                requestId = requestId,
+                deviceId = normalizedDeviceId,
+                displayName = normalizedName,
+                clientType = clientType,
+                verificationCode = randomDigits(PAIRING_CODE_DIGITS),
+                createdAtEpochMs = now,
+                expiresAtEpochMs = now + PAIRING_TTL_MS
+            )
+
+            pendingRequestsById.entries.removeIf { (_, existing) -> existing.deviceId == normalizedDeviceId }
+            pendingRequestsById[requestId] = request
+            publishPendingPairingRequestsLocked()
+
+            logger.i(
+                LogEventId.SECURITY_PAIRING_CHALLENGE_CREATED,
+                "Pending pairing request created requestId=$requestId device=$normalizedDeviceId type=${clientType.name}"
+            )
+
+            PairingRequestStartResult.Success(
+                requestId = request.requestId,
+                deviceId = request.deviceId,
+                displayName = request.displayName,
+                expiresAtEpochMs = request.expiresAtEpochMs
+            )
+        }
+    }
+
+    override suspend fun completePairingRequest(
+        requestId: String,
+        verificationCode: String
+    ): PairingResult {
+        ensureSanityCheck()
+
+        val normalizedRequestId = requestId.trim()
+        val normalizedCode = verificationCode.trim()
+        if (normalizedRequestId.isBlank()) {
+            return PairingResult.Failure(STATUS_BAD_REQUEST, "pairing_request_id_required")
+        }
+        if (!PAIRING_CODE_REGEX.matches(normalizedCode)) {
+            return PairingResult.Failure(STATUS_BAD_REQUEST, "invalid_pairing_code")
+        }
+
+        val now = System.currentTimeMillis()
+        val completion = pairingMutex.withLock {
+            purgeExpiredPairingState(now)
+            val pending = pendingRequestsById[normalizedRequestId]
+                ?: return@withLock PendingPairingCompletion.NotFound
+            if (pending.verificationCode != normalizedCode) {
+                return@withLock PendingPairingCompletion.InvalidCode
+            }
+            pendingRequestsById.remove(normalizedRequestId)
+            publishPendingPairingRequestsLocked()
+            PendingPairingCompletion.Ready(pending)
+        }
+
+        val request = when (completion) {
+            PendingPairingCompletion.NotFound -> {
+                return PairingResult.Failure(STATUS_NOT_FOUND, "pairing_request_not_found")
+            }
+            PendingPairingCompletion.InvalidCode -> {
+                return PairingResult.Failure(STATUS_UNAUTHORIZED, "invalid_pairing_code")
+            }
+            is PendingPairingCompletion.Ready -> completion.request
+        }
+
+        val trustedDevice = TrustedDevice(
+            deviceId = request.deviceId,
+            displayName = request.displayName,
+            addedAtEpochMillis = now
+        )
+        registerTrustedDevice(trustedDevice)
+
+        val tokenIssue = tokenMutex.withLock {
+            issueTokenLocked(boundDeviceId = trustedDevice.deviceId)
+        }
+
+        logger.i(
+            LogEventId.SECURITY_PAIRING_COMPLETED,
+            "Pending pairing completed requestId=${request.requestId} device=${trustedDevice.deviceId}"
+        )
+        return PairingResult.Success(
+            tokenId = tokenIssue.tokenId,
+            tokenValue = tokenIssue.tokenValue,
+            deviceId = trustedDevice.deviceId
+        )
+    }
+
+    override suspend fun cancelPairingRequest(requestId: String): PairingActionResult {
+        ensureSanityCheck()
+
+        val normalizedRequestId = requestId.trim()
+        if (normalizedRequestId.isBlank()) {
+            return PairingActionResult.Failure(STATUS_BAD_REQUEST, "pairing_request_id_required")
+        }
+
+        return pairingMutex.withLock {
+            purgeExpiredPairingState(System.currentTimeMillis())
+            val removed = pendingRequestsById.remove(normalizedRequestId)
+                ?: return@withLock PairingActionResult.Failure(STATUS_NOT_FOUND, "pairing_request_not_found")
+            publishPendingPairingRequestsLocked()
+            logger.i(
+                LogEventId.SECURITY_PAIRING_REPLAY_BLOCKED,
+                "Pending pairing request canceled requestId=${removed.requestId} device=${removed.deviceId}"
+            )
+            PairingActionResult.Success("pairing request canceled")
+        }
+    }
+
     override suspend fun createPairingChallenge(): PairingChallenge {
         ensureSanityCheck()
         val now = System.currentTimeMillis()
         return pairingMutex.withLock {
-            purgeExpiredPairingSessions(now)
+            purgeExpiredPairingState(now)
             val challenge = PairingChallenge(
                 sessionId = randomId(SESSION_ID_BYTES),
                 pairingCode = randomCode(PAIRING_CODE_BYTES),
@@ -181,7 +317,7 @@ class LocalSecurityManager @Inject constructor(
 
         val now = System.currentTimeMillis()
         val challengeStatus = pairingMutex.withLock {
-            purgeExpiredPairingSessions(now)
+            purgeExpiredPairingState(now)
             val session = pairingSessions[sessionId]
                 ?: return@withLock PairingChallengeStatus.NOT_FOUND
             if (session.consumed) {
@@ -415,14 +551,42 @@ class LocalSecurityManager @Inject constructor(
         return Base64.getUrlEncoder().withoutPadding().encodeToString(raw)
     }
 
-    private fun purgeExpiredPairingSessions(now: Long) {
-        val iterator = pairingSessions.iterator()
-        while (iterator.hasNext()) {
-            val (_, session) = iterator.next()
-            if (session.expiresAtEpochMs <= now) {
-                iterator.remove()
+    private fun randomDigits(length: Int): String {
+        return buildString(length) {
+            repeat(length) {
+                append(random.nextInt(10))
             }
         }
+    }
+
+    private fun purgeExpiredPairingState(now: Long) {
+        var pendingRequestsChanged = false
+
+        val legacyIterator = pairingSessions.iterator()
+        while (legacyIterator.hasNext()) {
+            val (_, session) = legacyIterator.next()
+            if (session.expiresAtEpochMs <= now) {
+                legacyIterator.remove()
+            }
+        }
+
+        val pendingIterator = pendingRequestsById.iterator()
+        while (pendingIterator.hasNext()) {
+            val (_, request) = pendingIterator.next()
+            if (request.expiresAtEpochMs <= now) {
+                pendingIterator.remove()
+                pendingRequestsChanged = true
+            }
+        }
+
+        if (pendingRequestsChanged) {
+            publishPendingPairingRequestsLocked()
+        }
+    }
+
+    private fun publishPendingPairingRequestsLocked() {
+        pendingPairingRequestsState.value = pendingRequestsById.values
+            .sortedByDescending(PendingPairingRequest::createdAtEpochMs)
     }
 
     private fun denied(statusCode: Int, reason: String): SecurityAuthDecision {
@@ -454,10 +618,17 @@ class LocalSecurityManager @Inject constructor(
         REPLAY
     }
 
+    private sealed interface PendingPairingCompletion {
+        data object NotFound : PendingPairingCompletion
+        data object InvalidCode : PendingPairingCompletion
+        data class Ready(val request: PendingPairingRequest) : PendingPairingCompletion
+    }
+
     private companion object {
         val PIN_REGEX = Regex("^[0-9]{4,10}$")
         val TOKEN_REGEX = Regex("^[A-Za-z0-9_-]{8,128}$")
         val DEVICE_ID_REGEX = Regex("^[A-Za-z0-9._:-]{3,64}$")
+        val PAIRING_CODE_REGEX = Regex("^[0-9]{6}$")
 
         const val STATUS_OK = 200
         const val STATUS_BAD_REQUEST = 400
@@ -467,6 +638,8 @@ class LocalSecurityManager @Inject constructor(
         const val STATUS_CONFLICT = 409
 
         const val PAIRING_TTL_MS = 120_000L
+        const val PAIRING_CODE_DIGITS = 6
+        const val REQUEST_ID_BYTES = 9
         const val SESSION_ID_BYTES = 9
         const val PAIRING_CODE_BYTES = 18
         const val TOKEN_ID_BYTES = 9

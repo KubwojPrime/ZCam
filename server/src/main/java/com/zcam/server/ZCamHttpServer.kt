@@ -18,6 +18,8 @@ import com.zcam.core.logging.e
 import com.zcam.core.logging.i
 import com.zcam.core.logging.w
 import com.zcam.security.LanAccessPolicy
+import com.zcam.security.PairingClientType
+import com.zcam.security.PairingRequestStartResult
 import com.zcam.security.PairingResult
 import com.zcam.security.SecurityManager
 import com.zcam.security.TokenRevocationResult
@@ -72,7 +74,7 @@ class ZCamHttpServer @Inject constructor(
                 val isPublic = isPublicEndpoint(uri, session.method)
                 val remoteIp = session.remoteIpAddress
                 val isLanOrVpnClient = lanAccessPolicy.isLanClient(remoteIp)
-                val allowPublicOverVpn = uri == "/api/security/pair/qr" || uri == "/api/security/pair"
+                val allowPublicOverVpn = isPublicPairingEndpoint(uri, session.method)
 
                 if (!isLanOrVpnClient && isPublic && !allowPublicOverVpn) {
                     return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "LAN only")
@@ -144,10 +146,84 @@ class ZCamHttpServer @Inject constructor(
             "/api/audio/play" -> handleAudioPlayEndpoint(session)
             "/api/volume" -> handleVolumeEndpoint(session)
             "/api/security/pair/qr" -> handlePairingQrEndpoint(session)
+            "/api/security/pair/request" -> handlePairingRequestEndpoint(session)
+            "/api/security/pair/complete" -> handlePairingCompleteEndpoint(session)
             "/api/security/pair" -> handlePairDeviceEndpoint(session)
             "/api/security/token/rotate" -> handleTokenRotateEndpoint(session)
             "/api/security/token/revoke" -> handleTokenRevokeEndpoint(session)
             else -> NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.NOT_FOUND, NanoHTTPD.MIME_PLAINTEXT, "not found")
+            }
+        }
+    }
+
+    private fun handlePairingRequestEndpoint(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
+        if (session.method != NanoHTTPD.Method.POST) {
+            return methodNotAllowed("POST")
+        }
+
+        val payload = parsePostPayload(session) ?: return badRequest("request body is required")
+        val deviceId = valueOf(payload, "deviceId")?.trim().orEmpty()
+        val displayName = valueOf(payload, "displayName", "name")?.trim().orEmpty()
+        val clientType = parsePairingClientType(valueOf(payload, "clientType", "type"))
+            ?: return badRequest("required: clientType in {android_app, web_browser}")
+        if (deviceId.isBlank() || displayName.isBlank()) {
+            return badRequest("required: deviceId, displayName, clientType")
+        }
+
+        return when (val result = runBlocking {
+            securityManager.requestPairing(
+                deviceId = deviceId,
+                displayName = displayName,
+                clientType = clientType
+            )
+        }) {
+            is PairingRequestStartResult.Success -> {
+                val body = buildString {
+                    append('{')
+                    append("\"status\":\"ok\",")
+                    append("\"requestId\":").append(jsonString(result.requestId)).append(',')
+                    append("\"deviceId\":").append(jsonString(result.deviceId)).append(',')
+                    append("\"displayName\":").append(jsonString(result.displayName)).append(',')
+                    append("\"expiresAtEpochMs\":").append(result.expiresAtEpochMs)
+                    append('}')
+                }
+                NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, JSON_UTF8, body)
+            }
+            is PairingRequestStartResult.Failure -> {
+                NanoHTTPD.newFixedLengthResponse(
+                    toStatus(result.statusCode),
+                    JSON_UTF8,
+                    "{\"status\":\"error\",\"reason\":${jsonString(result.reason)}}"
+                )
+            }
+        }
+    }
+
+    private fun handlePairingCompleteEndpoint(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
+        if (session.method != NanoHTTPD.Method.POST) {
+            return methodNotAllowed("POST")
+        }
+
+        val payload = parsePostPayload(session) ?: return badRequest("request body is required")
+        val requestId = valueOf(payload, "requestId")?.trim().orEmpty()
+        val verificationCode = valueOf(payload, "verificationCode", "code")?.trim().orEmpty()
+        if (requestId.isBlank() || verificationCode.isBlank()) {
+            return badRequest("required: requestId, verificationCode")
+        }
+
+        return when (val result = runBlocking {
+            securityManager.completePairingRequest(
+                requestId = requestId,
+                verificationCode = verificationCode
+            )
+        }) {
+            is PairingResult.Success -> pairingSuccessResponse(result)
+            is PairingResult.Failure -> {
+                NanoHTTPD.newFixedLengthResponse(
+                    toStatus(result.statusCode),
+                    JSON_UTF8,
+                    "{\"status\":\"error\",\"reason\":${jsonString(result.reason)}}"
+                )
             }
         }
     }
@@ -203,17 +279,7 @@ class ZCamHttpServer @Inject constructor(
                 displayName = displayName
             )
         }) {
-            is PairingResult.Success -> {
-                val body = buildString {
-                    append('{')
-                    append("\"status\":\"ok\",")
-                    append("\"tokenId\":").append(jsonString(result.tokenId)).append(',')
-                    append("\"token\":").append(jsonString(result.tokenValue)).append(',')
-                    append("\"deviceId\":").append(jsonString(result.deviceId))
-                    append('}')
-                }
-                NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, JSON_UTF8, body)
-            }
+            is PairingResult.Success -> pairingSuccessResponse(result)
             is PairingResult.Failure -> {
                 NanoHTTPD.newFixedLengthResponse(
                     toStatus(result.statusCode),
@@ -222,6 +288,18 @@ class ZCamHttpServer @Inject constructor(
                 )
             }
         }
+    }
+
+    private fun pairingSuccessResponse(result: PairingResult.Success): NanoHTTPD.Response {
+        val body = buildString {
+            append('{')
+            append("\"status\":\"ok\",")
+            append("\"tokenId\":").append(jsonString(result.tokenId)).append(',')
+            append("\"token\":").append(jsonString(result.tokenValue)).append(',')
+            append("\"deviceId\":").append(jsonString(result.deviceId))
+            append('}')
+        }
+        return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, JSON_UTF8, body)
     }
 
     private fun handleTokenRotateEndpoint(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
@@ -530,6 +608,7 @@ class ZCamHttpServer @Inject constructor(
                 AudioCommandErrorCode.INVALID_ARGUMENT -> NanoHTTPD.Response.Status.BAD_REQUEST
                 AudioCommandErrorCode.CONFLICT -> NanoHTTPD.Response.Status.CONFLICT
                 AudioCommandErrorCode.COOLDOWN_ACTIVE -> TOO_MANY_REQUESTS_STATUS
+                AudioCommandErrorCode.SYSTEM_VOLUME_UNAVAILABLE -> NanoHTTPD.Response.Status.SERVICE_UNAVAILABLE
             }
         }
 
@@ -619,6 +698,14 @@ class ZCamHttpServer @Inject constructor(
         return when (action?.trim()?.lowercase()) {
             "start", "on", "enable", "enabled" -> true
             "stop", "off", "disable", "disabled" -> false
+            else -> null
+        }
+    }
+
+    private fun parsePairingClientType(value: String?): PairingClientType? {
+        return when (value?.trim()?.lowercase()) {
+            "android_app", "android", "app", "client" -> PairingClientType.ANDROID_APP
+            "web_browser", "browser", "web" -> PairingClientType.WEB_BROWSER
             else -> null
         }
     }
@@ -724,11 +811,18 @@ class ZCamHttpServer @Inject constructor(
             ?.ifBlank { null }
     }
 
+    private fun isPublicPairingEndpoint(uri: String, method: NanoHTTPD.Method): Boolean {
+        if (uri == "/api/security/pair/qr" && method == NanoHTTPD.Method.GET) return true
+        if (uri == "/api/security/pair/request" && method == NanoHTTPD.Method.POST) return true
+        if (uri == "/api/security/pair/complete" && method == NanoHTTPD.Method.POST) return true
+        if (uri == "/api/security/pair" && method == NanoHTTPD.Method.POST) return true
+        return false
+    }
+
     private fun isPublicEndpoint(uri: String, method: NanoHTTPD.Method): Boolean {
         if (uri == "/") return true
         if (uri == "/health") return true
-        if (uri == "/api/security/pair/qr" && method == NanoHTTPD.Method.GET) return true
-        if (uri == "/api/security/pair" && method == NanoHTTPD.Method.POST) return true
+        if (isPublicPairingEndpoint(uri, method)) return true
         return false
     }
 
@@ -989,6 +1083,7 @@ class ZCamHttpServer @Inject constructor(
                 button.ok { border-color: #1f7a3f; }
                 button.warn { border-color: #8a5e00; }
                 button.err { border-color: #8a2424; }
+                .codeInput { max-width: 180px; letter-spacing: 3px; }
                 img { width: 100%; height: auto; border-radius: 8px; background: #000; border: 1px solid var(--border); }
                 pre { margin: 0; background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; max-height: 260px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 12px; }
                 .chip { display: inline-block; border-radius: 999px; border: 1px solid var(--border); padding: 3px 8px; font-size: 12px; color: var(--muted); }
@@ -1001,11 +1096,11 @@ class ZCamHttpServer @Inject constructor(
             <body>
               <div class="wrap">
                 <div class="card">
-                  <h1 class="title">ZCam Local Emergency Panel</h1>
-                  <p class="sub">Local-only control panel. API auth: token + device ID (if trusted-devices policy requires it).</p>
+                  <h1 class="title">ZCam Local Panel</h1>
+                  <p class="sub">Preferred pairing flow: request pairing from this browser, read the 6-digit code on the server app, then this browser stores its trusted token automatically. Manual token entry remains available for recovery.</p>
                   <div class="grid3">
                     <div>
-                      <label for="tokenInput">API token</label>
+                      <label for="tokenInput">Trusted token</label>
                       <input id="tokenInput" type="text" placeholder="zcam_..." />
                     </div>
                     <div>
@@ -1013,16 +1108,40 @@ class ZCamHttpServer @Inject constructor(
                       <input id="deviceIdInput" type="text" placeholder="browser-console" />
                     </div>
                     <div>
-                      <label>&nbsp;</label>
-                      <div class="row">
-                        <button id="applyAuthBtn" class="primary" type="button">Apply Auth</button>
-                        <button id="clearAuthBtn" type="button">Clear</button>
-                      </div>
+                      <label for="browserNameInput">Browser display name</label>
+                      <input id="browserNameInput" type="text" placeholder="Web Browser" />
                     </div>
+                  </div>
+                  <div class="row" style="margin-top:10px;">
+                    <button id="requestPairingBtn" class="primary" type="button">Request pairing</button>
+                    <input id="pairingCodeInput" class="codeInput mono" type="text" inputmode="numeric" maxlength="6" placeholder="123456" />
+                    <button id="completePairingBtn" class="ok" type="button">Complete pairing</button>
+                    <button id="applyAuthBtn" type="button">Save auth</button>
+                    <button id="clearAuthBtn" type="button">Clear token</button>
                   </div>
                   <div class="row" style="margin-top:8px;">
                     <span class="chip mono" id="authState">auth: not set</span>
+                    <span class="chip mono" id="pairingState">pairing: idle</span>
                     <span class="chip mono" id="statusLine">status: unknown</span>
+                  </div>
+                </div>
+
+                <div class="card">
+                  <h2 class="title">Browser Pairing</h2>
+                  <p class="sub">1. Open the server device pairing screen. 2. Click Request pairing here. 3. Enter the code shown on the server. 4. This browser keeps the trusted token in local storage.</p>
+                  <div class="grid3">
+                    <div>
+                      <label for="pairingRequestId">Pending request ID</label>
+                      <input id="pairingRequestId" type="text" readonly />
+                    </div>
+                    <div>
+                      <label for="pairingExpiresAt">Request expires</label>
+                      <input id="pairingExpiresAt" type="text" readonly />
+                    </div>
+                    <div>
+                      <label>&nbsp;</label>
+                      <div class="sub">If pairing is retried, a new request replaces the old one for this browser device ID.</div>
+                    </div>
                   </div>
                 </div>
 
@@ -1092,7 +1211,12 @@ class ZCamHttpServer @Inject constructor(
               <script>
                 const tokenInput = document.getElementById('tokenInput');
                 const deviceIdInput = document.getElementById('deviceIdInput');
+                const browserNameInput = document.getElementById('browserNameInput');
+                const pairingCodeInput = document.getElementById('pairingCodeInput');
+                const pairingRequestIdInput = document.getElementById('pairingRequestId');
+                const pairingExpiresAtInput = document.getElementById('pairingExpiresAt');
                 const authState = document.getElementById('authState');
+                const pairingState = document.getElementById('pairingState');
                 const statusLine = document.getElementById('statusLine');
                 const statusJson = document.getElementById('statusJson');
                 const apiLog = document.getElementById('apiLog');
@@ -1100,6 +1224,13 @@ class ZCamHttpServer @Inject constructor(
                 const snapshotLink = document.getElementById('snapshotLink');
                 const volumeRange = document.getElementById('volumeRange');
                 const volumeLabel = document.getElementById('volumeLabel');
+                const STORAGE = {
+                  token: 'zcam.panel.token',
+                  deviceId: 'zcam.panel.deviceId',
+                  browserName: 'zcam.panel.browserName',
+                  pendingRequestId: 'zcam.panel.pendingRequestId',
+                  pendingExpiresAt: 'zcam.panel.pendingExpiresAt'
+                };
 
                 function readAuth() {
                   return {
@@ -1108,12 +1239,83 @@ class ZCamHttpServer @Inject constructor(
                   };
                 }
 
+                function readPendingPairing() {
+                  return {
+                    requestId: localStorage.getItem(STORAGE.pendingRequestId) || '',
+                    expiresAtEpochMs: Number(localStorage.getItem(STORAGE.pendingExpiresAt) || '0')
+                  };
+                }
+
+                function saveAuthInputs() {
+                  localStorage.setItem(STORAGE.token, tokenInput.value.trim());
+                  localStorage.setItem(STORAGE.deviceId, deviceIdInput.value.trim());
+                  localStorage.setItem(STORAGE.browserName, browserNameInput.value.trim());
+                }
+
+                function savePendingPairing(requestId, expiresAtEpochMs) {
+                  localStorage.setItem(STORAGE.pendingRequestId, requestId || '');
+                  localStorage.setItem(STORAGE.pendingExpiresAt, String(expiresAtEpochMs || 0));
+                }
+
+                function clearPendingPairing(clearCodeInput) {
+                  localStorage.removeItem(STORAGE.pendingRequestId);
+                  localStorage.removeItem(STORAGE.pendingExpiresAt);
+                  if (clearCodeInput) pairingCodeInput.value = '';
+                }
+
+                function formatExpiry(epochMs) {
+                  if (!Number.isFinite(epochMs) || epochMs <= 0) return '-';
+                  return new Date(epochMs).toLocaleTimeString();
+                }
+
+                function generateBrowserDeviceId() {
+                  const suffix = (window.crypto && typeof window.crypto.randomUUID === 'function')
+                    ? window.crypto.randomUUID().replace(/[^A-Za-z0-9._:-]/g, '').slice(0, 24)
+                    : Math.random().toString(36).slice(2, 12);
+                  return 'browser-' + suffix;
+                }
+
+                function ensureBrowserIdentity() {
+                  if (!deviceIdInput.value.trim()) {
+                    deviceIdInput.value = localStorage.getItem(STORAGE.deviceId) || generateBrowserDeviceId();
+                  }
+                  if (!browserNameInput.value.trim()) {
+                    browserNameInput.value = localStorage.getItem(STORAGE.browserName) || 'Web Browser';
+                  }
+                  saveAuthInputs();
+                }
+
                 function updateAuthState() {
                   const auth = readAuth();
                   const hasToken = !!auth.token;
                   authState.textContent = hasToken
-                    ? 'auth: token set, device=' + (auth.deviceId || '-')
+                    ? 'auth: trusted token saved, device=' + (auth.deviceId || '-')
                     : 'auth: not set';
+                  authState.className = 'chip mono ' + (hasToken ? 'okText' : 'warnText');
+                }
+
+                function updatePairingState() {
+                  const pending = readPendingPairing();
+                  if (pending.requestId && pending.expiresAtEpochMs > Date.now()) {
+                    pairingRequestIdInput.value = pending.requestId;
+                    pairingExpiresAtInput.value = formatExpiry(pending.expiresAtEpochMs);
+                    pairingState.textContent = 'pairing: pending request ' + pending.requestId;
+                    pairingState.className = 'chip mono warnText';
+                    return;
+                  }
+
+                  if (pending.requestId) {
+                    clearPendingPairing(false);
+                  }
+                  pairingRequestIdInput.value = '';
+                  pairingExpiresAtInput.value = '';
+                  if (readAuth().token) {
+                    pairingState.textContent = 'pairing: trusted token active';
+                    pairingState.className = 'chip mono okText';
+                  } else {
+                    pairingState.textContent = 'pairing: idle';
+                    pairingState.className = 'chip mono warnText';
+                  }
                 }
 
                 function authHeaders() {
@@ -1162,6 +1364,63 @@ class ZCamHttpServer @Inject constructor(
                   return { response, parsed, text };
                 }
 
+                async function requestBrowserPairing() {
+                  const deviceId = deviceIdInput.value.trim();
+                  const displayName = browserNameInput.value.trim() || 'Web Browser';
+                  if (!deviceId) {
+                    appendLog('pairing request blocked: device ID is required');
+                    return;
+                  }
+
+                  const { response, parsed } = await apiPost('/api/security/pair/request', {
+                    deviceId,
+                    displayName,
+                    clientType: 'web_browser'
+                  });
+                  if (!response.ok || !parsed) {
+                    updatePairingState();
+                    return;
+                  }
+
+                  saveAuthInputs();
+                  savePendingPairing(parsed.requestId || '', parsed.expiresAtEpochMs || 0);
+                  pairingCodeInput.value = '';
+                  updatePairingState();
+                  pairingCodeInput.focus();
+                }
+
+                async function completeBrowserPairing() {
+                  const pending = readPendingPairing();
+                  if (!pending.requestId) {
+                    appendLog('pairing completion blocked: request pairing first');
+                    return;
+                  }
+                  const verificationCode = pairingCodeInput.value.replace(/[^0-9]/g, '').slice(0, 6);
+                  pairingCodeInput.value = verificationCode;
+                  if (verificationCode.length !== 6) {
+                    appendLog('pairing completion blocked: 6-digit code required');
+                    return;
+                  }
+
+                  const { response, parsed } = await apiPost('/api/security/pair/complete', {
+                    requestId: pending.requestId,
+                    verificationCode
+                  });
+                  if (!response.ok || !parsed) {
+                    updatePairingState();
+                    return;
+                  }
+
+                  tokenInput.value = parsed.token || '';
+                  deviceIdInput.value = parsed.deviceId || deviceIdInput.value.trim();
+                  saveAuthInputs();
+                  clearPendingPairing(true);
+                  updateAuthState();
+                  updatePairingState();
+                  applyPreviewSources();
+                  await refreshStatus();
+                }
+
                 async function refreshStatus() {
                   try {
                     const response = await fetch('/api/status', {
@@ -1176,6 +1435,11 @@ class ZCamHttpServer @Inject constructor(
                     const streamClients = data?.server?.streamClients ?? '?';
                     const torch = data?.cameraControls?.torchEnabled;
                     const night = data?.cameraControls?.nightModeEnabled;
+                    const audioVolume = data?.audio?.volumePercent;
+                    if (Number.isFinite(audioVolume)) {
+                      volumeRange.value = String(audioVolume);
+                      volumeLabel.textContent = audioVolume + '%';
+                    }
                     statusLine.textContent = 'status: http=' + response.status + ' alive=' + serverAlive + ' clients=' + streamClients + ' torch=' + torch + ' night=' + night;
                     statusLine.className = 'chip mono ' + (response.ok ? 'okText' : 'errText');
                   } catch (error) {
@@ -1222,21 +1486,29 @@ class ZCamHttpServer @Inject constructor(
                 }
 
                 document.getElementById('applyAuthBtn').addEventListener('click', () => {
-                  localStorage.setItem('zcam.panel.token', tokenInput.value);
-                  localStorage.setItem('zcam.panel.deviceId', deviceIdInput.value);
+                  saveAuthInputs();
                   updateAuthState();
+                  updatePairingState();
                   applyPreviewSources();
                   refreshStatus();
                 });
 
                 document.getElementById('clearAuthBtn').addEventListener('click', () => {
                   tokenInput.value = '';
-                  deviceIdInput.value = '';
-                  localStorage.removeItem('zcam.panel.token');
-                  localStorage.removeItem('zcam.panel.deviceId');
+                  localStorage.removeItem(STORAGE.token);
+                  clearPendingPairing(true);
                   updateAuthState();
+                  updatePairingState();
                   applyPreviewSources();
                   refreshStatus();
+                });
+
+                document.getElementById('requestPairingBtn').addEventListener('click', () => {
+                  requestBrowserPairing();
+                });
+
+                document.getElementById('completePairingBtn').addEventListener('click', () => {
+                  completeBrowserPairing();
                 });
 
                 document.getElementById('reloadPreviewBtn').addEventListener('click', () => {
@@ -1247,10 +1519,16 @@ class ZCamHttpServer @Inject constructor(
                   volumeLabel.textContent = volumeRange.value + '%';
                 });
 
-                // Boot
-                tokenInput.value = localStorage.getItem('zcam.panel.token') || '';
-                deviceIdInput.value = localStorage.getItem('zcam.panel.deviceId') || '';
+                pairingCodeInput.addEventListener('input', () => {
+                  pairingCodeInput.value = pairingCodeInput.value.replace(/[^0-9]/g, '').slice(0, 6);
+                });
+
+                tokenInput.value = localStorage.getItem(STORAGE.token) || '';
+                deviceIdInput.value = localStorage.getItem(STORAGE.deviceId) || '';
+                browserNameInput.value = localStorage.getItem(STORAGE.browserName) || '';
+                ensureBrowserIdentity();
                 updateAuthState();
+                updatePairingState();
                 applyPreviewSources();
                 refreshStatus();
                 setInterval(refreshStatus, 3000);
@@ -1259,6 +1537,8 @@ class ZCamHttpServer @Inject constructor(
                 window.setAudioLive = setAudioLive;
                 window.playSound = playSound;
                 window.setVolumeNow = setVolumeNow;
+                window.requestBrowserPairing = requestBrowserPairing;
+                window.completeBrowserPairing = completeBrowserPairing;
               </script>
             </body>
             </html>

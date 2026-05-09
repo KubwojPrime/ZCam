@@ -8,6 +8,7 @@ import com.zcam.core.domain.settings.RuntimeSettingsRepository
 import com.zcam.core.domain.settings.RuntimeSettingsUpdateResult
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -57,6 +58,39 @@ class LocalSecurityManagerNegativeTest {
         replay as PairingResult.Failure
         assertEquals(409, replay.statusCode)
         assertEquals("pairing_replay_detected", replay.reason)
+    }
+
+    @Test
+    fun simplified_pairing_request_requires_server_code_before_trusting_device() = runTest {
+        val manager = buildManager()
+
+        val started = manager.requestPairing(
+            deviceId = "browser-1",
+            displayName = "Browser",
+            clientType = PairingClientType.WEB_BROWSER
+        )
+        assertTrue(started is PairingRequestStartResult.Success)
+        started as PairingRequestStartResult.Success
+
+        val pending = manager.pendingPairingRequests
+            .first { requests -> requests.any { it.requestId == started.requestId } }
+            .single { it.requestId == started.requestId }
+
+        val wrongCode = manager.completePairingRequest(
+            requestId = started.requestId,
+            verificationCode = "000000"
+        )
+        assertTrue(wrongCode is PairingResult.Failure)
+        wrongCode as PairingResult.Failure
+        assertEquals(401, wrongCode.statusCode)
+        assertEquals("invalid_pairing_code", wrongCode.reason)
+
+        val success = manager.completePairingRequest(
+            requestId = started.requestId,
+            verificationCode = pending.verificationCode
+        )
+        assertTrue(success is PairingResult.Success)
+        assertTrue(manager.trustedDevices().any { it.deviceId == "browser-1" })
     }
 
     @Test

@@ -30,6 +30,7 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -109,6 +110,51 @@ class ZCamSecurityEndpointsIntegrationTest {
         response.use {
             assertEquals(401, it.code)
             assertTrue(it.body?.string().orEmpty().contains("invalid_token"))
+        }
+    }
+
+    @Test
+    fun simplified_pairing_flow_issues_token_after_code_confirmation() {
+        val requestResponseBody = postJson(
+            "/api/security/pair/request",
+            """{"deviceId":"browser-1","displayName":"Browser","clientType":"web_browser"}"""
+        ).use {
+            assertEquals(200, it.code)
+            it.body?.string().orEmpty()
+        }
+        val requestId = extractJsonString(requestResponseBody, "requestId")
+        val verificationCode = runBlocking {
+            securityManager.pendingPairingRequests
+                .first { requests -> requests.any { it.requestId == requestId } }
+                .single { it.requestId == requestId }
+                .verificationCode
+        }
+
+        postJson(
+            "/api/security/pair/complete",
+            """{"requestId":"$requestId","verificationCode":"000000"}"""
+        ).use {
+            assertEquals(401, it.code)
+            assertTrue(it.body?.string().orEmpty().contains("invalid_pairing_code"))
+        }
+
+        val completeResponseBody = postJson(
+            "/api/security/pair/complete",
+            """{"requestId":"$requestId","verificationCode":"$verificationCode"}"""
+        ).use {
+            assertEquals(200, it.code)
+            it.body?.string().orEmpty()
+        }
+        val issuedToken = extractJsonString(completeResponseBody, "token")
+
+        val statusRequest = Request.Builder()
+            .url("http://127.0.0.1:$port/api/status")
+            .get()
+            .header("X-ZCam-Token", issuedToken)
+            .header("X-ZCam-Device-Id", "browser-1")
+            .build()
+        client.newCall(statusRequest).execute().use {
+            assertEquals(200, it.code)
         }
     }
 

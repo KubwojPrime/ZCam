@@ -16,16 +16,22 @@ import com.zcam.core.domain.config.FeatureFlag
 import com.zcam.core.domain.config.RuntimeSettings
 import com.zcam.core.domain.config.RuntimeSettingsDefaults
 import com.zcam.core.domain.config.TrustedDevice
+import com.zcam.core.domain.settings.ClientSession
+import com.zcam.core.domain.settings.ClientSessionRepository
 import com.zcam.core.domain.settings.RuntimeSettingsRepository
 import com.zcam.core.domain.settings.RuntimeSettingsUpdateResult
 import com.zcam.core.domain.settings.RuntimeStateRepository
 import com.zcam.core.logging.ZCamLogger
+import com.zcam.security.PairingClientType
+import com.zcam.security.PendingPairingRequest
+import com.zcam.security.SecurityManager
 import com.zcam.service.ZCamForegroundService
 import com.zcam.service.runtime.ComponentHealth
 import com.zcam.service.runtime.ComponentHealthStatus
 import com.zcam.service.runtime.RuntimeHealthRepository
 import com.zcam.service.runtime.RuntimeOverallStatus
 import com.zcam.ui.ComponentStatusUi
+import com.zcam.ui.PendingPairingRequestUi
 import com.zcam.ui.SettingsUiState
 import com.zcam.ui.StatusTone
 import com.zcam.ui.TrustedDeviceUi
@@ -59,7 +65,9 @@ class ZCamMainViewModel @Inject constructor(
     private val runtimeHealthRepository: RuntimeHealthRepository,
     private val runtimeSettingsRepository: RuntimeSettingsRepository,
     private val runtimeStateRepository: RuntimeStateRepository,
+    private val clientSessionRepository: ClientSessionRepository,
     private val localClient: LocalClient,
+    private val securityManager: SecurityManager,
     private val dispatchers: DispatcherProvider,
     private val logger: ZCamLogger
 ) : ViewModel() {
@@ -69,9 +77,12 @@ class ZCamMainViewModel @Inject constructor(
 
     private var settingsSnapshot: RuntimeSettings = RuntimeSettingsDefaults.value
     private var volumeSyncJob: Job? = null
+    private var clientSessionSyncJob: Job? = null
 
     init {
         observeSettings()
+        observeClientSession()
+        observePendingPairingRequests()
         observeRuntimeHealth()
         observeDesiredState()
         monitorThermalStatus()
@@ -86,23 +97,35 @@ class ZCamMainViewModel @Inject constructor(
                 _state.update { current ->
                     current.copy(
                         mode = action.mode,
-                        pairing = if (action.mode == ZCamMode.SERVER) {
-                            current.pairing.copy(pin = settingsSnapshot.security.pinCode)
-                        } else {
-                            current.pairing
-                        },
+                        showModePicker = false,
+                        screen = if (current.showModePicker) ZCamScreen.MAIN else current.screen,
+                        showPairingSuggestionDialog = false,
                         errorMessage = null
                     )
                 }
                 refreshServerLanHost()
+            }
+            ZCamUiAction.OpenModePicker -> _state.update {
+                it.copy(
+                    showModePicker = true,
+                    screen = ZCamScreen.MAIN,
+                    showPairingSuggestionDialog = false,
+                    errorMessage = null
+                )
             }
 
             ZCamUiAction.RequestPermissions -> Unit
             ZCamUiAction.StartRuntime -> startRuntime()
             ZCamUiAction.StopRuntime -> stopRuntime()
             ZCamUiAction.RefreshClientStatus -> refreshClientStatusNow()
-            is ZCamUiAction.ClientHostChanged -> _state.update { it.copy(clientHost = action.host.trim()) }
-            is ZCamUiAction.ClientPortChanged -> _state.update { it.copy(clientPort = action.port.filter(Char::isDigit)) }
+            is ZCamUiAction.ClientHostChanged -> {
+                _state.update { it.copy(clientHost = action.host.trim()) }
+                scheduleClientSessionPersist()
+            }
+            is ZCamUiAction.ClientPortChanged -> {
+                _state.update { it.copy(clientPort = action.port.filter(Char::isDigit)) }
+                scheduleClientSessionPersist()
+            }
 
             is ZCamUiAction.PushToTalkChanged -> setPushToTalk(action.pressed)
             ZCamUiAction.ToggleLiveListen -> toggleLiveListen()
@@ -123,27 +146,20 @@ class ZCamMainViewModel @Inject constructor(
             }
 
             ZCamUiAction.ApplyPairingPayload -> applyPairingPayloadFromInput()
-            is ZCamUiAction.PairingSessionIdChanged -> _state.update {
-                it.copy(pairing = it.pairing.copy(sessionId = action.value.take(128)))
+            is ZCamUiAction.PairingDeviceIdChanged -> {
+                _state.update { it.copy(pairing = it.pairing.copy(deviceId = action.value.take(64))) }
+                scheduleClientSessionPersist()
             }
-
-            is ZCamUiAction.PairingCodeChanged -> _state.update {
-                it.copy(pairing = it.pairing.copy(pairingCode = action.value.take(128)))
+            is ZCamUiAction.PairingDisplayNameChanged -> {
+                _state.update { it.copy(pairing = it.pairing.copy(displayName = action.value.take(64))) }
+                scheduleClientSessionPersist()
             }
-
-            is ZCamUiAction.PairingPinChanged -> _state.update {
-                it.copy(pairing = it.pairing.copy(pin = action.value.filter(Char::isDigit).take(10)))
+            is ZCamUiAction.PairingVerificationCodeChanged -> _state.update {
+                it.copy(pairing = it.pairing.copy(verificationCodeInput = action.value.filter(Char::isDigit).take(PAIRING_CODE_DIGITS)))
             }
-
-            is ZCamUiAction.PairingDeviceIdChanged -> _state.update {
-                it.copy(pairing = it.pairing.copy(deviceId = action.value.take(64)))
-            }
-
-            is ZCamUiAction.PairingDisplayNameChanged -> _state.update {
-                it.copy(pairing = it.pairing.copy(displayName = action.value.take(64)))
-            }
-
+            ZCamUiAction.StartPairingRequest -> startPairingRequest()
             ZCamUiAction.SubmitPairing -> submitPairing()
+            is ZCamUiAction.CancelPendingPairing -> cancelPendingPairing(action.requestId)
             is ZCamUiAction.SettingsServerPortChanged -> updateSettingsDraft { copy(serverPortInput = action.value.filter(Char::isDigit).take(5)) }
             is ZCamUiAction.SettingsStreamWidthChanged -> updateSettingsDraft { copy(streamWidthInput = action.value.filter(Char::isDigit).take(5)) }
             is ZCamUiAction.SettingsStreamHeightChanged -> updateSettingsDraft { copy(streamHeightInput = action.value.filter(Char::isDigit).take(5)) }
@@ -172,6 +188,7 @@ class ZCamMainViewModel @Inject constructor(
             _state.update { current ->
                 current.copy(
                     mode = ZCamMode.CLIENT,
+                    showModePicker = false,
                     screen = ZCamScreen.PAIRING,
                     pairing = current.pairing.copy(payloadInput = payload)
                 )
@@ -192,15 +209,41 @@ class ZCamMainViewModel @Inject constructor(
                         } else {
                             state.clientPort
                         },
-                        settings = settings.toUiSettings(
-                            previous = state.settings
-                        ),
-                        pairing = state.pairing.copy(
-                            pin = if (state.mode == ZCamMode.SERVER) settings.security.pinCode else state.pairing.pin
-                        )
+                        settings = settings.toUiSettings(previous = state.settings)
                     )
                 }
                 refreshServerLanHost()
+            }
+        }
+    }
+
+    private fun observeClientSession() {
+        viewModelScope.launch(dispatchers.io) {
+            clientSessionRepository.session.collectLatest { session ->
+                if (session == ClientSession()) return@collectLatest
+                _state.update { current ->
+                    current.copy(
+                        clientHost = if (session.serverHost.isNotBlank()) session.serverHost else current.clientHost,
+                        clientPort = if (session.serverPort in 1..65535) session.serverPort.toString() else current.clientPort,
+                        pairing = current.pairing.copy(
+                            deviceId = session.deviceId.ifBlank { current.pairing.deviceId },
+                            displayName = session.displayName.ifBlank { current.pairing.displayName },
+                            issuedToken = session.issuedToken.ifBlank { current.pairing.issuedToken }
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    private fun observePendingPairingRequests() {
+        viewModelScope.launch(dispatchers.io) {
+            securityManager.pendingPairingRequests.collectLatest { requests ->
+                _state.update { current ->
+                    current.copy(
+                        pendingPairingRequests = requests.map { request -> request.toUi() }
+                    )
+                }
             }
         }
     }
@@ -249,11 +292,11 @@ class ZCamMainViewModel @Inject constructor(
                     when (preview) {
                         is ClientCallResult.Success -> current.copy(
                             previewFrameJpeg = preview.value,
-                            previewLabel = "Updated ${System.currentTimeMillis()}"
+                            previewLabel = ""
                         )
 
                         is ClientCallResult.Failure -> current.copy(
-                            previewLabel = "Preview unavailable (${preview.reason})"
+                            previewLabel = "Preview unavailable"
                         )
                     }
                 }
@@ -278,15 +321,28 @@ class ZCamMainViewModel @Inject constructor(
                 when (result) {
                     is ClientCallResult.Success -> {
                         val status = result.value
+                        val syncVolumeFromServer = volumeSyncJob?.isActive != true
+                        val serverVolume = status.audioVolumePercent
+                            ?.coerceIn(
+                                status.audioMinVolumePercent ?: 0,
+                                status.audioMaxVolumePercent ?: 85
+                            )
                         current.copy(
                             clientReachable = status.alive,
-                            clientStatusLabel = "alive=${status.alive} clients=${status.streamClients} video=${status.videoRunning}"
+                            clientStatusLabel = if (status.alive) "Connected" else "Unavailable",
+                            pttPressed = status.audioTransmitting,
+                            liveListenEnabled = status.audioLiveListening,
+                            volumePercent = if (syncVolumeFromServer && serverVolume != null) {
+                                serverVolume
+                            } else {
+                                current.volumePercent
+                            }
                         )
                     }
 
                     is ClientCallResult.Failure -> current.copy(
                         clientReachable = false,
-                        clientStatusLabel = "unreachable (${result.reason})"
+                        clientStatusLabel = "Unavailable"
                     )
                 }
             }
@@ -393,7 +449,7 @@ class ZCamMainViewModel @Inject constructor(
             when (val result = localClient.setVolume(currentTargetForCommands(), normalized)) {
                 is ClientCallResult.Success -> _state.update { it.copy(errorMessage = null) }
                 is ClientCallResult.Failure -> _state.update {
-                    it.copy(errorMessage = "Volume update failed: ${result.reason}")
+                    it.copy(errorMessage = "Volume update failed: ${result.reason}${result.responseBody?.let { body -> " ($body)" } ?: ""}")
                 }
             }
         }
@@ -491,66 +547,24 @@ class ZCamMainViewModel @Inject constructor(
     }
 
     private fun requestPairingQr() {
-        viewModelScope.launch(dispatchers.io) {
-            _state.update {
-                it.copy(
-                    pairing = it.pairing.copy(
-                        loading = true,
-                        resultMessage = "",
-                        resultTone = StatusTone.NEUTRAL
-                    )
-                )
-            }
-
-            when (val result = localClient.fetchPairingQr(currentTargetForCommands())) {
-                is ClientCallResult.Success -> {
-                    val preferredHostPort = preferredPairingHostPort()
-                    val normalizedPayload = normalizePairingPayloadHost(result.value.qrPayload, preferredHostPort)
-                    val parsed = parsePairingPayload(normalizedPayload)
-
-                    _state.update { current ->
-                        val parsedHost = parsed?.host
-                        val nextHost = when {
-                            current.mode != ZCamMode.CLIENT -> current.clientHost
-                            parsedHost.isNullOrBlank() -> current.clientHost
-                            isLoopbackHost(parsedHost) && current.clientHost.isNotBlank() -> current.clientHost
-                            else -> parsedHost
-                        }
-                        val nextPort = parsed?.port?.toString() ?: current.clientPort
-                        current.copy(
-                            clientHost = if (current.mode == ZCamMode.CLIENT) nextHost else current.clientHost,
-                            clientPort = if (current.mode == ZCamMode.CLIENT && parsed?.port != null) nextPort else current.clientPort,
-                            pairing = current.pairing.copy(
-                                loading = false,
-                                sessionId = parsed?.sessionId ?: result.value.sessionId,
-                                pairingCode = parsed?.pairingCode ?: result.value.pairingCode,
-                                qrPayload = normalizedPayload,
-                                payloadInput = normalizedPayload,
-                                resolvedHostPort = parsed?.hostPort.orEmpty(),
-                                sourceLabel = if (current.mode == ZCamMode.SERVER) {
-                                    "Server pairing challenge ready"
-                                } else {
-                                    "Challenge fetched from server"
-                                },
-                                expiresAtEpochMs = result.value.expiresAtEpochMs,
-                                resultMessage = "Pairing challenge ready",
-                                resultTone = StatusTone.HEALTHY
-                            )
-                        )
-                    }
-                }
-
-                is ClientCallResult.Failure -> _state.update { current ->
-                    current.copy(
-                        pairing = current.pairing.copy(
-                            loading = false,
-                            resultMessage = "QR fetch failed: ${result.reason}",
-                            resultTone = StatusTone.ERROR
-                        ),
-                        errorMessage = "QR fetch failed: ${result.reason}"
-                    )
-                }
-            }
+        val hostPort = preferredPairingHostPort()
+        if (hostPort.isBlank()) {
+            _state.update { it.copy(errorMessage = "LAN host unavailable. Connect server device to Wi-Fi or set server port first.") }
+            return
+        }
+        val payload = "zcam://pair?host=${Uri.encode(hostPort)}"
+        _state.update {
+            it.copy(
+                pairing = it.pairing.copy(
+                    qrPayload = payload,
+                    payloadInput = payload,
+                    resolvedHostPort = hostPort,
+                    sourceLabel = "Server connection QR ready",
+                    resultMessage = "Scan this QR on the client to fill server address",
+                    resultTone = StatusTone.HEALTHY
+                ),
+                errorMessage = null
+            )
         }
     }
 
@@ -565,7 +579,7 @@ class ZCamMainViewModel @Inject constructor(
         val parsed = parsePairingPayload(normalizedPayload)
         if (parsed == null) {
             _state.update {
-                it.copy(errorMessage = "Unable to parse pairing payload. Expected: zcam://pair?sid=...&code=...&host=...")
+                it.copy(errorMessage = "Unable to parse pairing payload. Expected: zcam://pair?host=...")
             }
             return
         }
@@ -582,8 +596,6 @@ class ZCamMainViewModel @Inject constructor(
                 clientHost = if (current.mode == ZCamMode.CLIENT) nextHost else current.clientHost,
                 clientPort = if (current.mode == ZCamMode.CLIENT && parsed.port != null) parsed.port.toString() else current.clientPort,
                 pairing = current.pairing.copy(
-                    sessionId = parsed.sessionId ?: current.pairing.sessionId,
-                    pairingCode = parsed.pairingCode ?: current.pairing.pairingCode,
                     resolvedHostPort = parsed.hostPort.orEmpty(),
                     sourceLabel = "Manual payload parsed",
                     resultMessage = "Payload parsed successfully",
@@ -592,13 +604,79 @@ class ZCamMainViewModel @Inject constructor(
                 errorMessage = null
             )
         }
+        scheduleClientSessionPersist()
+    }
+
+    private fun startPairingRequest() {
+        viewModelScope.launch(dispatchers.io) {
+            val current = state.value
+            if (current.mode != ZCamMode.CLIENT) return@launch
+            if (current.clientHost.isBlank()) {
+                _state.update { it.copy(errorMessage = "Set server host before pairing.") }
+                return@launch
+            }
+
+            val pairing = current.pairing
+            val deviceId = pairing.deviceId.ifBlank { defaultDeviceId() }
+            val displayName = pairing.displayName.ifBlank { "Android Client" }
+
+            _state.update {
+                it.copy(
+                    pairing = it.pairing.copy(
+                        loading = true,
+                        resultMessage = "",
+                        resultTone = StatusTone.NEUTRAL
+                    ),
+                    errorMessage = null
+                )
+            }
+
+            when (
+                val result = localClient.requestPairing(
+                    target = currentTargetForCommands(),
+                    deviceId = deviceId,
+                    displayName = displayName,
+                    clientType = PairingClientType.ANDROID_APP.name.lowercase()
+                )
+            ) {
+                is ClientCallResult.Success -> {
+                    _state.update {
+                        it.copy(
+                            pairing = it.pairing.copy(
+                                loading = false,
+                                requestId = result.value.requestId,
+                                deviceId = result.value.deviceId,
+                                displayName = result.value.displayName,
+                                expiresAtEpochMs = result.value.expiresAtEpochMs,
+                                verificationCodeInput = "",
+                                resultMessage = "Pairing request sent. Enter the code shown on the server.",
+                                resultTone = StatusTone.HEALTHY
+                            ),
+                            errorMessage = null
+                        )
+                    }
+                    persistClientSession()
+                }
+
+                is ClientCallResult.Failure -> _state.update {
+                    it.copy(
+                        pairing = it.pairing.copy(
+                            loading = false,
+                            resultMessage = "Pairing request failed: ${result.reason}",
+                            resultTone = StatusTone.ERROR
+                        ),
+                        errorMessage = "Pairing request failed: ${result.reason}${result.responseBody?.let { body -> " ($body)" } ?: ""}"
+                    )
+                }
+            }
+        }
     }
 
     private fun submitPairing() {
         viewModelScope.launch(dispatchers.io) {
             val pairing = state.value.pairing
-            if (pairing.pin.isBlank() || pairing.sessionId.isBlank() || pairing.pairingCode.isBlank()) {
-                _state.update { it.copy(errorMessage = "PIN, sessionId and pairingCode are required.") }
+            if (pairing.requestId.isBlank() || pairing.verificationCodeInput.length != PAIRING_CODE_DIGITS) {
+                _state.update { it.copy(errorMessage = "Start pairing first, then enter the ${PAIRING_CODE_DIGITS}-digit code from the server.") }
                 return@launch
             }
             if (state.value.mode == ZCamMode.CLIENT && state.value.clientHost.isBlank()) {
@@ -610,25 +688,27 @@ class ZCamMainViewModel @Inject constructor(
                 it.copy(pairing = it.pairing.copy(loading = true, resultMessage = "", resultTone = StatusTone.NEUTRAL))
             }
             when (
-                val result = localClient.pairDevice(
+                val result = localClient.completePairingRequest(
                     target = currentTargetForCommands(),
-                    pin = pairing.pin,
-                    sessionId = pairing.sessionId,
-                    pairingCode = pairing.pairingCode,
-                    deviceId = pairing.deviceId.ifBlank { defaultDeviceId() },
-                    displayName = pairing.displayName.ifBlank { "Android Client" }
+                    requestId = pairing.requestId,
+                    verificationCode = pairing.verificationCodeInput
                 )
             ) {
-                is ClientCallResult.Success -> _state.update { current ->
-                    current.copy(
-                        pairing = current.pairing.copy(
-                            loading = false,
-                            issuedToken = result.value.tokenValue,
-                            resultMessage = "Paired successfully (token: ${result.value.tokenId})",
-                            resultTone = StatusTone.HEALTHY
-                        ),
-                        errorMessage = null
-                    )
+                is ClientCallResult.Success -> {
+                    _state.update { current ->
+                        current.copy(
+                            pairing = current.pairing.copy(
+                                loading = false,
+                                requestId = "",
+                                verificationCodeInput = "",
+                                issuedToken = result.value.tokenValue,
+                                resultMessage = "Paired successfully (token: ${result.value.tokenId})",
+                                resultTone = StatusTone.HEALTHY
+                            ),
+                            errorMessage = null
+                        )
+                    }
+                    persistClientSession()
                 }
 
                 is ClientCallResult.Failure -> _state.update { current ->
@@ -638,9 +718,18 @@ class ZCamMainViewModel @Inject constructor(
                             resultMessage = "Pairing failed: ${result.reason}",
                             resultTone = StatusTone.ERROR
                         ),
-                        errorMessage = "Pairing failed: ${result.reason}"
+                        errorMessage = "Pairing failed: ${result.reason}${result.responseBody?.let { body -> " ($body)" } ?: ""}"
                     )
                 }
+            }
+        }
+    }
+
+    private fun cancelPendingPairing(requestId: String) {
+        viewModelScope.launch(dispatchers.io) {
+            if (requestId.isBlank()) return@launch
+            runCatching {
+                securityManager.cancelPairingRequest(requestId)
             }
         }
     }
@@ -759,11 +848,6 @@ class ZCamMainViewModel @Inject constructor(
                                 resultMessage = "Settings saved",
                                 resultTone = StatusTone.HEALTHY
                             ),
-                            pairing = if (it.mode == ZCamMode.SERVER) {
-                                it.pairing.copy(pin = candidate.security.pinCode)
-                            } else {
-                                it.pairing
-                            },
                             errorMessage = null
                         )
                     }
@@ -837,6 +921,30 @@ class ZCamMainViewModel @Inject constructor(
                 }
             }
         }
+    }
+
+    private fun scheduleClientSessionPersist() {
+        clientSessionSyncJob?.cancel()
+        clientSessionSyncJob = viewModelScope.launch(dispatchers.io) {
+            delay(CLIENT_SESSION_SYNC_DEBOUNCE_MS)
+            persistClientSession()
+        }
+    }
+
+    private suspend fun persistClientSession() {
+        val current = state.value
+        val parsedPort = current.clientPort.toIntOrNull() ?: settingsSnapshot.serverPort
+        clientSessionRepository.saveSession(
+            ClientSession(
+                serverHost = current.clientHost.trim(),
+                serverPort = parsedPort.coerceIn(1, 65535),
+                deviceId = current.pairing.deviceId.ifBlank { defaultDeviceId() },
+                displayName = current.pairing.displayName.ifBlank { "Android Client" },
+                issuedToken = current.pairing.issuedToken,
+                pairedAtEpochMs = if (current.pairing.issuedToken.isBlank()) 0L else System.currentTimeMillis(),
+                lastUpdatedAtEpochMs = System.currentTimeMillis()
+            )
+        )
     }
 
     private fun currentTargetForCommands(): ClientTarget {
@@ -943,6 +1051,20 @@ class ZCamMainViewModel @Inject constructor(
         )
     }
 
+    private fun PendingPairingRequest.toUi(): PendingPairingRequestUi {
+        return PendingPairingRequestUi(
+            requestId = requestId,
+            displayName = displayName,
+            deviceId = deviceId,
+            clientTypeLabel = when (clientType) {
+                PairingClientType.ANDROID_APP -> "Android app"
+                PairingClientType.WEB_BROWSER -> "Web browser"
+            },
+            verificationCode = verificationCode.chunked(3).joinToString(" "),
+            expiresAtEpochMs = expiresAtEpochMs
+        )
+    }
+
     private fun refreshServerLanHost() {
         val lanHost = findLocalLanHost()
         _state.update { current ->
@@ -973,13 +1095,22 @@ class ZCamMainViewModel @Inject constructor(
             currentHost
         }
 
-        val sid = parsed.sessionId ?: return payload
-        val code = parsed.pairingCode ?: return payload
         return buildString {
-            append("zcam://pair?sid=").append(Uri.encode(sid))
-            append("&code=").append(Uri.encode(code))
+            append("zcam://pair")
+            var hasQuery = false
+            if (!parsed.sessionId.isNullOrBlank()) {
+                append(if (hasQuery) '&' else '?')
+                append("sid=").append(Uri.encode(parsed.sessionId))
+                hasQuery = true
+            }
+            if (!parsed.pairingCode.isNullOrBlank()) {
+                append(if (hasQuery) '&' else '?')
+                append("code=").append(Uri.encode(parsed.pairingCode))
+                hasQuery = true
+            }
             if (nextHost.isNotBlank()) {
-                append("&host=").append(Uri.encode(nextHost))
+                append(if (hasQuery) '&' else '?')
+                append("host=").append(Uri.encode(nextHost))
             }
         }
     }
@@ -1000,7 +1131,7 @@ class ZCamMainViewModel @Inject constructor(
             val code = params["code"] ?: params["pairingcode"] ?: params["pairing_code"]
             val hostPortRaw = params["host"].orEmpty()
             val (host, port) = parseHostPort(hostPortRaw)
-            if (sid.isNullOrBlank() && code.isNullOrBlank()) return null
+            if (sid.isNullOrBlank() && code.isNullOrBlank() && host.isNullOrBlank()) return null
 
             ParsedPairingPayload(
                 sessionId = sid?.ifBlank { null },
@@ -1117,8 +1248,10 @@ class ZCamMainViewModel @Inject constructor(
     private companion object {
         const val PREVIEW_REFRESH_MS = 1_200L
         const val CLIENT_STATUS_REFRESH_MS = 2_000L
+        const val CLIENT_SESSION_SYNC_DEBOUNCE_MS = 250L
         const val THERMAL_REFRESH_MS = 2_500L
         const val VOLUME_DEBOUNCE_MS = 180L
+        const val PAIRING_CODE_DIGITS = 6
         val RECORDINGS_DATE_TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
         const val INVALID_TIME_INPUT = Long.MIN_VALUE
     }

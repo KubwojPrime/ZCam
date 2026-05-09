@@ -1,5 +1,45 @@
 package com.zcam.security
 
+enum class PairingClientType {
+    ANDROID_APP,
+    WEB_BROWSER
+}
+
+data class PendingPairingRequest(
+    val requestId: String,
+    val deviceId: String,
+    val displayName: String,
+    val clientType: PairingClientType,
+    val verificationCode: String,
+    val createdAtEpochMs: Long,
+    val expiresAtEpochMs: Long
+)
+
+sealed interface PairingRequestStartResult {
+    data class Success(
+        val requestId: String,
+        val deviceId: String,
+        val displayName: String,
+        val expiresAtEpochMs: Long
+    ) : PairingRequestStartResult
+
+    data class Failure(
+        val statusCode: Int,
+        val reason: String
+    ) : PairingRequestStartResult
+}
+
+sealed interface PairingActionResult {
+    data class Success(
+        val message: String = "ok"
+    ) : PairingActionResult
+
+    data class Failure(
+        val statusCode: Int,
+        val reason: String
+    ) : PairingActionResult
+}
+
 data class SecurityAuthDecision(
     val allowed: Boolean,
     val statusCode: Int,

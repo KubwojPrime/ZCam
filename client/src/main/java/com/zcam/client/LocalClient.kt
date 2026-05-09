@@ -16,13 +16,23 @@ data class ClientServerStatus(
     val lastFrameAgeMs: Long,
     val audioTransmitting: Boolean,
     val audioLiveListening: Boolean,
-    val audioPlayingBack: Boolean
+    val audioPlayingBack: Boolean,
+    val audioVolumePercent: Int?,
+    val audioMinVolumePercent: Int?,
+    val audioMaxVolumePercent: Int?
 )
 
 data class ClientPairingQr(
     val sessionId: String,
     val pairingCode: String,
     val qrPayload: String,
+    val expiresAtEpochMs: Long
+)
+
+data class ClientPairingRequest(
+    val requestId: String,
+    val deviceId: String,
+    val displayName: String,
     val expiresAtEpochMs: Long
 )
 
@@ -66,6 +76,19 @@ interface LocalClient {
 
     suspend fun setVolume(target: ClientTarget, levelPercent: Int): ClientCallResult<Unit>
     suspend fun fetchPairingQr(target: ClientTarget): ClientCallResult<ClientPairingQr>
+    suspend fun requestPairing(
+        target: ClientTarget,
+        deviceId: String,
+        displayName: String,
+        clientType: String
+    ): ClientCallResult<ClientPairingRequest>
+
+    suspend fun completePairingRequest(
+        target: ClientTarget,
+        requestId: String,
+        verificationCode: String
+    ): ClientCallResult<ClientPairingResult>
+
     suspend fun pairDevice(
         target: ClientTarget,
         pin: String,

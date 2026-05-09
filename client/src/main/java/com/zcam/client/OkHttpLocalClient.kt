@@ -48,7 +48,10 @@ class OkHttpLocalClient @Inject constructor(
                 lastFrameAgeMs = video?.optLong("lastFrameAgeMs") ?: -1L,
                 audioTransmitting = audio?.optBoolean("transmitting") ?: false,
                 audioLiveListening = audio?.optBoolean("liveListening") ?: false,
-                audioPlayingBack = audio?.optBoolean("playingBack") ?: false
+                audioPlayingBack = audio?.optBoolean("playingBack") ?: false,
+                audioVolumePercent = audio?.optNullableInt("volumePercent"),
+                audioMinVolumePercent = audio?.optNullableInt("minVolumePercent"),
+                audioMaxVolumePercent = audio?.optNullableInt("maxVolumePercent")
             )
         }
     }
@@ -127,6 +130,59 @@ class OkHttpLocalClient @Inject constructor(
                 pairingCode = payload.optString("pairingCode"),
                 qrPayload = payload.optString("qrPayload"),
                 expiresAtEpochMs = payload.optLong("expiresAtEpochMs")
+            )
+        }
+    }
+
+    override suspend fun requestPairing(
+        target: ClientTarget,
+        deviceId: String,
+        displayName: String,
+        clientType: String
+    ): ClientCallResult<ClientPairingRequest> {
+        val payload = JSONObject()
+            .put("deviceId", deviceId)
+            .put("displayName", displayName)
+            .put("clientType", clientType)
+            .toString()
+
+        return executeJsonRequest(
+            target = target,
+            path = "/api/security/pair/request",
+            method = HttpMethod.POST,
+            includeAuth = false,
+            payload = payload
+        ) { json ->
+            ClientPairingRequest(
+                requestId = json.optString("requestId"),
+                deviceId = json.optString("deviceId"),
+                displayName = json.optString("displayName"),
+                expiresAtEpochMs = json.optLong("expiresAtEpochMs")
+            )
+        }
+    }
+
+    override suspend fun completePairingRequest(
+        target: ClientTarget,
+        requestId: String,
+        verificationCode: String
+    ): ClientCallResult<ClientPairingResult> {
+        val payload = JSONObject()
+            .put("requestId", requestId)
+            .put("verificationCode", verificationCode)
+            .toString()
+
+        return executeJsonRequest(
+            target = target,
+            path = "/api/security/pair/complete",
+            method = HttpMethod.POST,
+            includeAuth = false,
+            payload = payload
+        ) { json ->
+            ClientPairingResult(
+                tokenId = json.optString("tokenId"),
+                tokenValue = json.optString("token"),
+                deviceId = json.optString("deviceId")
             )
         }
     }
@@ -327,6 +383,10 @@ class OkHttpLocalClient @Inject constructor(
             JSONObject(body).optString("reason").ifBlank { null }
                 ?: JSONObject(body).optString("message").ifBlank { null }
         }.getOrNull()
+    }
+
+    private fun JSONObject.optNullableInt(name: String): Int? {
+        return if (has(name) && !isNull(name)) optInt(name) else null
     }
 
     private enum class HttpMethod {

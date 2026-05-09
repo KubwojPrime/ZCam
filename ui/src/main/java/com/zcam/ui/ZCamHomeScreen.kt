@@ -22,10 +22,17 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.NavigationDrawerItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -33,8 +40,10 @@ import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
@@ -47,7 +56,9 @@ import com.google.zxing.qrcode.QRCodeWriter
 import com.zcam.core.domain.config.FeatureFlag
 import java.text.DateFormat
 import java.util.Date
+import kotlinx.coroutines.launch
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ZCamHomeScreen(
     state: ZCamUiState,
@@ -58,23 +69,194 @@ fun ZCamHomeScreen(
         modifier = modifier.fillMaxSize(),
         color = MaterialTheme.colorScheme.background
     ) {
-        Column(modifier = Modifier.fillMaxSize()) {
-            HeaderSection(state = state, onAction = onAction)
-            ModeTabs(state = state, onAction = onAction)
-            if (state.working || state.settings.saving) {
-                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-            }
-            ScreenTabs(state = state, onAction = onAction)
+        Box(modifier = Modifier.fillMaxSize()) {
+            if (state.showModePicker) {
+                ModePickerScreen(onAction = onAction)
+            } else {
+                val drawerState = androidx.compose.material3.rememberDrawerState(initialValue = DrawerValue.Closed)
+                val scope = rememberCoroutineScope()
+                ModalNavigationDrawer(
+                    drawerState = drawerState,
+                    drawerContent = {
+                        AppDrawerContent(
+                            state = state,
+                            onScreenSelected = { screen ->
+                                scope.launch {
+                                    drawerState.close()
+                                    onAction(ZCamUiAction.ScreenChanged(screen))
+                                }
+                            },
+                            onChangeMode = {
+                                scope.launch {
+                                    drawerState.close()
+                                    onAction(ZCamUiAction.OpenModePicker)
+                                }
+                            }
+                        )
+                    }
+                ) {
+                    Scaffold(
+                        topBar = {
+                            TopAppBar(
+                                title = {
+                                    Text(screenTitle(state = state))
+                                },
+                                navigationIcon = {
+                                    IconButton(
+                                        onClick = {
+                                            scope.launch {
+                                                drawerState.open()
+                                            }
+                                        }
+                                    ) {
+                                        Text("\u2630", style = MaterialTheme.typography.titleLarge)
+                                    }
+                                }
+                            )
+                        }
+                    ) { innerPadding ->
+                        Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(innerPadding)
+                        ) {
+                            if (state.working || state.settings.saving) {
+                                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                            }
+                            if (!state.permissionsReady) {
+                                PermissionNoticeCard(state = state, onAction = onAction)
+                            }
 
-            when (state.screen) {
-                ZCamScreen.MAIN -> MainScreen(state = state, onAction = onAction)
-                ZCamScreen.PAIRING -> PairingScreen(state = state, onAction = onAction)
-                ZCamScreen.SETTINGS -> SettingsScreen(state = state, onAction = onAction)
+                            when (state.screen) {
+                                ZCamScreen.MAIN -> MainScreen(state = state, onAction = onAction)
+                                ZCamScreen.PAIRING -> PairingScreen(state = state, onAction = onAction)
+                                ZCamScreen.SETTINGS -> SettingsScreen(state = state, onAction = onAction)
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (state.showPairingSuggestionDialog && state.mode == ZCamMode.SERVER && !state.showModePicker) {
+                PairingSuggestionDialog(onAction = onAction)
             }
         }
+    }
+}
 
-        if (state.showPairingSuggestionDialog && state.mode == ZCamMode.SERVER) {
-            PairingSuggestionDialog(onAction = onAction)
+@Composable
+private fun ModePickerScreen(
+    onAction: (ZCamUiAction) -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(20.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterVertically)
+    ) {
+        Text(
+            text = "Choose device role",
+            style = MaterialTheme.typography.headlineSmall,
+            fontWeight = FontWeight.SemiBold
+        )
+        Text(
+            text = "Select how this device should work right now.",
+            style = MaterialTheme.typography.bodyMedium
+        )
+        Button(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(64.dp),
+            onClick = { onAction(ZCamUiAction.ModeChanged(ZCamMode.SERVER)) }
+        ) {
+            Text("Server")
+        }
+        OutlinedButton(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(64.dp),
+            onClick = { onAction(ZCamUiAction.ModeChanged(ZCamMode.CLIENT)) }
+        ) {
+            Text("Client")
+        }
+    }
+}
+
+@Composable
+private fun AppDrawerContent(
+    state: ZCamUiState,
+    onScreenSelected: (ZCamScreen) -> Unit,
+    onChangeMode: () -> Unit
+) {
+    ModalDrawerSheet {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text("ZCam", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            Text(
+                if (state.mode == ZCamMode.SERVER) "Server device" else "Client remote",
+                style = MaterialTheme.typography.bodySmall
+            )
+            NavigationDrawerItem(
+                label = { Text("Main") },
+                selected = state.screen == ZCamScreen.MAIN,
+                onClick = { onScreenSelected(ZCamScreen.MAIN) }
+            )
+            NavigationDrawerItem(
+                label = { Text("Pairing") },
+                selected = state.screen == ZCamScreen.PAIRING,
+                onClick = { onScreenSelected(ZCamScreen.PAIRING) }
+            )
+            NavigationDrawerItem(
+                label = { Text("Settings") },
+                selected = state.screen == ZCamScreen.SETTINGS,
+                onClick = { onScreenSelected(ZCamScreen.SETTINGS) }
+            )
+            NavigationDrawerItem(
+                label = { Text("Change Mode") },
+                selected = false,
+                onClick = onChangeMode
+            )
+        }
+    }
+}
+
+private fun screenTitle(state: ZCamUiState): String {
+    return when (state.screen) {
+        ZCamScreen.MAIN -> if (state.mode == ZCamMode.SERVER) "Server" else "Client"
+        ZCamScreen.PAIRING -> "Pairing"
+        ZCamScreen.SETTINGS -> "Settings"
+    }
+}
+
+@Composable
+private fun PermissionNoticeCard(
+    state: ZCamUiState,
+    onAction: (ZCamUiAction) -> Unit
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                text = state.permissionsLabel,
+                style = MaterialTheme.typography.bodyMedium
+            )
+            OutlinedButton(
+                modifier = Modifier.fillMaxWidth(),
+                onClick = { onAction(ZCamUiAction.RequestPermissions) }
+            ) {
+                Text("Grant permissions")
+            }
         }
     }
 }
@@ -172,24 +354,13 @@ private fun MainScreen(
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(horizontal = 12.dp),
+            .padding(horizontal = 12.dp, vertical = 10.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        RoleInfoCard(state.mode)
         when (state.mode) {
             ZCamMode.SERVER -> {
                 PreviewCard(state = state)
                 RuntimeControls(state = state, onAction = onAction)
-                if (state.componentStatuses.isNotEmpty()) {
-                    Text(
-                        text = "Component status",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                    state.componentStatuses.forEach { component ->
-                        ComponentStatusCard(component = component)
-                    }
-                }
             }
             ZCamMode.CLIENT -> {
                 ClientSection(state = state, onAction = onAction)
@@ -236,7 +407,7 @@ private fun ServerPairingScreen(
 ) {
     InfoCard(
         title = "Server pairing",
-        body = "Generate a pairing challenge for clients. PIN is configured in Settings > Security."
+        body = "Clients and browsers start pairing from their side. This screen shows pending pairing requests and the verification code to enter on the client."
     )
     StatusChip(
         label = if (state.serverLanHost.isBlank()) {
@@ -257,7 +428,7 @@ private fun ServerPairingScreen(
                 .height(56.dp),
             onClick = { onAction(ZCamUiAction.RequestPairingQr) }
         ) {
-            Text("Generate challenge")
+            Text("Show connection QR")
         }
         OutlinedButton(
             modifier = Modifier
@@ -272,7 +443,18 @@ private fun ServerPairingScreen(
     if (state.pairing.qrPayload.isNotBlank()) {
         PairingQrCard(state.pairing.qrPayload)
     }
-    PairingMetaCard(state = state)
+    if (state.pendingPairingRequests.isEmpty()) {
+        InfoCard(
+            title = "No pending requests",
+            body = "Open the client app or browser, start pairing, then enter the code shown here on the client device."
+        )
+    } else {
+        state.pendingPairingRequests.forEach { request ->
+            PendingPairingRequestCard(request = request, onCancel = {
+                onAction(ZCamUiAction.CancelPendingPairing(request.requestId))
+            })
+        }
+    }
 }
 
 @Composable
@@ -282,7 +464,7 @@ private fun ClientPairingScreen(
 ) {
     InfoCard(
         title = "Client pairing",
-        body = "Set server Host/Port, then pair by QR or manually with Session ID, Pairing Code and server PIN."
+        body = "Set server Host/Port or scan connection QR, request pairing, then enter the code currently shown on the server device."
     )
     ClientSection(state = state, onAction = onAction)
 
@@ -291,7 +473,7 @@ private fun ClientPairingScreen(
         value = state.pairing.payloadInput,
         onValueChange = { onAction(ZCamUiAction.PairingPayloadChanged(it)) },
         label = { Text("Pairing payload (optional)") },
-        placeholder = { Text("zcam://pair?sid=...&code=...&host=...") }
+        placeholder = { Text("zcam://pair?host=...") }
     )
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -306,46 +488,17 @@ private fun ClientPairingScreen(
         ) {
             Text("Apply payload")
         }
-        Button(
+        OutlinedButton(
             modifier = Modifier
                 .weight(1f)
                 .height(52.dp),
-            enabled = !state.pairing.loading,
-            onClick = { onAction(ZCamUiAction.RequestPairingQr) }
+            onClick = { onAction(ZCamUiAction.RefreshClientStatus) }
         ) {
-            Text("Fetch challenge")
+            Text("Check server")
         }
     }
 
-    if (state.pairing.qrPayload.isNotBlank()) {
-        PairingQrCard(state.pairing.qrPayload)
-    }
-
     PairingMetaCard(state = state)
-
-    OutlinedTextField(
-        modifier = Modifier.fillMaxWidth(),
-        value = state.pairing.sessionId,
-        onValueChange = { onAction(ZCamUiAction.PairingSessionIdChanged(it)) },
-        label = { Text("Session ID (ID)") },
-        singleLine = true
-    )
-    OutlinedTextField(
-        modifier = Modifier.fillMaxWidth(),
-        value = state.pairing.pairingCode,
-        onValueChange = { onAction(ZCamUiAction.PairingCodeChanged(it)) },
-        label = { Text("Pairing code (CODE)") },
-        singleLine = true
-    )
-    OutlinedTextField(
-        modifier = Modifier.fillMaxWidth(),
-        value = state.pairing.pin,
-        onValueChange = { onAction(ZCamUiAction.PairingPinChanged(it)) },
-        label = { Text("PIN") },
-        supportingText = { Text("PIN configured on server in Settings > Security.") },
-        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-        singleLine = true
-    )
     OutlinedTextField(
         modifier = Modifier.fillMaxWidth(),
         value = state.pairing.deviceId,
@@ -367,9 +520,27 @@ private fun ClientPairingScreen(
             .fillMaxWidth()
             .height(56.dp),
         enabled = !state.pairing.loading,
+        onClick = { onAction(ZCamUiAction.StartPairingRequest) }
+    ) {
+        Text(if (state.pairing.loading) "Requesting..." else "Start pairing request")
+    }
+    OutlinedTextField(
+        modifier = Modifier.fillMaxWidth(),
+        value = state.pairing.verificationCodeInput,
+        onValueChange = { onAction(ZCamUiAction.PairingVerificationCodeChanged(it)) },
+        label = { Text("Code shown on server") },
+        supportingText = { Text("Enter the 6-digit code currently visible on the server device.") },
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+        singleLine = true
+    )
+    Button(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(56.dp),
+        enabled = !state.pairing.loading,
         onClick = { onAction(ZCamUiAction.SubmitPairing) }
     ) {
-        Text(if (state.pairing.loading) "Pairing..." else "Pair device")
+        Text(if (state.pairing.loading) "Pairing..." else "Complete pairing")
     }
 }
 
@@ -389,7 +560,7 @@ private fun SettingsScreen(
         if (state.mode == ZCamMode.CLIENT) {
             InfoCard(
                 title = "Client settings",
-                body = "Server runtime settings are editable only in Server mode. Client host, pairing and audio controls are available in Main/Pairing tabs."
+                body = "Server runtime settings are editable only in Server mode. Client host, pairing and audio controls stay on the main and pairing screens."
             )
         }
 
@@ -407,7 +578,7 @@ private fun SettingsScreen(
                     modifier = Modifier.fillMaxWidth(),
                     value = settings.pinInput,
                     onValueChange = { onAction(ZCamUiAction.SettingsPinChanged(it)) },
-                    label = { Text("Pairing PIN (4-10 digits)") },
+                    label = { Text("Legacy pairing PIN (fallback)") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     singleLine = true
                 )
@@ -415,7 +586,7 @@ private fun SettingsScreen(
                     modifier = Modifier.fillMaxWidth(),
                     value = settings.apiTokenInput,
                     onValueChange = { onAction(ZCamUiAction.SettingsApiTokenChanged(it)) },
-                    label = { Text("Bootstrap API token") },
+                    label = { Text("Bootstrap API token (advanced)") },
                     singleLine = true
                 )
             }
@@ -544,6 +715,15 @@ private fun SettingsScreen(
                 }
             }
 
+            SettingsSection(title = "Diagnostics") {
+                StatusChip(label = "Runtime: ${state.runtimeLabel}", tone = state.runtimeTone)
+                StatusChip(label = "Thermal: ${state.thermalLabel}", tone = state.thermalTone)
+                StatusChip(label = "Recovery: ${state.recoveryLabel}", tone = state.recoveryTone)
+                state.componentStatuses.forEach { component ->
+                    ComponentStatusCard(component = component)
+                }
+            }
+
             if (settings.resultMessage.isNotBlank()) {
                 StatusChip(
                     label = settings.resultMessage,
@@ -584,7 +764,7 @@ private fun PairingSuggestionDialog(
             }
         },
         title = { Text("Server started") },
-        text = { Text("Do you want to pair a client device now? You can also do it later in the Pairing tab.") }
+        text = { Text("Do you want to pair a client device now? You can also do it later from Pairing in the menu.") }
     )
 }
 
@@ -677,16 +857,44 @@ private fun PairingMetaCard(state: ZCamUiState) {
                 label = state.pairing.sourceLabel,
                 tone = StatusTone.NEUTRAL
             )
-            Text("Session: ${state.pairing.sessionId.ifBlank { "-" }}")
-            Text("Code: ${state.pairing.pairingCode.ifBlank { "-" }}")
             if (state.pairing.resolvedHostPort.isNotBlank()) {
                 Text("Host: ${state.pairing.resolvedHostPort}")
+            }
+            Text("Request ID: ${state.pairing.requestId.ifBlank { "-" }}")
+            if (state.pairing.issuedToken.isNotBlank()) {
+                Text("Trusted device token saved", style = MaterialTheme.typography.bodySmall)
             }
             if (state.pairing.resultMessage.isNotBlank()) {
                 StatusChip(
                     label = state.pairing.resultMessage,
                     tone = state.pairing.resultTone
                 )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PendingPairingRequestCard(
+    request: PendingPairingRequestUi,
+    onCancel: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Text(request.displayName, fontWeight = FontWeight.SemiBold)
+            Text("${request.clientTypeLabel} - ${request.deviceId}", style = MaterialTheme.typography.bodySmall)
+            Text("Code: ${request.verificationCode}", style = MaterialTheme.typography.titleLarge)
+            OutlinedButton(
+                modifier = Modifier.fillMaxWidth(),
+                onClick = onCancel
+            ) {
+                Text("Cancel request")
             }
         }
     }
@@ -716,7 +924,7 @@ private fun PairingQrCard(payload: String) {
                 )
             } else {
                 Text(
-                    text = "QR generation failed. Use manual pairing fields below.",
+                    text = "QR generation failed. Enter the server host manually on the client.",
                     style = MaterialTheme.typography.bodySmall,
                     textAlign = TextAlign.Center
                 )
@@ -815,7 +1023,6 @@ private fun PreviewCard(state: ZCamUiState) {
                     )
                 }
             }
-            Text(text = state.previewLabel, style = MaterialTheme.typography.bodySmall)
         }
     }
 }
@@ -825,27 +1032,38 @@ private fun RuntimeControls(
     state: ZCamUiState,
     onAction: (ZCamUiAction) -> Unit
 ) {
-    Row(
+    Card(
         modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(10.dp)
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
     ) {
-        Button(
-            onClick = { onAction(ZCamUiAction.StartRuntime) },
-            modifier = Modifier
-                .weight(1f)
-                .height(58.dp),
-            enabled = !state.working
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            Text("Start")
-        }
-        OutlinedButton(
-            onClick = { onAction(ZCamUiAction.StopRuntime) },
-            modifier = Modifier
-                .weight(1f)
-                .height(58.dp),
-            enabled = !state.working
-        ) {
-            Text("Stop")
+            StatusChip(label = "Runtime: ${state.runtimeLabel}", tone = state.runtimeTone)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Button(
+                    onClick = { onAction(ZCamUiAction.StartRuntime) },
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(58.dp),
+                    enabled = !state.working
+                ) {
+                    Text("Start")
+                }
+                OutlinedButton(
+                    onClick = { onAction(ZCamUiAction.StopRuntime) },
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(58.dp),
+                    enabled = !state.working
+                ) {
+                    Text("Stop")
+                }
+            }
         }
     }
 }
@@ -1008,7 +1226,7 @@ private fun RecordingItemRow(
             Text("Start: $startedAt", style = MaterialTheme.typography.bodySmall)
             Text("End: $endedAt", style = MaterialTheme.typography.bodySmall)
             Text(
-                "Duration: ${item.durationMs / 1000}s • Size: ${item.sizeBytes / (1024 * 1024)} MB",
+                "Duration: ${item.durationMs / 1000}s - Size: ${item.sizeBytes / (1024 * 1024)} MB",
                 style = MaterialTheme.typography.bodySmall
             )
             OutlinedButton(
@@ -1151,3 +1369,5 @@ private fun StatusChip(
         )
     }
 }
+
+

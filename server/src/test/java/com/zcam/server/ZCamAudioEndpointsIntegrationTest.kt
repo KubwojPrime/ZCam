@@ -1,6 +1,8 @@
 package com.zcam.server
 
 import com.zcam.audio.AndroidPushToTalkManager
+import com.zcam.audio.SystemVolumeApplyResult
+import com.zcam.audio.SystemVolumeController
 import com.zcam.camera.CameraControlCommandResult
 import com.zcam.camera.CameraControlErrorCode
 import com.zcam.camera.CameraControlManager
@@ -12,8 +14,12 @@ import com.zcam.core.dispatchers.DispatcherProvider
 import com.zcam.core.domain.config.TrustedDevice
 import com.zcam.core.logging.ZCamLogger
 import com.zcam.security.LanAccessPolicy
+import com.zcam.security.PairingActionResult
 import com.zcam.security.PairingChallenge
+import com.zcam.security.PairingClientType
+import com.zcam.security.PairingRequestStartResult
 import com.zcam.security.PairingResult
+import com.zcam.security.PendingPairingRequest
 import com.zcam.security.SecurityAuthDecision
 import com.zcam.security.SecurityManager
 import com.zcam.security.TokenRevocationResult
@@ -22,6 +28,7 @@ import com.zcam.storage.LoopRecordingManager
 import com.zcam.storage.RecordingClipSummary
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -41,6 +48,7 @@ class ZCamAudioEndpointsIntegrationTest {
     private val dispatchers = TestDispatcherProvider()
 
     private lateinit var audioManager: AndroidPushToTalkManager
+    private lateinit var volumeController: FakeSystemVolumeController
     private lateinit var cameraControlManager: FakeCameraControlManager
     private val securityManager = AllowAllSecurityManager()
     private lateinit var httpServer: ZCamHttpServer
@@ -48,9 +56,11 @@ class ZCamAudioEndpointsIntegrationTest {
 
     @Before
     fun setUp() {
+        volumeController = FakeSystemVolumeController()
         audioManager = AndroidPushToTalkManager(
             dispatchers = dispatchers,
-            logger = logger
+            logger = logger,
+            systemVolumeController = volumeController
         )
         cameraControlManager = FakeCameraControlManager()
         httpServer = ZCamHttpServer(
@@ -115,6 +125,24 @@ class ZCamAudioEndpointsIntegrationTest {
             val payload = it.body?.string().orEmpty()
             assertEquals(200, it.code)
             assertTrue(payload.contains("\"volumePercent\":80"))
+        }
+        assertEquals(80, volumeController.lastRequestedPercent ?: -1)
+    }
+
+    @Test
+    fun volume_endpoint_reports_system_volume_failure() {
+        volumeController.nextFailureReason = "volume service unavailable"
+
+        val response = postJson(
+            path = "/api/volume",
+            body = """{"level":60}"""
+        )
+
+        response.use {
+            val payload = it.body?.string().orEmpty()
+            assertEquals(503, it.code)
+            assertTrue(payload.contains("\"code\":\"system_volume_unavailable\""))
+            assertTrue(payload.contains("volume service unavailable"))
         }
     }
 
@@ -257,6 +285,35 @@ class ZCamAudioEndpointsIntegrationTest {
         override val default: CoroutineDispatcher = Dispatchers.Default
     }
 
+    private class FakeSystemVolumeController : SystemVolumeController {
+        var lastRequestedPercent: Int? = null
+        var nextFailureReason: String? = null
+
+        override fun currentMusicVolumePercent(): Int? = lastRequestedPercent
+
+        override fun setMusicVolumePercent(levelPercent: Int): SystemVolumeApplyResult {
+            val failure = nextFailureReason
+            if (failure != null) {
+                nextFailureReason = null
+                return SystemVolumeApplyResult(
+                    applied = false,
+                    actualPercent = lastRequestedPercent,
+                    streamVolume = null,
+                    streamMaxVolume = 15,
+                    reason = failure
+                )
+            }
+
+            lastRequestedPercent = levelPercent
+            return SystemVolumeApplyResult(
+                applied = true,
+                actualPercent = levelPercent,
+                streamVolume = levelPercent,
+                streamMaxVolume = 100
+            )
+        }
+    }
+
     private class NoopLogger : ZCamLogger {
         override fun d(message: String) = Unit
         override fun i(message: String) = Unit
@@ -279,6 +336,8 @@ class ZCamAudioEndpointsIntegrationTest {
     }
 
     private class AllowAllSecurityManager : SecurityManager {
+        override val pendingPairingRequests = MutableStateFlow<List<PendingPairingRequest>>(emptyList())
+
         override suspend fun authorizeRequest(tokenCandidate: String?, deviceId: String?): SecurityAuthDecision {
             return SecurityAuthDecision(
                 allowed = true,
@@ -287,6 +346,30 @@ class ZCamAudioEndpointsIntegrationTest {
                 tokenId = "test-token",
                 deviceId = deviceId
             )
+        }
+
+        override suspend fun requestPairing(
+            deviceId: String,
+            displayName: String,
+            clientType: PairingClientType
+        ): PairingRequestStartResult = PairingRequestStartResult.Success(
+            requestId = "request-1",
+            deviceId = deviceId,
+            displayName = displayName,
+            expiresAtEpochMs = Long.MAX_VALUE
+        )
+
+        override suspend fun completePairingRequest(
+            requestId: String,
+            verificationCode: String
+        ): PairingResult = PairingResult.Success(
+            tokenId = "test-token",
+            tokenValue = "test-secret",
+            deviceId = "browser-1"
+        )
+
+        override suspend fun cancelPairingRequest(requestId: String): PairingActionResult {
+            return PairingActionResult.Success()
         }
 
         override suspend fun createPairingChallenge(): PairingChallenge {

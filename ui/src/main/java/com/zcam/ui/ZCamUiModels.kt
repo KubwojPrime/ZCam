@@ -56,6 +56,15 @@ data class TrustedDeviceUi(
     val addedAtEpochMillis: Long
 )
 
+data class PendingPairingRequestUi(
+    val requestId: String,
+    val displayName: String,
+    val deviceId: String,
+    val clientTypeLabel: String,
+    val verificationCode: String,
+    val expiresAtEpochMs: Long
+)
+
 data class SettingsUiState(
     val serverPortInput: String = "8080",
     val streamWidthInput: String = "1280",
@@ -81,14 +90,13 @@ data class SettingsUiState(
 )
 
 data class PairingUiState(
-    val sessionId: String = "",
-    val pairingCode: String = "",
     val qrPayload: String = "",
     val payloadInput: String = "",
     val resolvedHostPort: String = "",
-    val sourceLabel: String = "No pairing challenge loaded",
+    val sourceLabel: String = "No server selected",
     val expiresAtEpochMs: Long = 0L,
-    val pin: String = "",
+    val requestId: String = "",
+    val verificationCodeInput: String = "",
     val deviceId: String = "",
     val displayName: String = "",
     val loading: Boolean = false,
@@ -100,6 +108,7 @@ data class PairingUiState(
 data class ZCamUiState(
     val screen: ZCamScreen = ZCamScreen.MAIN,
     val mode: ZCamMode = ZCamMode.SERVER,
+    val showModePicker: Boolean = true,
     val runtimeOn: Boolean = false,
     val runtimeLabel: String = "Stopped",
     val runtimeTone: StatusTone = StatusTone.NEUTRAL,
@@ -126,10 +135,10 @@ data class ZCamUiState(
     val clientStatusLabel: String = "Client disconnected",
     val serverLanHost: String = "",
     val pairing: PairingUiState = PairingUiState(
-        pin = "0000",
         deviceId = "android-client",
         displayName = "Android Client"
     ),
+    val pendingPairingRequests: List<PendingPairingRequestUi> = emptyList(),
     val recordings: RecordingsUiState = RecordingsUiState(),
     val settings: SettingsUiState = SettingsUiState(),
     val showPairingSuggestionDialog: Boolean = false,
@@ -140,6 +149,7 @@ data class ZCamUiState(
 sealed interface ZCamUiAction {
     data class ScreenChanged(val screen: ZCamScreen) : ZCamUiAction
     data class ModeChanged(val mode: ZCamMode) : ZCamUiAction
+    data object OpenModePicker : ZCamUiAction
     data object RequestPermissions : ZCamUiAction
     data object StartRuntime : ZCamUiAction
     data object StopRuntime : ZCamUiAction
@@ -159,12 +169,12 @@ sealed interface ZCamUiAction {
     data object RequestPairingQr : ZCamUiAction
     data class PairingPayloadChanged(val value: String) : ZCamUiAction
     data object ApplyPairingPayload : ZCamUiAction
-    data class PairingSessionIdChanged(val value: String) : ZCamUiAction
-    data class PairingCodeChanged(val value: String) : ZCamUiAction
-    data class PairingPinChanged(val value: String) : ZCamUiAction
     data class PairingDeviceIdChanged(val value: String) : ZCamUiAction
     data class PairingDisplayNameChanged(val value: String) : ZCamUiAction
+    data class PairingVerificationCodeChanged(val value: String) : ZCamUiAction
+    data object StartPairingRequest : ZCamUiAction
     data object SubmitPairing : ZCamUiAction
+    data class CancelPendingPairing(val requestId: String) : ZCamUiAction
 
     data class SettingsServerPortChanged(val value: String) : ZCamUiAction
     data class SettingsStreamWidthChanged(val value: String) : ZCamUiAction
