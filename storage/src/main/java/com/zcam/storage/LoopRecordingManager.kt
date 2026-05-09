@@ -12,6 +12,12 @@ interface LoopRecordingManager : LoopRecordingEngine {
         limit: Int = 200
     ): List<RecordingClipSummary>
 
+    suspend fun queryRecordingEvents(
+        fromEpochMs: Long? = null,
+        toEpochMs: Long? = null,
+        limit: Int = 400
+    ): List<RecordingEventSummary>
+
     suspend fun resolveRecordingFile(fileName: String): File?
 }
 
@@ -25,3 +31,10 @@ data class RecordingClipSummary(
 ) {
     val durationMs: Long = (endedAtEpochMs - startedAtEpochMs).coerceAtLeast(0L)
 }
+
+data class RecordingEventSummary(
+    val epochMs: Long,
+    val confidencePercent: Int,
+    val source: String,
+    val recordingFileName: String?
+)

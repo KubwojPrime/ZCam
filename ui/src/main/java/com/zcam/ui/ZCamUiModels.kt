@@ -9,6 +9,7 @@ enum class ZCamMode {
 
 enum class ZCamScreen {
     MAIN,
+    RECORDINGS,
     PAIRING,
     SETTINGS
 }
@@ -42,12 +43,23 @@ data class RecordingItemUi(
     val sizeBytes: Long
 )
 
+data class RecordingEventUi(
+    val epochMs: Long,
+    val confidencePercent: Int,
+    val source: String,
+    val recordingFileName: String?
+)
+
 data class RecordingsUiState(
     val fromInput: String = "",
     val toInput: String = "",
     val loading: Boolean = false,
     val resultMessage: String = "",
-    val items: List<RecordingItemUi> = emptyList()
+    val items: List<RecordingItemUi> = emptyList(),
+    val events: List<RecordingEventUi> = emptyList(),
+    val selectedFileName: String = "",
+    val selectedPlaybackUrl: String = "",
+    val selectedPlaybackOffsetMs: Long = 0L
 )
 
 data class TrustedDeviceUi(
@@ -113,6 +125,7 @@ data class ZCamUiState(
     val runtimeLabel: String = "Stopped",
     val runtimeTone: StatusTone = StatusTone.NEUTRAL,
     val previewFrameJpeg: ByteArray? = null,
+    val previewStreamUrl: String = "",
     val previewLabel: String = "No frame",
     val thermalLabel: String = "Unknown",
     val thermalTone: StatusTone = StatusTone.NEUTRAL,
@@ -133,6 +146,9 @@ data class ZCamUiState(
     val clientPort: String = "8080",
     val clientReachable: Boolean = false,
     val clientStatusLabel: String = "Client disconnected",
+    val clientTorchEnabled: Boolean = false,
+    val clientNightModeEnabled: Boolean = false,
+    val clientLowLightBoostSupported: Boolean = false,
     val serverLanHost: String = "",
     val pairing: PairingUiState = PairingUiState(
         deviceId = "android-client",
@@ -157,6 +173,8 @@ sealed interface ZCamUiAction {
     data class ClientHostChanged(val host: String) : ZCamUiAction
     data class ClientPortChanged(val port: String) : ZCamUiAction
 
+    data class SetTorchEnabled(val enabled: Boolean) : ZCamUiAction
+    data class SetNightModeEnabled(val enabled: Boolean) : ZCamUiAction
     data class PushToTalkChanged(val pressed: Boolean) : ZCamUiAction
     data object ToggleLiveListen : ZCamUiAction
     data class PlayQuickSound(val clipId: String, val aversive: Boolean) : ZCamUiAction
@@ -164,7 +182,10 @@ sealed interface ZCamUiAction {
     data class RecordingsFromChanged(val value: String) : ZCamUiAction
     data class RecordingsToChanged(val value: String) : ZCamUiAction
     data object FetchRecordings : ZCamUiAction
-    data class PlayRecording(val fileName: String) : ZCamUiAction
+    data class PlayRecording(
+        val fileName: String,
+        val seekToEpochMs: Long? = null
+    ) : ZCamUiAction
 
     data object RequestPairingQr : ZCamUiAction
     data class PairingPayloadChanged(val value: String) : ZCamUiAction

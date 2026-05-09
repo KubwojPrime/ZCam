@@ -38,6 +38,7 @@ class OkHttpLocalClient @Inject constructor(
         ) { payload ->
             val server = payload.optJSONObject("server")
             val video = payload.optJSONObject("video")
+            val cameraControls = payload.optJSONObject("cameraControls")
             val audio = payload.optJSONObject("audio")
             ClientServerStatus(
                 alive = server?.optBoolean("alive") ?: false,
@@ -46,6 +47,9 @@ class OkHttpLocalClient @Inject constructor(
                 uptimeMs = server?.optLong("uptimeMs") ?: 0L,
                 videoRunning = video?.optBoolean("running") ?: false,
                 lastFrameAgeMs = video?.optLong("lastFrameAgeMs") ?: -1L,
+                torchEnabled = cameraControls?.optBoolean("torchEnabled") ?: false,
+                nightModeEnabled = cameraControls?.optBoolean("nightModeEnabled") ?: false,
+                lowLightBoostSupported = cameraControls?.optBoolean("lowLightBoostSupported") ?: false,
                 audioTransmitting = audio?.optBoolean("transmitting") ?: false,
                 audioLiveListening = audio?.optBoolean("liveListening") ?: false,
                 audioPlayingBack = audio?.optBoolean("playingBack") ?: false,
@@ -54,6 +58,19 @@ class OkHttpLocalClient @Inject constructor(
                 audioMaxVolumePercent = audio?.optNullableInt("maxVolumePercent")
             )
         }
+    }
+
+    override fun buildPreviewStreamUrl(target: ClientTarget): String {
+        val base = "http://${target.host}:${target.port}/video"
+        val query = buildList {
+            target.token?.takeIf { it.isNotBlank() }?.let {
+                add("token=" + URLEncoder.encode(it, StandardCharsets.UTF_8.name()))
+            }
+            target.deviceId?.takeIf { it.isNotBlank() }?.let {
+                add("deviceId=" + URLEncoder.encode(it, StandardCharsets.UTF_8.name()))
+            }
+        }.joinToString("&")
+        return if (query.isBlank()) base else "$base?$query"
     }
 
     override suspend fun fetchSnapshot(target: ClientTarget): ClientCallResult<ByteArray> = withContext(dispatchers.io) {
@@ -97,6 +114,20 @@ class OkHttpLocalClient @Inject constructor(
             .put("enabled", enabled)
             .toString()
         return executeAction(target, "/api/audio/live", payload)
+    }
+
+    override suspend fun setTorch(target: ClientTarget, enabled: Boolean): ClientCallResult<Unit> {
+        val payload = JSONObject()
+            .put("enabled", enabled)
+            .toString()
+        return executeAction(target, "/api/torch", payload)
+    }
+
+    override suspend fun setNightMode(target: ClientTarget, enabled: Boolean): ClientCallResult<Unit> {
+        val payload = JSONObject()
+            .put("enabled", enabled)
+            .toString()
+        return executeAction(target, "/api/nightmode", payload)
     }
 
     override suspend fun playQuickSound(
@@ -274,6 +305,68 @@ class OkHttpLocalClient @Inject constructor(
                 }
             }.getOrElse { error ->
                 logger.w("Fetch recordings failed: ${error.message}")
+                ClientCallResult.Failure(
+                    code = null,
+                    reason = "io_error",
+                    responseBody = error.message
+                )
+            }
+        }
+    }
+
+    override suspend fun fetchRecordingEvents(
+        target: ClientTarget,
+        fromEpochMs: Long?,
+        toEpochMs: Long?,
+        limit: Int
+    ): ClientCallResult<List<ClientRecordingEvent>> {
+        val base = "http://${target.host}:${target.port}/api/recordings/events"
+        val httpUrl = base.toHttpUrlOrNull()
+            ?: return ClientCallResult.Failure(code = null, reason = "invalid_target")
+        val urlBuilder = httpUrl.newBuilder()
+        fromEpochMs?.let { urlBuilder.addQueryParameter("fromEpochMs", it.toString()) }
+        toEpochMs?.let { urlBuilder.addQueryParameter("toEpochMs", it.toString()) }
+        urlBuilder.addQueryParameter("limit", limit.coerceIn(1, 1000).toString())
+
+        val requestBuilder = Request.Builder()
+            .url(urlBuilder.build())
+            .header("Accept", "application/json")
+            .header("Connection", "close")
+
+        target.token?.takeIf { it.isNotBlank() }?.let { requestBuilder.header("X-ZCam-Token", it) }
+        target.deviceId?.takeIf { it.isNotBlank() }?.let { requestBuilder.header("X-ZCam-Device-Id", it) }
+
+        return withContext(dispatchers.io) {
+            runCatching {
+                client.newCall(requestBuilder.get().build()).execute().use { response ->
+                    val bodyString = response.body?.string().orEmpty()
+                    if (!response.isSuccessful) {
+                        return@use ClientCallResult.Failure(
+                            code = response.code,
+                            reason = extractErrorReason(bodyString) ?: "http_${response.code}",
+                            responseBody = bodyString
+                        )
+                    }
+
+                    val payload = if (bodyString.isBlank()) JSONObject() else JSONObject(bodyString)
+                    val items = payload.optJSONArray("events") ?: JSONArray()
+                    val events = buildList {
+                        for (index in 0 until items.length()) {
+                            val item = items.optJSONObject(index) ?: continue
+                            add(
+                                ClientRecordingEvent(
+                                    epochMs = item.optLong("epochMs"),
+                                    confidencePercent = item.optInt("confidencePercent"),
+                                    source = item.optString("source"),
+                                    recordingFileName = item.optString("recordingFileName").ifBlank { null }
+                                )
+                            )
+                        }
+                    }
+                    ClientCallResult.Success(events)
+                }
+            }.getOrElse { error ->
+                logger.w("Fetch recording events failed: ${error.message}")
                 ClientCallResult.Failure(
                     code = null,
                     reason = "io_error",

@@ -1,0 +1,580 @@
+package com.zcam.ui
+
+import android.net.Uri
+import android.view.ViewGroup
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.VideoView
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
+import java.text.DateFormat
+import java.util.Date
+import kotlinx.coroutines.delay
+import kotlin.math.max
+
+@Composable
+internal fun ActiveActionButton(
+    text: String,
+    active: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    destructive: Boolean = false
+) {
+    val colors = when {
+        active && destructive -> ButtonDefaults.buttonColors(
+            containerColor = MaterialTheme.colorScheme.error,
+            contentColor = MaterialTheme.colorScheme.onError
+        )
+        active -> ButtonDefaults.buttonColors(
+            containerColor = MaterialTheme.colorScheme.tertiary,
+            contentColor = MaterialTheme.colorScheme.onTertiary
+        )
+        destructive -> ButtonDefaults.buttonColors(
+            containerColor = MaterialTheme.colorScheme.errorContainer,
+            contentColor = MaterialTheme.colorScheme.onErrorContainer
+        )
+        else -> ButtonDefaults.buttonColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer,
+            contentColor = MaterialTheme.colorScheme.onSecondaryContainer
+        )
+    }
+    Button(
+        onClick = onClick,
+        modifier = modifier,
+        enabled = enabled,
+        colors = colors
+    ) {
+        Text(text)
+    }
+}
+
+@Composable
+internal fun LivePreviewSurface(
+    previewStreamUrl: String,
+    previewLabel: String,
+    modifier: Modifier = Modifier
+) {
+    if (previewStreamUrl.isBlank()) {
+        Box(
+            modifier = modifier
+                .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(12.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = previewLabel.ifBlank { "Preview unavailable" },
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(12.dp)
+            )
+        }
+        return
+    }
+
+    AndroidView(
+        modifier = modifier,
+        factory = { context ->
+            WebView(context).apply {
+                layoutParams = ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+                settings.javaScriptEnabled = false
+                settings.loadsImagesAutomatically = true
+                settings.cacheMode = WebSettings.LOAD_NO_CACHE
+                settings.mediaPlaybackRequiresUserGesture = false
+                isHorizontalScrollBarEnabled = false
+                isVerticalScrollBarEnabled = false
+                setBackgroundColor(android.graphics.Color.BLACK)
+                webViewClient = WebViewClient()
+            }
+        },
+        update = { webView ->
+            val html = """
+                <html>
+                  <body style="margin:0;background:#000;overflow:hidden;">
+                    <img src="$previewStreamUrl" style="width:100vw;height:100vh;object-fit:cover;" />
+                  </body>
+                </html>
+            """.trimIndent()
+            if (webView.tag != html) {
+                webView.tag = html
+                webView.loadDataWithBaseURL(previewStreamUrl, html, "text/html", "utf-8", null)
+            }
+        }
+    )
+}
+
+@Composable
+internal fun ClientCameraControlsSection(
+    state: ZCamUiState,
+    onAction: (ZCamUiAction) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text(
+                text = "Camera controls",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                ActiveActionButton(
+                    text = "Torch ON",
+                    active = state.clientTorchEnabled,
+                    onClick = { onAction(ZCamUiAction.SetTorchEnabled(true)) },
+                    modifier = Modifier.weight(1f)
+                )
+                ActiveActionButton(
+                    text = "Torch OFF",
+                    active = !state.clientTorchEnabled,
+                    onClick = { onAction(ZCamUiAction.SetTorchEnabled(false)) },
+                    modifier = Modifier.weight(1f),
+                    destructive = true
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                ActiveActionButton(
+                    text = "Night ON",
+                    active = state.clientNightModeEnabled,
+                    onClick = { onAction(ZCamUiAction.SetNightModeEnabled(true)) },
+                    modifier = Modifier.weight(1f),
+                    enabled = state.clientLowLightBoostSupported
+                )
+                ActiveActionButton(
+                    text = "Night OFF",
+                    active = !state.clientNightModeEnabled,
+                    onClick = { onAction(ZCamUiAction.SetNightModeEnabled(false)) },
+                    modifier = Modifier.weight(1f),
+                    destructive = true
+                )
+            }
+            Text(
+                text = if (state.clientLowLightBoostSupported) {
+                    "Low-light boost available on the server camera."
+                } else {
+                    "Low-light boost unsupported on the server camera."
+                },
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
+    }
+}
+
+@Composable
+internal fun RecordingsStudioScreen(
+    state: ZCamUiState,
+    onAction: (ZCamUiAction) -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        if (state.mode != ZCamMode.CLIENT) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+            ) {
+                Text(
+                    text = "Recordings timeline is available from client mode, where the app can pull remote clips and event markers from the server.",
+                    modifier = Modifier.padding(12.dp)
+                )
+            }
+            return
+        }
+
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+        ) {
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = "Recordings",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = "Load a time range, tap a segment or event marker, then scrub the selected recording below.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                OutlinedTextField(
+                    modifier = Modifier.fillMaxWidth(),
+                    value = state.recordings.fromInput,
+                    onValueChange = { onAction(ZCamUiAction.RecordingsFromChanged(it)) },
+                    label = { Text("From") },
+                    singleLine = true
+                )
+                OutlinedTextField(
+                    modifier = Modifier.fillMaxWidth(),
+                    value = state.recordings.toInput,
+                    onValueChange = { onAction(ZCamUiAction.RecordingsToChanged(it)) },
+                    label = { Text("To") },
+                    singleLine = true
+                )
+                ActiveActionButton(
+                    text = if (state.recordings.loading) "Loading..." else "Load recordings",
+                    active = state.recordings.items.isNotEmpty(),
+                    onClick = { onAction(ZCamUiAction.FetchRecordings) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(52.dp),
+                    enabled = !state.recordings.loading
+                )
+                if (state.recordings.resultMessage.isNotBlank()) {
+                    Text(
+                        text = state.recordings.resultMessage,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+        }
+
+        RecordingPlayerCard(state = state)
+        RecordingTimelineCard(state = state, onAction = onAction)
+        RecordingSegmentsList(state = state, onAction = onAction)
+    }
+}
+
+@Composable
+private fun RecordingPlayerCard(state: ZCamUiState) {
+    val selectedUrl = state.recordings.selectedPlaybackUrl
+    val selectedOffsetMs = state.recordings.selectedPlaybackOffsetMs
+    var videoViewRef by remember { mutableStateOf<VideoView?>(null) }
+    var durationMs by remember(selectedUrl) { mutableLongStateOf(0L) }
+    var positionMs by remember(selectedUrl) { mutableLongStateOf(selectedOffsetMs) }
+    var scrubPositionMs by remember(selectedUrl) { mutableLongStateOf(selectedOffsetMs) }
+    var scrubbing by remember { mutableStateOf(false) }
+    var initialSeekMs by remember(selectedUrl, selectedOffsetMs) { mutableLongStateOf(selectedOffsetMs) }
+    val selectedItem = state.recordings.items.firstOrNull { it.fileName == state.recordings.selectedFileName }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text(
+                text = "Playback",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold
+            )
+            if (selectedUrl.isBlank()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(240.dp)
+                        .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(12.dp)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("Select a recording from the timeline below.")
+                }
+            } else {
+                AndroidView(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(240.dp),
+                    factory = { context ->
+                        VideoView(context).apply {
+                            layoutParams = ViewGroup.LayoutParams(
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                ViewGroup.LayoutParams.MATCH_PARENT
+                            )
+                            setOnPreparedListener { mediaPlayer ->
+                                durationMs = mediaPlayer.duration.toLong().coerceAtLeast(0L)
+                                if (initialSeekMs > 0L) {
+                                    seekTo(initialSeekMs.coerceAtMost(durationMs).toInt())
+                                    positionMs = initialSeekMs.coerceAtMost(durationMs)
+                                    scrubPositionMs = positionMs
+                                    initialSeekMs = 0L
+                                }
+                                start()
+                            }
+                            setOnCompletionListener {
+                                positionMs = durationMs
+                                scrubPositionMs = durationMs
+                            }
+                        }
+                    },
+                    update = { view ->
+                        videoViewRef = view
+                        val playbackKey = "$selectedUrl#$selectedOffsetMs"
+                        if (view.tag != playbackKey) {
+                            view.tag = playbackKey
+                            durationMs = 0L
+                            positionMs = selectedOffsetMs
+                            scrubPositionMs = selectedOffsetMs
+                            initialSeekMs = selectedOffsetMs
+                            view.stopPlayback()
+                            view.setVideoURI(Uri.parse(selectedUrl))
+                            view.requestFocus()
+                        }
+                    }
+                )
+
+                LaunchedEffect(videoViewRef, selectedUrl, scrubbing) {
+                    while (videoViewRef != null && selectedUrl.isNotBlank()) {
+                        if (!scrubbing) {
+                            val currentPosition = videoViewRef?.currentPosition?.toLong()?.coerceAtLeast(0L) ?: 0L
+                            positionMs = currentPosition
+                            scrubPositionMs = currentPosition
+                        }
+                        delay(250L)
+                    }
+                }
+
+                val sliderMax = max(durationMs, 1L).toFloat()
+                Slider(
+                    value = (if (scrubbing) scrubPositionMs else positionMs).coerceAtMost(durationMs).toFloat(),
+                    onValueChange = { value ->
+                        scrubbing = true
+                        scrubPositionMs = value.toLong()
+                    },
+                    onValueChangeFinished = {
+                        val target = scrubPositionMs.coerceAtMost(durationMs)
+                        videoViewRef?.seekTo(target.toInt())
+                        positionMs = target
+                        scrubbing = false
+                    },
+                    valueRange = 0f..sliderMax
+                )
+            }
+
+            if (selectedItem != null) {
+                Text(
+                    text = selectedItem.fileName,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = "Start ${formatDateTime(selectedItem.startedAtEpochMs)}  End ${formatDateTime(selectedItem.endedAtEpochMs)}",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun RecordingTimelineCard(
+    state: ZCamUiState,
+    onAction: (ZCamUiAction) -> Unit
+) {
+    val segments = state.recordings.items.sortedBy(RecordingItemUi::startedAtEpochMs)
+    val events = state.recordings.events.sortedBy(RecordingEventUi::epochMs)
+    val rangeStart = segments.minOfOrNull(RecordingItemUi::startedAtEpochMs)
+        ?: events.minOfOrNull(RecordingEventUi::epochMs)
+    val rangeEnd = segments.maxOfOrNull(RecordingItemUi::endedAtEpochMs)
+        ?: events.maxOfOrNull(RecordingEventUi::epochMs)
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                text = "Timeline",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold
+            )
+            if (rangeStart == null || rangeEnd == null || rangeEnd <= rangeStart) {
+                Text(
+                    text = "Load recordings to build the timeline.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                return@Column
+            }
+
+            BoxWithConstraints(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(96.dp)
+            ) {
+                val timelineWidth = maxWidth
+                val totalRange = (rangeEnd - rangeStart).coerceAtLeast(1L).toFloat()
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(56.dp)
+                        .align(Alignment.Center)
+                        .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(12.dp))
+                )
+
+                segments.forEach { item ->
+                    val startFraction = ((item.startedAtEpochMs - rangeStart) / totalRange).coerceIn(0f, 1f)
+                    val endFraction = ((item.endedAtEpochMs - rangeStart) / totalRange).coerceIn(0f, 1f)
+                    val widthFraction = (endFraction - startFraction).coerceAtLeast(0.03f)
+                    Box(
+                        modifier = Modifier
+                            .padding(top = 20.dp)
+                            .height(24.dp)
+                            .width(timelineWidth * widthFraction)
+                            .background(
+                                if (state.recordings.selectedFileName == item.fileName) {
+                                    MaterialTheme.colorScheme.tertiary
+                                } else {
+                                    MaterialTheme.colorScheme.primaryContainer
+                                },
+                                RoundedCornerShape(8.dp)
+                            )
+                            .clickable { onAction(ZCamUiAction.PlayRecording(item.fileName)) }
+                            .align(Alignment.TopStart)
+                            .offset(x = timelineWidth * startFraction)
+                    )
+                }
+
+                events.forEach { event ->
+                    val markerFraction = ((event.epochMs - rangeStart) / totalRange).coerceIn(0f, 1f)
+                    Box(
+                        modifier = Modifier
+                            .padding(top = 12.dp)
+                            .width(4.dp)
+                            .height(40.dp)
+                            .background(
+                                MaterialTheme.colorScheme.error,
+                                RoundedCornerShape(2.dp)
+                            )
+                            .align(Alignment.TopStart)
+                            .offset(x = timelineWidth * markerFraction)
+                            .clickable(enabled = !event.recordingFileName.isNullOrBlank()) {
+                                event.recordingFileName?.let { fileName ->
+                                    onAction(ZCamUiAction.PlayRecording(fileName, event.epochMs))
+                                }
+                            }
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(formatDateTime(rangeStart), style = MaterialTheme.typography.bodySmall)
+                Text(formatDateTime(rangeEnd), style = MaterialTheme.typography.bodySmall)
+            }
+            Text(
+                text = "Red markers are detected events. Tap a marker to jump to the matching recording.",
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
+    }
+}
+
+@Composable
+private fun RecordingSegmentsList(
+    state: ZCamUiState,
+    onAction: (ZCamUiAction) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                text = "Segments",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold
+            )
+            if (state.recordings.items.isEmpty()) {
+                Text("No recordings in the selected range.", style = MaterialTheme.typography.bodySmall)
+                return@Column
+            }
+            state.recordings.items.forEach { item ->
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (state.recordings.selectedFileName == item.fileName) {
+                            MaterialTheme.colorScheme.secondaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.surface
+                        }
+                    )
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onAction(ZCamUiAction.PlayRecording(item.fileName)) }
+                            .padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(item.fileName, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            text = "Start ${formatDateTime(item.startedAtEpochMs)}",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Text(
+                            text = "Duration ${item.durationMs / 1000}s  Size ${item.sizeBytes / (1024 * 1024)} MB",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun formatDateTime(epochMs: Long): String {
+    return DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
+        .format(Date(epochMs))
+}

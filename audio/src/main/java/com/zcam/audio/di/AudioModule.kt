@@ -1,6 +1,8 @@
 ﻿package com.zcam.audio.di
 
 import com.zcam.audio.AndroidPushToTalkManager
+import com.zcam.audio.AndroidAudioCuePlayer
+import com.zcam.audio.AudioCuePlayer
 import com.zcam.audio.AndroidSystemVolumeController
 import com.zcam.audio.PushToTalkManager
 import com.zcam.audio.SystemVolumeController
@@ -17,6 +19,10 @@ abstract class AudioModule {
     @Binds
     @Singleton
     abstract fun bindPushToTalkManager(impl: AndroidPushToTalkManager): PushToTalkManager
+
+    @Binds
+    @Singleton
+    abstract fun bindAudioCuePlayer(impl: AndroidAudioCuePlayer): AudioCuePlayer
 
     @Binds
     @Singleton

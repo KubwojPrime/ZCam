@@ -6,6 +6,10 @@ import com.zcam.core.logging.LogEventId
 import com.zcam.core.logging.ZCamLogger
 import com.zcam.core.logging.i
 import com.zcam.core.logging.w
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -17,7 +21,8 @@ import javax.inject.Singleton
 class AndroidPushToTalkManager @Inject constructor(
     private val dispatchers: DispatcherProvider,
     private val logger: ZCamLogger,
-    private val systemVolumeController: SystemVolumeController
+    private val systemVolumeController: SystemVolumeController,
+    private val audioCuePlayer: AudioCuePlayer = NoOpAudioCuePlayer
 ) : PushToTalkManager {
 
     private val stateMutex = Mutex()
@@ -43,6 +48,8 @@ class AndroidPushToTalkManager @Inject constructor(
     private var activeClipId: String? = null
     private var volumePercent: Int = DEFAULT_VOLUME_PERCENT
     private var lastAversivePlaybackAtEpochMs: Long = 0L
+    private var playbackGeneration: Long = 0L
+    private var playbackCompletionJob: Job? = null
 
     override suspend fun start() = withContext(dispatchers.io) {
         stateMutex.withLock {
@@ -63,12 +70,16 @@ class AndroidPushToTalkManager @Inject constructor(
     }
 
     override suspend fun stop() = withContext(dispatchers.io) {
+        audioCuePlayer.stop()
         stateMutex.withLock {
             engineStarted = false
             transmitting = false
             liveListening = false
             playingBack = false
             activeClipId = null
+            playbackGeneration += 1L
+            playbackCompletionJob?.cancel()
+            playbackCompletionJob = null
             updateSnapshotLocked()
             logger.i(LogEventId.AUDIO_ENGINE_STOPPED, "Audio engine stopped")
         }
@@ -108,11 +119,15 @@ class AndroidPushToTalkManager @Inject constructor(
     }
 
     override suspend fun stopPlayback() = withContext(dispatchers.io) {
+        audioCuePlayer.stop()
         stateMutex.withLock {
             if (!engineStarted) return@withLock
             if (playingBack) {
                 playingBack = false
                 activeClipId = null
+                playbackGeneration += 1L
+                playbackCompletionJob?.cancel()
+                playbackCompletionJob = null
                 updateSnapshotLocked()
                 logger.i(LogEventId.AUDIO_PLAYBACK_STOPPED, "Audio playback stopped")
             }
@@ -195,9 +210,21 @@ class AndroidPushToTalkManager @Inject constructor(
                     lastAversivePlaybackAtEpochMs = now
                 }
 
+                playbackGeneration += 1L
+                playbackCompletionJob?.cancel()
+                playbackCompletionJob = null
+                audioCuePlayer.stop()
                 playingBack = true
                 activeClipId = request.clipId
                 val updated = updateSnapshotLocked(now = now)
+                val cuePlayback = audioCuePlayer.play(request.clipId, request.category)
+                cuePlayback?.let { cue ->
+                    schedulePlaybackCompletionLocked(
+                        clipId = request.clipId,
+                        generation = playbackGeneration,
+                        delayMs = cue.durationMs
+                    )
+                }
                 logger.i(
                     LogEventId.AUDIO_PLAYBACK_STARTED,
                     "Audio playback started clip=${request.clipId} category=${request.category.name.lowercase()}"
@@ -282,6 +309,30 @@ class AndroidPushToTalkManager @Inject constructor(
         if (lastAversivePlaybackAtEpochMs <= 0L) return 0L
         val elapsed = (now - lastAversivePlaybackAtEpochMs).coerceAtLeast(0L)
         return (AVERSIVE_COOLDOWN_MS - elapsed).coerceAtLeast(0L)
+    }
+
+    private fun schedulePlaybackCompletionLocked(
+        clipId: String,
+        generation: Long,
+        delayMs: Long
+    ) {
+        if (delayMs <= 0L) return
+        playbackCompletionJob = CoroutineScope(dispatchers.default).launch {
+            delay(delayMs)
+            stateMutex.withLock {
+                if (!engineStarted) return@withLock
+                if (playbackGeneration != generation) return@withLock
+                if (!playingBack || activeClipId != clipId) return@withLock
+                playingBack = false
+                activeClipId = null
+                playbackCompletionJob = null
+                updateSnapshotLocked()
+                logger.i(
+                    LogEventId.AUDIO_PLAYBACK_STOPPED,
+                    "Audio playback finished clip=$clipId"
+                )
+            }
+        }
     }
 
     private companion object {

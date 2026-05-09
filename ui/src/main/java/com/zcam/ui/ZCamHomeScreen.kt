@@ -1,7 +1,6 @@
 package com.zcam.ui
 
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Color
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -129,6 +128,7 @@ fun ZCamHomeScreen(
 
                             when (state.screen) {
                                 ZCamScreen.MAIN -> MainScreen(state = state, onAction = onAction)
+                                ZCamScreen.RECORDINGS -> RecordingsStudioScreen(state = state, onAction = onAction)
                                 ZCamScreen.PAIRING -> PairingScreen(state = state, onAction = onAction)
                                 ZCamScreen.SETTINGS -> SettingsScreen(state = state, onAction = onAction)
                             }
@@ -211,6 +211,11 @@ private fun AppDrawerContent(
                 onClick = { onScreenSelected(ZCamScreen.PAIRING) }
             )
             NavigationDrawerItem(
+                label = { Text("Recordings") },
+                selected = state.screen == ZCamScreen.RECORDINGS,
+                onClick = { onScreenSelected(ZCamScreen.RECORDINGS) }
+            )
+            NavigationDrawerItem(
                 label = { Text("Settings") },
                 selected = state.screen == ZCamScreen.SETTINGS,
                 onClick = { onScreenSelected(ZCamScreen.SETTINGS) }
@@ -227,6 +232,7 @@ private fun AppDrawerContent(
 private fun screenTitle(state: ZCamUiState): String {
     return when (state.screen) {
         ZCamScreen.MAIN -> if (state.mode == ZCamMode.SERVER) "Server" else "Client"
+        ZCamScreen.RECORDINGS -> "Recordings"
         ZCamScreen.PAIRING -> "Pairing"
         ZCamScreen.SETTINGS -> "Settings"
     }
@@ -323,14 +329,20 @@ private fun ScreenTabs(
 ) {
     val selected = when (state.screen) {
         ZCamScreen.MAIN -> 0
-        ZCamScreen.PAIRING -> 1
-        ZCamScreen.SETTINGS -> 2
+        ZCamScreen.RECORDINGS -> 1
+        ZCamScreen.PAIRING -> 2
+        ZCamScreen.SETTINGS -> 3
     }
     TabRow(selectedTabIndex = selected) {
         Tab(
             selected = state.screen == ZCamScreen.MAIN,
             onClick = { onAction(ZCamUiAction.ScreenChanged(ZCamScreen.MAIN)) },
             text = { Text("Main") }
+        )
+        Tab(
+            selected = state.screen == ZCamScreen.RECORDINGS,
+            onClick = { onAction(ZCamUiAction.ScreenChanged(ZCamScreen.RECORDINGS)) },
+            text = { Text("Recordings") }
         )
         Tab(
             selected = state.screen == ZCamScreen.PAIRING,
@@ -365,6 +377,7 @@ private fun MainScreen(
             ZCamMode.CLIENT -> {
                 ClientSection(state = state, onAction = onAction)
                 PreviewCard(state = state)
+                ClientCameraControlsSection(state = state, onAction = onAction)
                 PushToTalkControls(state = state, onAction = onAction)
                 QuickSoundsSection(state = state, onAction = onAction)
                 RecordingsSection(state = state, onAction = onAction)
@@ -997,32 +1010,19 @@ private fun PreviewCard(state: ZCamUiState) {
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold
             )
-            val bitmap = remember(state.previewFrameJpeg) {
-                state.previewFrameJpeg?.let { bytes ->
-                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
-                }
-            }
-            Box(
+            LivePreviewSurface(
+                previewStreamUrl = state.previewStreamUrl,
+                previewLabel = state.previewLabel.ifBlank {
+                    if (state.mode == ZCamMode.SERVER && !state.runtimeOn) {
+                        "Start runtime to see live preview."
+                    } else {
+                        "Preview unavailable"
+                    }
+                },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(210.dp)
-                    .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(12.dp)),
-                contentAlignment = Alignment.Center
-            ) {
-                if (bitmap != null) {
-                    Image(
-                        bitmap = bitmap,
-                        contentDescription = "Live preview",
-                        modifier = Modifier.fillMaxSize()
-                    )
-                } else {
-                    Text(
-                        text = "Preview unavailable",
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.padding(12.dp)
-                    )
-                }
-            }
+            )
         }
     }
 }
@@ -1045,24 +1045,25 @@ private fun RuntimeControls(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Button(
+                ActiveActionButton(
+                    text = "Start",
+                    active = state.runtimeOn,
                     onClick = { onAction(ZCamUiAction.StartRuntime) },
                     modifier = Modifier
                         .weight(1f)
                         .height(58.dp),
                     enabled = !state.working
-                ) {
-                    Text("Start")
-                }
-                OutlinedButton(
+                )
+                ActiveActionButton(
+                    text = "Stop",
+                    active = !state.runtimeOn,
                     onClick = { onAction(ZCamUiAction.StopRuntime) },
                     modifier = Modifier
                         .weight(1f)
                         .height(58.dp),
-                    enabled = !state.working
-                ) {
-                    Text("Stop")
-                }
+                    enabled = !state.working,
+                    destructive = true
+                )
             }
         }
     }
@@ -1078,22 +1079,23 @@ private fun PushToTalkControls(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
     ) {
         Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Button(
+            ActiveActionButton(
+                text = if (state.pttPressed) "Push-to-talk ON" else "Push-to-talk OFF",
+                active = state.pttPressed,
+                onClick = { onAction(ZCamUiAction.PushToTalkChanged(!state.pttPressed)) },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(74.dp),
-                onClick = { onAction(ZCamUiAction.PushToTalkChanged(!state.pttPressed)) }
-            ) {
-                Text(if (state.pttPressed) "Release Push-To-Talk" else "Hold Push-To-Talk")
-            }
-            OutlinedButton(
+                destructive = state.pttPressed
+            )
+            ActiveActionButton(
+                text = if (state.liveListenEnabled) "Live listen ON" else "Live listen OFF",
+                active = state.liveListenEnabled,
+                onClick = { onAction(ZCamUiAction.ToggleLiveListen) },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(56.dp),
-                onClick = { onAction(ZCamUiAction.ToggleLiveListen) }
-            ) {
-                Text(if (state.liveListenEnabled) "Disable live listen" else "Enable live listen")
-            }
+                    .height(56.dp)
+            )
             Text(text = "Volume ${state.volumePercent}%")
             Slider(
                 value = state.volumePercent.toFloat(),
@@ -1150,52 +1152,32 @@ private fun RecordingsSection(
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Text(
-                text = "Recordings",
+                text = "Recordings studio",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold
             )
             Text(
-                text = "Time range format: YYYY-MM-DD HH:mm (local) or epoch ms",
+                text = if (state.recordings.items.isEmpty()) {
+                    "Open the dedicated recordings tab for timeline playback and event markers."
+                } else {
+                    "Loaded ${state.recordings.items.size} clip(s) and ${state.recordings.events.size} event marker(s). Open the dedicated recordings tab to browse them."
+                },
                 style = MaterialTheme.typography.bodySmall
             )
-            OutlinedTextField(
-                modifier = Modifier.fillMaxWidth(),
-                value = state.recordings.fromInput,
-                onValueChange = { onAction(ZCamUiAction.RecordingsFromChanged(it)) },
-                label = { Text("From") },
-                singleLine = true
-            )
-            OutlinedTextField(
-                modifier = Modifier.fillMaxWidth(),
-                value = state.recordings.toInput,
-                onValueChange = { onAction(ZCamUiAction.RecordingsToChanged(it)) },
-                label = { Text("To") },
-                singleLine = true
-            )
-            Button(
+            ActiveActionButton(
+                text = "Open recordings",
+                active = state.screen == ZCamScreen.RECORDINGS,
+                onClick = { onAction(ZCamUiAction.ScreenChanged(ZCamScreen.RECORDINGS)) },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(52.dp),
-                enabled = !state.recordings.loading,
-                onClick = { onAction(ZCamUiAction.FetchRecordings) }
-            ) {
-                Text(if (state.recordings.loading) "Loading..." else "Load recordings")
-            }
+                enabled = !state.recordings.loading
+            )
             if (state.recordings.resultMessage.isNotBlank()) {
-                StatusChip(
-                    label = state.recordings.resultMessage,
-                    tone = StatusTone.NEUTRAL
-                )
-            }
-            if (state.recordings.items.isEmpty()) {
                 Text(
-                    text = "No recordings in selected range.",
+                    text = state.recordings.resultMessage,
                     style = MaterialTheme.typography.bodySmall
                 )
-            } else {
-                state.recordings.items.forEach { item ->
-                    RecordingItemRow(item = item, onPlay = { onAction(ZCamUiAction.PlayRecording(item.fileName)) })
-                }
             }
         }
     }

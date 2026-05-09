@@ -1,7 +1,6 @@
 package com.zcam.app
 
 import android.content.Context
-import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
@@ -32,6 +31,7 @@ import com.zcam.service.runtime.RuntimeHealthRepository
 import com.zcam.service.runtime.RuntimeOverallStatus
 import com.zcam.ui.ComponentStatusUi
 import com.zcam.ui.PendingPairingRequestUi
+import com.zcam.ui.RecordingEventUi
 import com.zcam.ui.SettingsUiState
 import com.zcam.ui.StatusTone
 import com.zcam.ui.TrustedDeviceUi
@@ -86,13 +86,21 @@ class ZCamMainViewModel @Inject constructor(
         observeRuntimeHealth()
         observeDesiredState()
         monitorThermalStatus()
-        refreshPreviewLoop()
+        refreshPreviewTarget()
         refreshClientStatusLoop()
     }
 
     fun onAction(action: ZCamUiAction) {
         when (action) {
-            is ZCamUiAction.ScreenChanged -> _state.update { it.copy(screen = action.screen) }
+            is ZCamUiAction.ScreenChanged -> {
+                _state.update { it.copy(screen = action.screen) }
+                if (action.screen == ZCamScreen.RECORDINGS && state.value.mode == ZCamMode.CLIENT) {
+                    ensureRecordingsDefaults()
+                    if (state.value.recordings.items.isEmpty()) {
+                        fetchRecordingsForRange()
+                    }
+                }
+            }
             is ZCamUiAction.ModeChanged -> {
                 _state.update { current ->
                     current.copy(
@@ -104,6 +112,7 @@ class ZCamMainViewModel @Inject constructor(
                     )
                 }
                 refreshServerLanHost()
+                refreshPreviewTarget()
             }
             ZCamUiAction.OpenModePicker -> _state.update {
                 it.copy(
@@ -121,12 +130,16 @@ class ZCamMainViewModel @Inject constructor(
             is ZCamUiAction.ClientHostChanged -> {
                 _state.update { it.copy(clientHost = action.host.trim()) }
                 scheduleClientSessionPersist()
+                refreshPreviewTarget()
             }
             is ZCamUiAction.ClientPortChanged -> {
                 _state.update { it.copy(clientPort = action.port.filter(Char::isDigit)) }
                 scheduleClientSessionPersist()
+                refreshPreviewTarget()
             }
 
+            is ZCamUiAction.SetTorchEnabled -> setTorchEnabled(action.enabled)
+            is ZCamUiAction.SetNightModeEnabled -> setNightModeEnabled(action.enabled)
             is ZCamUiAction.PushToTalkChanged -> setPushToTalk(action.pressed)
             ZCamUiAction.ToggleLiveListen -> toggleLiveListen()
             is ZCamUiAction.PlayQuickSound -> playQuickSound(action.clipId, action.aversive)
@@ -138,7 +151,7 @@ class ZCamMainViewModel @Inject constructor(
                 it.copy(recordings = it.recordings.copy(toInput = action.value))
             }
             ZCamUiAction.FetchRecordings -> fetchRecordingsForRange()
-            is ZCamUiAction.PlayRecording -> playRecording(action.fileName)
+            is ZCamUiAction.PlayRecording -> playRecording(action.fileName, action.seekToEpochMs)
 
             ZCamUiAction.RequestPairingQr -> requestPairingQr()
             is ZCamUiAction.PairingPayloadChanged -> _state.update {
@@ -213,6 +226,7 @@ class ZCamMainViewModel @Inject constructor(
                     )
                 }
                 refreshServerLanHost()
+                refreshPreviewTarget()
             }
         }
     }
@@ -232,6 +246,7 @@ class ZCamMainViewModel @Inject constructor(
                         )
                     )
                 }
+                refreshPreviewTarget()
             }
         }
     }
@@ -279,29 +294,31 @@ class ZCamMainViewModel @Inject constructor(
         viewModelScope.launch(dispatchers.io) {
             runtimeStateRepository.desiredState.collectLatest { desired ->
                 _state.update { it.copy(runtimeOn = desired.shouldRun) }
+                refreshPreviewTarget()
             }
         }
     }
 
-    private fun refreshPreviewLoop() {
-        viewModelScope.launch(dispatchers.io) {
-            while (isActive) {
-                val target = currentTargetForCommands()
-                val preview = localClient.fetchSnapshot(target)
-                _state.update { current ->
-                    when (preview) {
-                        is ClientCallResult.Success -> current.copy(
-                            previewFrameJpeg = preview.value,
-                            previewLabel = ""
-                        )
-
-                        is ClientCallResult.Failure -> current.copy(
-                            previewLabel = "Preview unavailable"
-                        )
-                    }
-                }
-                delay(PREVIEW_REFRESH_MS)
+    private fun refreshPreviewTarget() {
+        val current = state.value
+        val target = currentTargetForCommands()
+        val streamUrl = when (current.mode) {
+            ZCamMode.SERVER -> if (current.runtimeOn) {
+                localClient.buildPreviewStreamUrl(target)
+            } else {
+                ""
             }
+            ZCamMode.CLIENT -> if (current.clientHost.isNotBlank()) {
+                localClient.buildPreviewStreamUrl(target)
+            } else {
+                ""
+            }
+        }
+        _state.update {
+            it.copy(
+                previewStreamUrl = streamUrl,
+                previewLabel = if (streamUrl.isBlank()) "Preview unavailable" else ""
+            )
         }
     }
 
@@ -330,6 +347,9 @@ class ZCamMainViewModel @Inject constructor(
                         current.copy(
                             clientReachable = status.alive,
                             clientStatusLabel = if (status.alive) "Connected" else "Unavailable",
+                            clientTorchEnabled = status.torchEnabled,
+                            clientNightModeEnabled = status.nightModeEnabled,
+                            clientLowLightBoostSupported = status.lowLightBoostSupported,
                             pttPressed = status.audioTransmitting,
                             liveListenEnabled = status.audioLiveListening,
                             volumePercent = if (syncVolumeFromServer && serverVolume != null) {
@@ -346,6 +366,7 @@ class ZCamMainViewModel @Inject constructor(
                     )
                 }
             }
+            refreshPreviewTarget()
         }
     }
 
@@ -440,6 +461,38 @@ class ZCamMainViewModel @Inject constructor(
         }
     }
 
+    private fun setTorchEnabled(enabled: Boolean) {
+        viewModelScope.launch(dispatchers.io) {
+            when (val result = localClient.setTorch(currentTargetForCommands(), enabled)) {
+                is ClientCallResult.Success -> _state.update {
+                    it.copy(
+                        clientTorchEnabled = enabled,
+                        errorMessage = null
+                    )
+                }
+                is ClientCallResult.Failure -> _state.update {
+                    it.copy(errorMessage = "Torch update failed: ${result.reason}${result.responseBody?.let { body -> " ($body)" } ?: ""}")
+                }
+            }
+        }
+    }
+
+    private fun setNightModeEnabled(enabled: Boolean) {
+        viewModelScope.launch(dispatchers.io) {
+            when (val result = localClient.setNightMode(currentTargetForCommands(), enabled)) {
+                is ClientCallResult.Success -> _state.update {
+                    it.copy(
+                        clientNightModeEnabled = enabled,
+                        errorMessage = null
+                    )
+                }
+                is ClientCallResult.Failure -> _state.update {
+                    it.copy(errorMessage = "Night mode update failed: ${result.reason}${result.responseBody?.let { body -> " ($body)" } ?: ""}")
+                }
+            }
+        }
+    }
+
     private fun updateVolume(levelPercent: Int) {
         val normalized = levelPercent.coerceIn(0, 85)
         _state.update { it.copy(volumePercent = normalized) }
@@ -500,12 +553,42 @@ class ZCamMainViewModel @Inject constructor(
                             sizeBytes = clip.sizeBytes
                         )
                     }
+                    val events = when (
+                        val eventsResult = localClient.fetchRecordingEvents(
+                            target = currentTargetForCommands(),
+                            fromEpochMs = fromParsed,
+                            toEpochMs = toParsed,
+                            limit = 400
+                        )
+                    ) {
+                        is ClientCallResult.Success -> eventsResult.value.map { event ->
+                            RecordingEventUi(
+                                epochMs = event.epochMs,
+                                confidencePercent = event.confidencePercent,
+                                source = event.source,
+                                recordingFileName = event.recordingFileName
+                            )
+                        }
+                        is ClientCallResult.Failure -> emptyList()
+                    }
                     _state.update {
+                        val selectedFileName = it.recordings.selectedFileName
+                            .takeIf { fileName -> items.any { item -> item.fileName == fileName } }
+                            ?: items.firstOrNull()?.fileName.orEmpty()
+                        val selectedPlaybackUrl = if (selectedFileName.isBlank()) {
+                            ""
+                        } else {
+                            localClient.buildRecordingPlaybackUrl(currentTargetForCommands(), selectedFileName)
+                        }
                         it.copy(
                             recordings = it.recordings.copy(
                                 loading = false,
                                 resultMessage = "Found ${items.size} recording(s)",
-                                items = items
+                                items = items,
+                                events = events,
+                                selectedFileName = selectedFileName,
+                                selectedPlaybackUrl = selectedPlaybackUrl,
+                                selectedPlaybackOffsetMs = 0L
                             ),
                             errorMessage = null
                         )
@@ -526,22 +609,25 @@ class ZCamMainViewModel @Inject constructor(
         }
     }
 
-    private fun playRecording(fileName: String) {
+    private fun playRecording(fileName: String, seekToEpochMs: Long?) {
         viewModelScope.launch(dispatchers.io) {
             if (fileName.isBlank()) return@launch
             val url = localClient.buildRecordingPlaybackUrl(currentTargetForCommands(), fileName)
-            val uri = Uri.parse(url)
-            val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, "video/mp4")
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            val item = state.value.recordings.items.firstOrNull { it.fileName == fileName }
+            val offsetMs = if (item != null && seekToEpochMs != null) {
+                (seekToEpochMs - item.startedAtEpochMs).coerceAtLeast(0L)
+            } else {
+                0L
             }
-            runCatching {
-                appContext.startActivity(intent)
-                _state.update { it.copy(errorMessage = null) }
-            }.onFailure { error ->
-                _state.update {
-                    it.copy(errorMessage = "Cannot open recording player: ${error.message}")
-                }
+            _state.update {
+                it.copy(
+                    recordings = it.recordings.copy(
+                        selectedFileName = fileName,
+                        selectedPlaybackUrl = url,
+                        selectedPlaybackOffsetMs = offsetMs
+                    ),
+                    errorMessage = null
+                )
             }
         }
     }
@@ -968,6 +1054,28 @@ class ZCamMainViewModel @Inject constructor(
         }
     }
 
+    private fun ensureRecordingsDefaults() {
+        val current = state.value.recordings
+        if (current.fromInput.isNotBlank() || current.toInput.isNotBlank()) return
+        val now = System.currentTimeMillis()
+        val from = now - DEFAULT_RECORDINGS_LOOKBACK_MS
+        _state.update {
+            it.copy(
+                recordings = it.recordings.copy(
+                    fromInput = formatRecordingTimeInput(from),
+                    toInput = formatRecordingTimeInput(now)
+                )
+            )
+        }
+    }
+
+    private fun formatRecordingTimeInput(epochMs: Long): String {
+        return java.time.Instant.ofEpochMilli(epochMs)
+            .atZone(ZoneId.systemDefault())
+            .toLocalDateTime()
+            .format(RECORDINGS_DATE_TIME_FORMATTER)
+    }
+
     private suspend fun readThermalState(): Pair<String, StatusTone> = withContext(dispatchers.io) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             return@withContext "Unsupported (API < 29)" to StatusTone.NEUTRAL
@@ -1246,12 +1354,12 @@ class ZCamMainViewModel @Inject constructor(
     }
 
     private companion object {
-        const val PREVIEW_REFRESH_MS = 1_200L
         const val CLIENT_STATUS_REFRESH_MS = 2_000L
         const val CLIENT_SESSION_SYNC_DEBOUNCE_MS = 250L
         const val THERMAL_REFRESH_MS = 2_500L
         const val VOLUME_DEBOUNCE_MS = 180L
         const val PAIRING_CODE_DIGITS = 6
+        const val DEFAULT_RECORDINGS_LOOKBACK_MS = 12 * 60 * 60 * 1000L
         val RECORDINGS_DATE_TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
         const val INVALID_TIME_INPUT = Long.MIN_VALUE
     }

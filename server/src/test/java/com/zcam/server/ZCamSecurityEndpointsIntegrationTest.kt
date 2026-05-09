@@ -364,6 +364,12 @@ class ZCamSecurityEndpointsIntegrationTest {
             limit: Int
         ): List<RecordingClipSummary> = emptyList()
 
+        override suspend fun queryRecordingEvents(
+            fromEpochMs: Long?,
+            toEpochMs: Long?,
+            limit: Int
+        ): List<com.zcam.storage.RecordingEventSummary> = emptyList()
+
         override suspend fun resolveRecordingFile(fileName: String): java.io.File? = null
     }
 

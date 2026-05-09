@@ -5,6 +5,7 @@ import android.os.Environment
 import com.zcam.camera.VideoRecordingPipeline
 import com.zcam.core.dispatchers.DispatcherProvider
 import com.zcam.core.domain.config.LoopRecordingConfig
+import com.zcam.core.domain.recording.RecordingEventStore
 import com.zcam.core.logging.LogEventId
 import com.zcam.core.logging.ZCamLogger
 import com.zcam.core.logging.e
@@ -31,6 +32,7 @@ class LocalLoopRecordingManager @Inject constructor(
     @ApplicationContext private val context: Context,
     private val dispatchers: DispatcherProvider,
     private val videoRecordingPipeline: VideoRecordingPipeline,
+    private val recordingEventStore: RecordingEventStore,
     private val logger: ZCamLogger
 ) : LoopRecordingManager {
 
@@ -143,6 +145,38 @@ class LocalLoopRecordingManager @Inject constructor(
                     )
                 }
                 .toList()
+        }
+    }
+
+    override suspend fun queryRecordingEvents(
+        fromEpochMs: Long?,
+        toEpochMs: Long?,
+        limit: Int
+    ): List<RecordingEventSummary> = withContext(dispatchers.io) {
+        val events = recordingEventStore.query(
+            fromEpochMs = fromEpochMs,
+            toEpochMs = toEpochMs,
+            limit = limit.coerceIn(1, MAX_RECORDING_EVENTS_QUERY_LIMIT)
+        )
+        val catalog = stateMutex.withLock {
+            val directory = recordingDir()
+            val repository = indexRepository ?: RecordingIndexRepository(indexFile(directory)).also {
+                indexRepository = it
+            }
+            repository.loadOrRebuild(directory, logger).also {
+                currentCatalog = it
+            }
+        }
+        return@withContext events.map { event ->
+            val recordingFileName = catalog.segments.firstOrNull { segment ->
+                event.epochMs in segment.startedAtEpochMs..segment.endedAtEpochMs
+            }?.fileName
+            RecordingEventSummary(
+                epochMs = event.epochMs,
+                confidencePercent = event.confidencePercent,
+                source = event.source,
+                recordingFileName = recordingFileName
+            )
         }
     }
 
@@ -280,7 +314,7 @@ class LocalLoopRecordingManager @Inject constructor(
         return null
     }
 
-    private fun enforceStoragePolicy(
+    private suspend fun enforceStoragePolicy(
         recordingDir: File,
         repository: RecordingIndexRepository,
         catalog: RecordingCatalog,
@@ -298,6 +332,9 @@ class LocalLoopRecordingManager @Inject constructor(
                 LogEventId.RECORDING_CLEANUP_REMOVED,
                 "Cleanup removed ${retentionOutcome.deletedSegments} segments (${retentionOutcome.deletedBytes} bytes)"
             )
+        }
+        retentionOutcome.catalog.segments.minOfOrNull(RecordingSegmentEntry::startedAtEpochMs)?.let { oldestRetained ->
+            recordingEventStore.pruneBefore(oldestRetained)
         }
         repository.save(retentionOutcome.catalog)
         return retentionOutcome.catalog
@@ -348,6 +385,7 @@ class LocalLoopRecordingManager @Inject constructor(
         const val MAX_OUT_OF_SPACE_RECOVERY_ATTEMPTS = 6
         const val BASE_OUT_OF_SPACE_BACKOFF_MS = 1_500L
         const val MAX_RECORDINGS_QUERY_LIMIT = 500
+        const val MAX_RECORDING_EVENTS_QUERY_LIMIT = 1_000
         val RECORDING_FILE_NAME_REGEX = Regex("^[A-Za-z0-9._-]{1,128}\\.mp4$")
     }
 }

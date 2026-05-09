@@ -27,9 +27,14 @@ import androidx.lifecycle.LifecycleRegistry
 import com.google.common.util.concurrent.ListenableFuture
 import com.zcam.core.dispatchers.DispatcherProvider
 import com.zcam.core.domain.config.StreamConfig
+import com.zcam.core.domain.recording.RecordingEvent
+import com.zcam.core.domain.recording.RecordingEventStore
 import com.zcam.core.logging.ZCamLogger
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -54,6 +59,7 @@ import kotlin.coroutines.resumeWithException
 class CameraRuntimeImpl @Inject constructor(
     @ApplicationContext private val appContext: Context,
     private val dispatchers: DispatcherProvider,
+    private val recordingEventStore: RecordingEventStore,
     private val logger: ZCamLogger
 ) : CameraRuntime, MjpegFrameSource, FramePipelineStatusSource, VideoRecordingPipeline {
 
@@ -64,6 +70,8 @@ class CameraRuntimeImpl @Inject constructor(
     private val cameraExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "zcam-camera-analyzer").apply { isDaemon = true }
     }
+    private val eventScope = CoroutineScope(SupervisorJob() + dispatchers.io)
+    private val motionEventDetector = MotionEventDetector()
 
     private val targetWidth = AtomicInteger(DEFAULT_WIDTH)
     private val targetHeight = AtomicInteger(DEFAULT_HEIGHT)
@@ -503,10 +511,19 @@ class CameraRuntimeImpl @Inject constructor(
         encoder.lastProcessedAtMs = now
 
         try {
+            val event = motionEventDetector.analyze(
+                image = image,
+                eventEpochMs = System.currentTimeMillis()
+            )
             val jpeg = encoder.encode(image)
             latest.set(jpeg)
             producedFrames.incrementAndGet()
             lastFrameEpochMs.set(System.currentTimeMillis())
+            if (event != null) {
+                eventScope.launch {
+                    recordingEventStore.append(event)
+                }
+            }
         } catch (error: Throwable) {
             droppedFrames.incrementAndGet()
             logger.e(error, "Frame pipeline encode failed")
@@ -621,6 +638,121 @@ class CameraRuntimeImpl @Inject constructor(
                     }
                 }
             }
+        }
+    }
+
+    private class MotionEventDetector {
+        private var previousSamples = IntArray(0)
+        private var warmupFrames = 0
+        private var consecutiveHits = 0
+        private var lastEventEpochMs = 0L
+
+        fun analyze(
+            image: ImageProxy,
+            eventEpochMs: Long
+        ): RecordingEvent? {
+            val samples = sampleLuma(image)
+            if (samples.isEmpty()) return null
+            if (previousSamples.isEmpty()) {
+                previousSamples = samples
+                warmupFrames = 1
+                return null
+            }
+
+            if (warmupFrames < WARMUP_FRAME_COUNT) {
+                previousSamples = samples
+                warmupFrames += 1
+                return null
+            }
+
+            val comparisons = minOf(previousSamples.size, samples.size)
+            if (comparisons == 0) {
+                previousSamples = samples
+                return null
+            }
+
+            var changedSamples = 0
+            var totalDelta = 0
+            var peakDelta = 0
+            for (index in 0 until comparisons) {
+                val delta = kotlin.math.abs(samples[index] - previousSamples[index])
+                totalDelta += delta
+                if (delta >= SAMPLE_DELTA_THRESHOLD) {
+                    changedSamples += 1
+                }
+                if (delta > peakDelta) {
+                    peakDelta = delta
+                }
+            }
+            previousSamples = samples
+
+            val averageDelta = totalDelta / comparisons.toFloat()
+            val changedRatio = changedSamples / comparisons.toFloat()
+            val hit = averageDelta >= AVERAGE_DELTA_THRESHOLD &&
+                peakDelta >= PEAK_DELTA_THRESHOLD &&
+                changedRatio >= CHANGED_SAMPLE_RATIO_THRESHOLD
+
+            consecutiveHits = if (hit) {
+                (consecutiveHits + 1).coerceAtMost(CONSECUTIVE_HITS_REQUIRED)
+            } else {
+                0
+            }
+
+            if (consecutiveHits < CONSECUTIVE_HITS_REQUIRED) {
+                return null
+            }
+            if (eventEpochMs - lastEventEpochMs < EVENT_COOLDOWN_MS) {
+                return null
+            }
+
+            consecutiveHits = 0
+            lastEventEpochMs = eventEpochMs
+            return RecordingEvent(
+                epochMs = eventEpochMs,
+                confidencePercent = (averageDelta * 2.5f).toInt().coerceIn(1, 100),
+                source = "motion"
+            )
+        }
+
+        private fun sampleLuma(image: ImageProxy): IntArray {
+            val plane = image.planes.firstOrNull() ?: return IntArray(0)
+            val buffer = plane.buffer.duplicate()
+            val rowStride = plane.rowStride
+            val pixelStride = plane.pixelStride.coerceAtLeast(1)
+            val width = image.width
+            val height = image.height
+            if (width <= 0 || height <= 0 || !buffer.hasRemaining()) return IntArray(0)
+
+            val xStep = (width / SAMPLE_COLUMNS).coerceAtLeast(MIN_SAMPLE_STEP)
+            val yStep = (height / SAMPLE_ROWS).coerceAtLeast(MIN_SAMPLE_STEP)
+            val samples = ArrayList<Int>(SAMPLE_COLUMNS * SAMPLE_ROWS)
+            var y = 0
+            while (y < height) {
+                val rowBase = y * rowStride
+                var x = 0
+                while (x < width) {
+                    val index = rowBase + (x * pixelStride)
+                    if (index < buffer.limit()) {
+                        samples += (buffer.get(index).toInt() and 0xFF)
+                    }
+                    x += xStep
+                }
+                y += yStep
+            }
+            return samples.toIntArray()
+        }
+
+        private companion object {
+            const val SAMPLE_COLUMNS = 14
+            const val SAMPLE_ROWS = 10
+            const val MIN_SAMPLE_STEP = 8
+            const val WARMUP_FRAME_COUNT = 8
+            const val CONSECUTIVE_HITS_REQUIRED = 4
+            const val SAMPLE_DELTA_THRESHOLD = 28
+            const val AVERAGE_DELTA_THRESHOLD = 18f
+            const val PEAK_DELTA_THRESHOLD = 54
+            const val CHANGED_SAMPLE_RATIO_THRESHOLD = 0.35f
+            const val EVENT_COOLDOWN_MS = 15_000L
         }
     }
 

@@ -45,7 +45,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         handlePairingIntent(intent)
-        lastInteractionAtElapsedMs = SystemClock.elapsedRealtime()
+        registerUserInteraction()
 
         setContent {
             val state by viewModel.state.collectAsState()
@@ -160,7 +160,7 @@ class MainActivity : ComponentActivity() {
                             .clickable(
                                 interactionSource = interactionSource,
                                 indication = null,
-                                onClick = {}
+                                onClick = { registerUserInteraction() }
                             )
                     )
                 }
@@ -176,27 +176,43 @@ class MainActivity : ComponentActivity() {
 
     override fun onUserInteraction() {
         super.onUserInteraction()
-        lastInteractionAtElapsedMs = SystemClock.elapsedRealtime()
+        registerUserInteraction()
     }
 
     private fun requiredPermissionsForMode(mode: ZCamMode): List<String> {
         return when (mode) {
-            ZCamMode.SERVER -> listOf(Manifest.permission.CAMERA) + storagePermissions()
-            ZCamMode.CLIENT -> listOf(Manifest.permission.RECORD_AUDIO)
+            ZCamMode.SERVER -> buildList {
+                add(Manifest.permission.CAMERA)
+                add(Manifest.permission.RECORD_AUDIO)
+                addAll(storagePermissions())
+                addAll(notificationPermissions())
+            }
+            ZCamMode.CLIENT -> buildList {
+                add(Manifest.permission.RECORD_AUDIO)
+                addAll(notificationPermissions())
+            }
         }
     }
 
     private fun requiredPermissionsForAction(mode: ZCamMode, action: ZCamUiAction): List<String> {
         return when (action) {
             ZCamUiAction.StartRuntime -> if (mode == ZCamMode.SERVER) {
-                listOf(Manifest.permission.CAMERA) + storagePermissions()
+                buildList {
+                    add(Manifest.permission.CAMERA)
+                    add(Manifest.permission.RECORD_AUDIO)
+                    addAll(storagePermissions())
+                    addAll(notificationPermissions())
+                }
             } else {
                 emptyList()
             }
 
             is ZCamUiAction.PushToTalkChanged,
             ZCamUiAction.ToggleLiveListen -> if (mode == ZCamMode.CLIENT) {
-                listOf(Manifest.permission.RECORD_AUDIO)
+                buildList {
+                    add(Manifest.permission.RECORD_AUDIO)
+                    addAll(notificationPermissions())
+                }
             } else {
                 emptyList()
             }
@@ -221,6 +237,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun notificationPermissions(): List<String> {
+        return if (Build.VERSION.SDK_INT >= 33) {
+            listOf(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            emptyList()
+        }
+    }
+
     private fun isPermissionGranted(permission: String): Boolean {
         return ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
     }
@@ -236,12 +260,17 @@ class MainActivity : ComponentActivity() {
         return when (permission) {
             Manifest.permission.CAMERA -> "Camera"
             Manifest.permission.RECORD_AUDIO -> "Microphone"
+            Manifest.permission.POST_NOTIFICATIONS -> "Notifications"
             Manifest.permission.READ_MEDIA_VIDEO,
             Manifest.permission.READ_MEDIA_AUDIO,
             Manifest.permission.READ_EXTERNAL_STORAGE,
             Manifest.permission.WRITE_EXTERNAL_STORAGE -> "Files"
             else -> permission
         }
+    }
+
+    private fun registerUserInteraction() {
+        lastInteractionAtElapsedMs = SystemClock.elapsedRealtime()
     }
 
     private fun handlePairingIntent(intent: Intent?) {

@@ -14,6 +14,9 @@ data class ClientServerStatus(
     val uptimeMs: Long,
     val videoRunning: Boolean,
     val lastFrameAgeMs: Long,
+    val torchEnabled: Boolean,
+    val nightModeEnabled: Boolean,
+    val lowLightBoostSupported: Boolean,
     val audioTransmitting: Boolean,
     val audioLiveListening: Boolean,
     val audioPlayingBack: Boolean,
@@ -52,6 +55,13 @@ data class ClientRecordingSummary(
     val codec: String
 )
 
+data class ClientRecordingEvent(
+    val epochMs: Long,
+    val confidencePercent: Int,
+    val source: String,
+    val recordingFileName: String?
+)
+
 sealed interface ClientCallResult<out T> {
     data class Success<T>(val value: T) : ClientCallResult<T>
 
@@ -66,8 +76,11 @@ interface LocalClient {
     suspend fun isServerAlive(target: ClientTarget): Boolean
     suspend fun fetchStatus(target: ClientTarget): ClientCallResult<ClientServerStatus>
     suspend fun fetchSnapshot(target: ClientTarget): ClientCallResult<ByteArray>
+    fun buildPreviewStreamUrl(target: ClientTarget): String
     suspend fun setPushToTalk(target: ClientTarget, enabled: Boolean): ClientCallResult<Unit>
     suspend fun setLiveListen(target: ClientTarget, enabled: Boolean): ClientCallResult<Unit>
+    suspend fun setTorch(target: ClientTarget, enabled: Boolean): ClientCallResult<Unit>
+    suspend fun setNightMode(target: ClientTarget, enabled: Boolean): ClientCallResult<Unit>
     suspend fun playQuickSound(
         target: ClientTarget,
         clipId: String,
@@ -104,6 +117,13 @@ interface LocalClient {
         toEpochMs: Long? = null,
         limit: Int = 120
     ): ClientCallResult<List<ClientRecordingSummary>>
+
+    suspend fun fetchRecordingEvents(
+        target: ClientTarget,
+        fromEpochMs: Long? = null,
+        toEpochMs: Long? = null,
+        limit: Int = 400
+    ): ClientCallResult<List<ClientRecordingEvent>>
 
     fun buildRecordingPlaybackUrl(target: ClientTarget, fileName: String): String
 }

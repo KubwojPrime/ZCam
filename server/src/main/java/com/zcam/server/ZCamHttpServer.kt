@@ -26,6 +26,7 @@ import com.zcam.security.TokenRevocationResult
 import com.zcam.security.TokenRotationResult
 import com.zcam.storage.LoopRecordingManager
 import com.zcam.storage.RecordingClipSummary
+import com.zcam.storage.RecordingEventSummary
 import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -132,6 +133,7 @@ class ZCamHttpServer @Inject constructor(
     private fun routeRequest(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
         val uri = session.uri.orEmpty()
         return when {
+            uri == "/api/recordings/events" -> handleRecordingEventsEndpoint(session)
             uri.startsWith("/api/recordings/") -> handleRecordingDownloadEndpoint(session)
             else -> when (uri) {
             "/" -> buildPanelResponse()
@@ -547,6 +549,54 @@ class ZCamHttpServer @Inject constructor(
         return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, JSON_UTF8, body)
     }
 
+    private fun handleRecordingEventsEndpoint(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
+        if (session.method != NanoHTTPD.Method.GET) {
+            return methodNotAllowed("GET")
+        }
+        val rawFrom = firstQueryValue(session, "fromEpochMs")
+            ?: firstQueryValue(session, "from")
+            ?: firstQueryValue(session, "start")
+        val fromEpochMs = parseEpochParam(rawFrom)
+        if (rawFrom != null && fromEpochMs == null) {
+            return badRequest("invalid fromEpochMs/from/start")
+        }
+
+        val rawTo = firstQueryValue(session, "toEpochMs")
+            ?: firstQueryValue(session, "to")
+            ?: firstQueryValue(session, "end")
+        val toEpochMs = parseEpochParam(rawTo)
+        if (rawTo != null && toEpochMs == null) {
+            return badRequest("invalid toEpochMs/to/end")
+        }
+
+        if (fromEpochMs != null && toEpochMs != null && fromEpochMs > toEpochMs) {
+            return badRequest("from must be <= to")
+        }
+        val limit = (firstQueryValue(session, "limit")?.toIntOrNull() ?: DEFAULT_RECORDINGS_LIST_LIMIT)
+            .coerceIn(1, MAX_RECORDINGS_LIST_LIMIT * 2)
+
+        val events = runBlocking {
+            loopRecordingManager.queryRecordingEvents(
+                fromEpochMs = fromEpochMs,
+                toEpochMs = toEpochMs,
+                limit = limit
+            )
+        }
+
+        val body = buildString(capacity = 256 + events.size * 96) {
+            append('{')
+            append("\"status\":\"ok\",")
+            append("\"count\":").append(events.size).append(',')
+            append("\"events\":[")
+            events.forEachIndexed { index, event ->
+                if (index > 0) append(',')
+                append(recordingEventJson(event))
+            }
+            append("]}")
+        }
+        return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, JSON_UTF8, body)
+    }
+
     private fun handleRecordingDownloadEndpoint(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
         if (session.method != NanoHTTPD.Method.GET) {
             return methodNotAllowed("GET")
@@ -727,6 +777,17 @@ class ZCamHttpServer @Inject constructor(
             append("\"sizeBytes\":").append(clip.sizeBytes).append(',')
             append("\"container\":").append(jsonString(clip.container)).append(',')
             append("\"codec\":").append(jsonString(clip.codec))
+            append('}')
+        }
+    }
+
+    private fun recordingEventJson(event: RecordingEventSummary): String {
+        return buildString(capacity = 128) {
+            append('{')
+            append("\"epochMs\":").append(event.epochMs).append(',')
+            append("\"confidencePercent\":").append(event.confidencePercent).append(',')
+            append("\"source\":").append(jsonString(event.source)).append(',')
+            append("\"recordingFileName\":").append(jsonString(event.recordingFileName))
             append('}')
         }
     }
