@@ -1,5 +1,7 @@
-﻿package com.zcam.core.di
+package com.zcam.core.di
 
+import com.zcam.core.device.AndroidPowerStatusProvider
+import com.zcam.core.device.PowerStatusProvider
 import com.zcam.core.dispatchers.DefaultDispatcher
 import com.zcam.core.dispatchers.DefaultDispatcherProvider
 import com.zcam.core.dispatchers.DispatcherProvider
@@ -28,6 +30,10 @@ abstract class CoreBindingsModule {
     @Binds
     @Singleton
     abstract fun bindLogger(impl: TimberZCamLogger): ZCamLogger
+
+    @Binds
+    @Singleton
+    abstract fun bindPowerStatusProvider(impl: AndroidPowerStatusProvider): PowerStatusProvider
 }
 
 @Module

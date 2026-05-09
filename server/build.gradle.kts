@@ -31,6 +31,7 @@ dependencies {
     implementation(project(":security"))
 
     implementation(libs.nanohttpd)
+    implementation(libs.nanohttpd.websocket)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.hilt.android)
     kapt(libs.hilt.compiler)

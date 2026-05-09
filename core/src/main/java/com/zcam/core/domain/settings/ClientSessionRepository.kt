@@ -9,7 +9,8 @@ data class ClientSession(
     val displayName: String = "",
     val issuedToken: String = "",
     val pairedAtEpochMs: Long = 0L,
-    val lastUpdatedAtEpochMs: Long = 0L
+    val lastUpdatedAtEpochMs: Long = 0L,
+    val lastModeName: String = ""
 )
 
 interface ClientSessionRepository {

@@ -4,6 +4,7 @@ import com.zcam.audio.AudioCommandResult
 import com.zcam.audio.AudioLiveMode
 import com.zcam.audio.AudioPlaybackRequest
 import com.zcam.audio.AudioStateSnapshot
+import com.zcam.audio.AudioTransportConfig
 import com.zcam.audio.PushToTalkManager
 import com.zcam.camera.CameraControlCommandResult
 import com.zcam.camera.CameraControlManager
@@ -11,6 +12,8 @@ import com.zcam.camera.CameraControlsSnapshot
 import com.zcam.camera.FramePipelineStatus
 import com.zcam.camera.FramePipelineStatusSource
 import com.zcam.camera.MjpegFrameSource
+import com.zcam.core.device.PowerStatusProvider
+import com.zcam.core.device.PowerStatusSnapshot
 import com.zcam.core.dispatchers.DispatcherProvider
 import com.zcam.core.domain.audio.PlaybackSource
 import com.zcam.core.domain.config.FeatureFlag
@@ -69,6 +72,7 @@ class ZCamSecurityEndpointsIntegrationTest {
             pushToTalkManager = FakeAudioManager(),
             loopRecordingManager = NoopLoopRecordingManager(),
             securityManager = securityManager,
+            powerStatusProvider = FakePowerStatusProvider(),
             dispatchers = dispatchers,
             logger = logger,
             lanAccessPolicy = LanAccessPolicy()
@@ -279,6 +283,21 @@ class ZCamSecurityEndpointsIntegrationTest {
             return AudioCommandResult.Success(snapshotState(), "ok")
         }
 
+        override fun transportConfig(): AudioTransportConfig = AudioTransportConfig()
+
+        override suspend fun registerLiveAudioSubscriber(
+            subscriberId: String,
+            onFrame: (ByteArray) -> Unit
+        ): Boolean = true
+
+        override suspend fun unregisterLiveAudioSubscriber(subscriberId: String) = Unit
+
+        override suspend fun openPushToTalkStream(streamId: String): Boolean = true
+
+        override suspend fun submitPushToTalkAudio(streamId: String, pcmFrame: ByteArray): Boolean = true
+
+        override suspend fun closePushToTalkStream(streamId: String) = Unit
+
         override fun snapshotState(): AudioStateSnapshot = AudioStateSnapshot(
             engineStarted = true,
             transmitting = false,
@@ -343,6 +362,15 @@ class ZCamSecurityEndpointsIntegrationTest {
             )
             state.value = next
             return RuntimeSettingsUpdateResult.Success(next)
+        }
+    }
+
+    private class FakePowerStatusProvider : PowerStatusProvider {
+        override fun snapshot(): PowerStatusSnapshot {
+            return PowerStatusSnapshot(
+                batteryPercent = 81,
+                charging = false
+            )
         }
     }
 

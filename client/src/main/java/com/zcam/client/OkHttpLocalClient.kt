@@ -40,6 +40,7 @@ class OkHttpLocalClient @Inject constructor(
             val video = payload.optJSONObject("video")
             val cameraControls = payload.optJSONObject("cameraControls")
             val audio = payload.optJSONObject("audio")
+            val power = payload.optJSONObject("power")
             ClientServerStatus(
                 alive = server?.optBoolean("alive") ?: false,
                 overallStatus = payload.optString("status", "unknown"),
@@ -55,7 +56,9 @@ class OkHttpLocalClient @Inject constructor(
                 audioPlayingBack = audio?.optBoolean("playingBack") ?: false,
                 audioVolumePercent = audio?.optNullableInt("volumePercent"),
                 audioMinVolumePercent = audio?.optNullableInt("minVolumePercent"),
-                audioMaxVolumePercent = audio?.optNullableInt("maxVolumePercent")
+                audioMaxVolumePercent = audio?.optNullableInt("maxVolumePercent"),
+                batteryPercent = power?.optNullableInt("batteryPercent"),
+                charging = power?.optNullableBoolean("charging")
             )
         }
     }
@@ -480,6 +483,10 @@ class OkHttpLocalClient @Inject constructor(
 
     private fun JSONObject.optNullableInt(name: String): Int? {
         return if (has(name) && !isNull(name)) optInt(name) else null
+    }
+
+    private fun JSONObject.optNullableBoolean(name: String): Boolean? {
+        return if (has(name) && !isNull(name)) optBoolean(name) else null
     }
 
     private enum class HttpMethod {

@@ -9,7 +9,10 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.zcam.client.ClientCallResult
 import com.zcam.client.ClientTarget
+import com.zcam.client.LocalAudioTransport
+import com.zcam.client.LocalAudioTransportResult
 import com.zcam.client.LocalClient
+import com.zcam.core.device.PowerStatusProvider
 import com.zcam.core.dispatchers.DispatcherProvider
 import com.zcam.core.domain.config.FeatureFlag
 import com.zcam.core.domain.config.RuntimeSettings
@@ -46,6 +49,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -67,7 +71,9 @@ class ZCamMainViewModel @Inject constructor(
     private val runtimeStateRepository: RuntimeStateRepository,
     private val clientSessionRepository: ClientSessionRepository,
     private val localClient: LocalClient,
+    private val localAudioTransport: LocalAudioTransport,
     private val securityManager: SecurityManager,
+    private val powerStatusProvider: PowerStatusProvider,
     private val dispatchers: DispatcherProvider,
     private val logger: ZCamLogger
 ) : ViewModel() {
@@ -85,9 +91,11 @@ class ZCamMainViewModel @Inject constructor(
         observePendingPairingRequests()
         observeRuntimeHealth()
         observeDesiredState()
+        monitorLocalPowerStatus()
         monitorThermalStatus()
         refreshPreviewTarget()
         refreshClientStatusLoop()
+        refreshPreviewSnapshotLoop()
     }
 
     fun onAction(action: ZCamUiAction) {
@@ -102,6 +110,11 @@ class ZCamMainViewModel @Inject constructor(
                 }
             }
             is ZCamUiAction.ModeChanged -> {
+                if (action.mode != ZCamMode.CLIENT) {
+                    viewModelScope.launch(dispatchers.io) {
+                        localAudioTransport.stopAll()
+                    }
+                }
                 _state.update { current ->
                     current.copy(
                         mode = action.mode,
@@ -111,6 +124,7 @@ class ZCamMainViewModel @Inject constructor(
                         errorMessage = null
                     )
                 }
+                scheduleClientSessionPersist()
                 refreshServerLanHost()
                 refreshPreviewTarget()
             }
@@ -206,6 +220,7 @@ class ZCamMainViewModel @Inject constructor(
                     pairing = current.pairing.copy(payloadInput = payload)
                 )
             }
+            persistClientSession()
             applyPairingPayloadFromInput()
         }
     }
@@ -234,9 +249,13 @@ class ZCamMainViewModel @Inject constructor(
     private fun observeClientSession() {
         viewModelScope.launch(dispatchers.io) {
             clientSessionRepository.session.collectLatest { session ->
-                if (session == ClientSession()) return@collectLatest
                 _state.update { current ->
+                    val restoredMode = session.lastModeName.toStoredModeOrNull()
+                    val shouldRestoreMode = current.showModePicker && restoredMode != null
                     current.copy(
+                        mode = if (shouldRestoreMode) restoredMode!! else current.mode,
+                        showModePicker = if (shouldRestoreMode) false else current.showModePicker,
+                        screen = if (shouldRestoreMode) ZCamScreen.MAIN else current.screen,
                         clientHost = if (session.serverHost.isNotBlank()) session.serverHost else current.clientHost,
                         clientPort = if (session.serverPort in 1..65535) session.serverPort.toString() else current.clientPort,
                         pairing = current.pairing.copy(
@@ -317,7 +336,8 @@ class ZCamMainViewModel @Inject constructor(
         _state.update {
             it.copy(
                 previewStreamUrl = streamUrl,
-                previewLabel = if (streamUrl.isBlank()) "Preview unavailable" else ""
+                previewLabel = if (streamUrl.isBlank()) "Preview unavailable" else "",
+                previewFrameJpeg = if (streamUrl.isBlank()) null else it.previewFrameJpeg
             )
         }
     }
@@ -327,6 +347,34 @@ class ZCamMainViewModel @Inject constructor(
             while (isActive) {
                 refreshClientStatusNow()
                 delay(CLIENT_STATUS_REFRESH_MS)
+            }
+        }
+    }
+
+    private fun refreshPreviewSnapshotLoop() {
+        viewModelScope.launch(dispatchers.io) {
+            while (isActive) {
+                val current = state.value
+                if (!shouldRefreshPreviewSnapshots(current)) {
+                    if (current.previewFrameJpeg != null) {
+                        _state.update { it.copy(previewFrameJpeg = null) }
+                    }
+                    delay(PREVIEW_SNAPSHOT_REFRESH_MS)
+                    continue
+                }
+
+                when (val result = localClient.fetchSnapshot(currentTargetForCommands())) {
+                    is ClientCallResult.Success -> _state.update { latest ->
+                        if (shouldRefreshPreviewSnapshots(latest)) {
+                            latest.copy(previewFrameJpeg = result.value)
+                        } else {
+                            latest
+                        }
+                    }
+
+                    is ClientCallResult.Failure -> Unit
+                }
+                delay(PREVIEW_SNAPSHOT_REFRESH_MS)
             }
         }
     }
@@ -344,6 +392,11 @@ class ZCamMainViewModel @Inject constructor(
                                 status.audioMinVolumePercent ?: 0,
                                 status.audioMaxVolumePercent ?: 85
                             )
+                        val power = powerUiState(
+                            batteryPercent = status.batteryPercent,
+                            charging = status.charging,
+                            remote = current.mode == ZCamMode.CLIENT
+                        )
                         current.copy(
                             clientReachable = status.alive,
                             clientStatusLabel = if (status.alive) "Connected" else "Unavailable",
@@ -352,6 +405,10 @@ class ZCamMainViewModel @Inject constructor(
                             clientLowLightBoostSupported = status.lowLightBoostSupported,
                             pttPressed = status.audioTransmitting,
                             liveListenEnabled = status.audioLiveListening,
+                            serverBatteryPercent = status.batteryPercent,
+                            serverCharging = status.charging,
+                            serverBatteryLabel = power.label,
+                            serverBatteryTone = power.tone,
                             volumePercent = if (syncVolumeFromServer && serverVolume != null) {
                                 serverVolume
                             } else {
@@ -360,10 +417,29 @@ class ZCamMainViewModel @Inject constructor(
                         )
                     }
 
-                    is ClientCallResult.Failure -> current.copy(
-                        clientReachable = false,
-                        clientStatusLabel = "Unavailable"
-                    )
+                    is ClientCallResult.Failure -> {
+                        val failureBatteryLabel = if (current.mode == ZCamMode.CLIENT) {
+                            "Server battery unavailable"
+                        } else {
+                            current.serverBatteryLabel
+                        }
+                        current.copy(
+                            clientReachable = false,
+                            clientStatusLabel = "Unavailable",
+                            serverBatteryPercent = if (current.mode == ZCamMode.CLIENT) null else current.serverBatteryPercent,
+                            serverCharging = if (current.mode == ZCamMode.CLIENT) null else current.serverCharging,
+                            serverBatteryLabel = failureBatteryLabel,
+                            serverBatteryTone = if (current.mode == ZCamMode.CLIENT) StatusTone.WARNING else current.serverBatteryTone
+                        )
+                    }
+                }
+            }
+            if (result is ClientCallResult.Success) {
+                if (!result.value.audioTransmitting) {
+                    localAudioTransport.stopPushToTalk()
+                }
+                if (!result.value.audioLiveListening) {
+                    localAudioTransport.stopLiveListen()
                 }
             }
             refreshPreviewTarget()
@@ -425,14 +501,65 @@ class ZCamMainViewModel @Inject constructor(
 
     private fun setPushToTalk(pressed: Boolean) {
         viewModelScope.launch(dispatchers.io) {
-            val result = localClient.setPushToTalk(currentTargetForCommands(), enabled = pressed)
-            _state.update { current ->
-                when (result) {
-                    is ClientCallResult.Success -> current.copy(pttPressed = pressed, errorMessage = null)
-                    is ClientCallResult.Failure -> current.copy(
-                        errorMessage = "Push-to-talk failed: ${result.reason}${result.responseBody?.let { " ($it)" } ?: ""}"
-                    )
+            val target = currentTargetForCommands()
+            if (!pressed) {
+                localAudioTransport.stopPushToTalk()
+            }
+
+            when (val result = localClient.setPushToTalk(target, enabled = pressed)) {
+                is ClientCallResult.Success -> {
+                    if (pressed) {
+                        when (val audioResult = localAudioTransport.startPushToTalk(target)) {
+                            LocalAudioTransportResult.Success -> _state.update {
+                                it.copy(pttPressed = true, errorMessage = null)
+                            }
+                            is LocalAudioTransportResult.Failure -> {
+                                localClient.setPushToTalk(target, enabled = false)
+                                _state.update {
+                                    it.copy(
+                                        pttPressed = false,
+                                        errorMessage = "Push-to-talk transport failed: ${audioResult.reason}${audioResult.detail?.let { detail -> " ($detail)" } ?: ""}"
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        _state.update { it.copy(pttPressed = false, errorMessage = null) }
+                    }
                 }
+                is ClientCallResult.Failure -> {
+                    _state.update {
+                        it.copy(
+                            errorMessage = "Push-to-talk failed: ${result.reason}${result.responseBody?.let { body -> " ($body)" } ?: ""}"
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private fun monitorLocalPowerStatus() {
+        viewModelScope.launch(dispatchers.io) {
+            while (isActive) {
+                val power = powerStatusProvider.snapshot()
+                val powerUi = powerUiState(
+                    batteryPercent = power.batteryPercent,
+                    charging = power.charging,
+                    remote = false
+                )
+                _state.update { current ->
+                    if (current.mode != ZCamMode.SERVER) {
+                        current
+                    } else {
+                        current.copy(
+                            serverBatteryPercent = power.batteryPercent,
+                            serverCharging = power.charging,
+                            serverBatteryLabel = powerUi.label,
+                            serverBatteryTone = powerUi.tone
+                        )
+                    }
+                }
+                delay(POWER_REFRESH_MS)
             }
         }
     }
@@ -440,13 +567,38 @@ class ZCamMainViewModel @Inject constructor(
     private fun toggleLiveListen() {
         viewModelScope.launch(dispatchers.io) {
             val enabled = !state.value.liveListenEnabled
-            val result = localClient.setLiveListen(currentTargetForCommands(), enabled = enabled)
-            _state.update { current ->
-                when (result) {
-                    is ClientCallResult.Success -> current.copy(liveListenEnabled = enabled, errorMessage = null)
-                    is ClientCallResult.Failure -> current.copy(
-                        errorMessage = "Live listen failed: ${result.reason}${result.responseBody?.let { " ($it)" } ?: ""}"
-                    )
+            val target = currentTargetForCommands()
+            if (!enabled) {
+                localAudioTransport.stopLiveListen()
+            }
+
+            when (val result = localClient.setLiveListen(target, enabled = enabled)) {
+                is ClientCallResult.Success -> {
+                    if (enabled) {
+                        when (val audioResult = localAudioTransport.startLiveListen(target)) {
+                            LocalAudioTransportResult.Success -> _state.update {
+                                it.copy(liveListenEnabled = true, errorMessage = null)
+                            }
+                            is LocalAudioTransportResult.Failure -> {
+                                localClient.setLiveListen(target, enabled = false)
+                                _state.update {
+                                    it.copy(
+                                        liveListenEnabled = false,
+                                        errorMessage = "Live listen transport failed: ${audioResult.reason}${audioResult.detail?.let { detail -> " ($detail)" } ?: ""}"
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        _state.update { it.copy(liveListenEnabled = false, errorMessage = null) }
+                    }
+                }
+                is ClientCallResult.Failure -> {
+                    _state.update {
+                        it.copy(
+                            errorMessage = "Live listen failed: ${result.reason}${result.responseBody?.let { body -> " ($body)" } ?: ""}"
+                        )
+                    }
                 }
             }
         }
@@ -1020,6 +1172,15 @@ class ZCamMainViewModel @Inject constructor(
     private suspend fun persistClientSession() {
         val current = state.value
         val parsedPort = current.clientPort.toIntOrNull() ?: settingsSnapshot.serverPort
+        val existingSession = clientSessionRepository.session.first()
+        val now = System.currentTimeMillis()
+        val pairedAtEpochMs = when {
+            current.pairing.issuedToken.isBlank() -> 0L
+            current.pairing.issuedToken == existingSession.issuedToken && existingSession.pairedAtEpochMs > 0L -> {
+                existingSession.pairedAtEpochMs
+            }
+            else -> now
+        }
         clientSessionRepository.saveSession(
             ClientSession(
                 serverHost = current.clientHost.trim(),
@@ -1027,8 +1188,9 @@ class ZCamMainViewModel @Inject constructor(
                 deviceId = current.pairing.deviceId.ifBlank { defaultDeviceId() },
                 displayName = current.pairing.displayName.ifBlank { "Android Client" },
                 issuedToken = current.pairing.issuedToken,
-                pairedAtEpochMs = if (current.pairing.issuedToken.isBlank()) 0L else System.currentTimeMillis(),
-                lastUpdatedAtEpochMs = System.currentTimeMillis()
+                pairedAtEpochMs = pairedAtEpochMs,
+                lastUpdatedAtEpochMs = now,
+                lastModeName = current.mode.name
             )
         )
     }
@@ -1052,6 +1214,13 @@ class ZCamMainViewModel @Inject constructor(
                 deviceId = currentState.pairing.deviceId.ifBlank { defaultDeviceId() }
             )
         }
+    }
+
+    override fun onCleared() {
+        viewModelScope.launch(dispatchers.io) {
+            localAudioTransport.stopAll()
+        }
+        super.onCleared()
     }
 
     private fun ensureRecordingsDefaults() {
@@ -1339,6 +1508,39 @@ class ZCamMainViewModel @Inject constructor(
         return if (model.isBlank()) "android-client" else "android-$model"
     }
 
+    private fun shouldRefreshPreviewSnapshots(current: ZCamUiState): Boolean {
+        return !current.showModePicker &&
+            current.screen == ZCamScreen.MAIN &&
+            current.previewStreamUrl.isNotBlank()
+    }
+
+    private fun powerUiState(
+        batteryPercent: Int?,
+        charging: Boolean?,
+        remote: Boolean
+    ): PowerUiState {
+        val prefix = if (remote) "Server battery" else "Battery"
+        val label = when {
+            batteryPercent != null && charging == true -> "$prefix: $batteryPercent% - charging"
+            batteryPercent != null -> "$prefix: $batteryPercent%"
+            charging == true -> "$prefix: charging"
+            else -> "$prefix unavailable"
+        }
+        val tone = when {
+            batteryPercent == null && charging == null -> StatusTone.WARNING
+            charging == true -> StatusTone.HEALTHY
+            batteryPercent == null -> StatusTone.WARNING
+            batteryPercent < 15 -> StatusTone.ERROR
+            batteryPercent < 35 -> StatusTone.WARNING
+            else -> StatusTone.HEALTHY
+        }
+        return PowerUiState(label = label, tone = tone)
+    }
+
+    private fun String.toStoredModeOrNull(): ZCamMode? {
+        return runCatching { ZCamMode.valueOf(trim().uppercase()) }.getOrNull()
+    }
+
     private data class ParsedPairingPayload(
         val sessionId: String?,
         val pairingCode: String?,
@@ -1353,10 +1555,17 @@ class ZCamMainViewModel @Inject constructor(
             }
     }
 
+    private data class PowerUiState(
+        val label: String,
+        val tone: StatusTone
+    )
+
     private companion object {
         const val CLIENT_STATUS_REFRESH_MS = 2_000L
         const val CLIENT_SESSION_SYNC_DEBOUNCE_MS = 250L
         const val THERMAL_REFRESH_MS = 2_500L
+        const val POWER_REFRESH_MS = 10_000L
+        const val PREVIEW_SNAPSHOT_REFRESH_MS = 1_500L
         const val VOLUME_DEBOUNCE_MS = 180L
         const val PAIRING_CODE_DIGITS = 6
         const val DEFAULT_RECORDINGS_LOOKBACK_MS = 12 * 60 * 60 * 1000L

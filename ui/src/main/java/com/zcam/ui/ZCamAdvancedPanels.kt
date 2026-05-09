@@ -1,11 +1,16 @@
 package com.zcam.ui
 
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.view.ViewGroup
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.VideoView
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -40,6 +45,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -90,8 +97,17 @@ internal fun ActiveActionButton(
 internal fun LivePreviewSurface(
     previewStreamUrl: String,
     previewLabel: String,
-    modifier: Modifier = Modifier
+    fallbackFrameJpeg: ByteArray? = null,
+    modifier: Modifier = Modifier,
+    zoomable: Boolean = false,
+    containPreview: Boolean = false
 ) {
+    val fallbackBitmap = remember(fallbackFrameJpeg) {
+        fallbackFrameJpeg?.takeIf { it.isNotEmpty() }?.let { jpeg ->
+            BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
+        }
+    }
+
     if (previewStreamUrl.isBlank()) {
         Box(
             modifier = modifier
@@ -107,38 +123,81 @@ internal fun LivePreviewSurface(
         return
     }
 
-    AndroidView(
-        modifier = modifier,
-        factory = { context ->
-            WebView(context).apply {
-                layoutParams = ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT
-                )
-                settings.javaScriptEnabled = false
-                settings.loadsImagesAutomatically = true
-                settings.cacheMode = WebSettings.LOAD_NO_CACHE
-                settings.mediaPlaybackRequiresUserGesture = false
-                isHorizontalScrollBarEnabled = false
-                isVerticalScrollBarEnabled = false
-                setBackgroundColor(android.graphics.Color.BLACK)
-                webViewClient = WebViewClient()
-            }
-        },
-        update = { webView ->
-            val html = """
-                <html>
-                  <body style="margin:0;background:#000;overflow:hidden;">
-                    <img src="$previewStreamUrl" style="width:100vw;height:100vh;object-fit:cover;" />
-                  </body>
-                </html>
-            """.trimIndent()
-            if (webView.tag != html) {
-                webView.tag = html
-                webView.loadDataWithBaseURL(previewStreamUrl, html, "text/html", "utf-8", null)
-            }
+    Box(
+        modifier = modifier
+            .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(12.dp))
+    ) {
+        if (fallbackBitmap != null) {
+            Image(
+                bitmap = fallbackBitmap.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = if (containPreview) ContentScale.Fit else ContentScale.Crop
+            )
         }
-    )
+
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { context ->
+                WebView(context).apply {
+                    layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                    settings.javaScriptEnabled = false
+                    settings.loadsImagesAutomatically = true
+                    settings.cacheMode = WebSettings.LOAD_NO_CACHE
+                    settings.mediaPlaybackRequiresUserGesture = false
+                    isHorizontalScrollBarEnabled = false
+                    isVerticalScrollBarEnabled = false
+                    setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                    webViewClient = object : WebViewClient() {
+                        override fun onReceivedError(
+                            view: WebView,
+                            request: WebResourceRequest,
+                            error: WebResourceError
+                        ) {
+                            view.postDelayed({ view.reload() }, PREVIEW_RETRY_DELAY_MS)
+                        }
+
+                        override fun onReceivedHttpError(
+                            view: WebView,
+                            request: WebResourceRequest,
+                            errorResponse: WebResourceResponse
+                        ) {
+                            view.postDelayed({ view.reload() }, PREVIEW_RETRY_DELAY_MS)
+                        }
+                    }
+                }
+            },
+            update = { webView ->
+                webView.settings.setSupportZoom(zoomable)
+                webView.settings.builtInZoomControls = zoomable
+                webView.settings.displayZoomControls = false
+                webView.settings.useWideViewPort = zoomable
+                webView.settings.loadWithOverviewMode = zoomable
+                val objectFit = if (containPreview) "contain" else "cover"
+                val imageWidth = if (zoomable) "100%" else "100vw"
+                val imageHeight = if (containPreview) "auto" else "100vh"
+                val html = """
+                    <html>
+                      <head>
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=8.0, user-scalable=yes" />
+                      </head>
+                      <body style="margin:0;background:transparent;overflow:hidden;">
+                        <div style="width:100vw;min-height:100vh;display:flex;align-items:center;justify-content:center;background:transparent;">
+                          <img src="$previewStreamUrl" style="display:block;width:$imageWidth;height:$imageHeight;object-fit:$objectFit;" />
+                        </div>
+                      </body>
+                    </html>
+                """.trimIndent()
+                if (webView.tag != html) {
+                    webView.tag = html
+                    webView.loadDataWithBaseURL(previewStreamUrl, html, "text/html", "utf-8", null)
+                }
+            }
+        )
+    }
 }
 
 @Composable
@@ -207,6 +266,8 @@ internal fun ClientCameraControlsSection(
         }
     }
 }
+
+private const val PREVIEW_RETRY_DELAY_MS = 1_000L
 
 @Composable
 internal fun RecordingsStudioScreen(

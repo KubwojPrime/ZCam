@@ -5,12 +5,15 @@ import com.zcam.audio.AudioCommandResult
 import com.zcam.audio.AudioLiveMode
 import com.zcam.audio.AudioPlaybackCategory
 import com.zcam.audio.AudioPlaybackRequest
+import com.zcam.audio.AudioTransportConfig
 import com.zcam.audio.PushToTalkManager
 import com.zcam.camera.CameraControlCommandResult
 import com.zcam.camera.CameraControlErrorCode
 import com.zcam.camera.CameraControlManager
 import com.zcam.camera.FramePipelineStatusSource
 import com.zcam.camera.MjpegFrameSource
+import com.zcam.core.device.PowerStatusProvider
+import com.zcam.core.device.PowerStatusSnapshot
 import com.zcam.core.dispatchers.DispatcherProvider
 import com.zcam.core.logging.LogEventId
 import com.zcam.core.logging.ZCamLogger
@@ -28,9 +31,17 @@ import com.zcam.storage.LoopRecordingManager
 import com.zcam.storage.RecordingClipSummary
 import com.zcam.storage.RecordingEventSummary
 import fi.iki.elonen.NanoHTTPD
+import fi.iki.elonen.NanoWSD
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
+import java.io.IOException
 import java.io.InputStream
 import java.net.Inet4Address
 import java.net.NetworkInterface
@@ -50,6 +61,7 @@ class ZCamHttpServer @Inject constructor(
     private val pushToTalkManager: PushToTalkManager,
     private val loopRecordingManager: LoopRecordingManager,
     private val securityManager: SecurityManager,
+    private val powerStatusProvider: PowerStatusProvider,
     private val dispatchers: DispatcherProvider,
     private val logger: ZCamLogger,
     private val lanAccessPolicy: LanAccessPolicy
@@ -63,52 +75,31 @@ class ZCamHttpServer @Inject constructor(
 
     private val activeStreamClients = AtomicInteger(0)
     private val startedAtEpochMs = AtomicLong(0L)
+    private val websocketScope = CoroutineScope(SupervisorJob() + dispatchers.io)
 
     override suspend fun start(port: Int) = withContext(dispatchers.io) {
         if (server != null) return@withContext
 
         securityManager.sanityCheckAfterRestart()
         activePort = port
-        val httpServer = object : NanoHTTPD(port) {
+        val httpServer = object : NanoWSD(port) {
             override fun serve(session: IHTTPSession): Response {
-                val uri = session.uri.orEmpty()
-                val isPublic = isPublicEndpoint(uri, session.method)
-                val remoteIp = session.remoteIpAddress
-                val isLanOrVpnClient = lanAccessPolicy.isLanClient(remoteIp)
-                val allowPublicOverVpn = isPublicPairingEndpoint(uri, session.method)
-
-                if (!isLanOrVpnClient && isPublic && !allowPublicOverVpn) {
-                    return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "LAN only")
-                }
-
-                if (!isPublic) {
-                    val auth = runBlocking {
-                        securityManager.authorizeRequest(
-                            tokenCandidate = extractToken(session),
-                            deviceId = extractDeviceId(session)
+                return authorizeAndHandleSession(session) {
+                    if (isWebsocketRequested(session) && session.uri.orEmpty() != AUDIO_SOCKET_PATH) {
+                        return@authorizeAndHandleSession newFixedLengthResponse(
+                            Response.Status.NOT_FOUND,
+                            MIME_PLAINTEXT,
+                            "not found"
                         )
                     }
-                    if (!auth.allowed) {
-                        return newFixedLengthResponse(
-                            toStatus(auth.statusCode),
-                            JSON_UTF8,
-                            "{\"status\":\"error\",\"reason\":${jsonString(auth.reason)}}"
-                        )
-                    }
-                    if (!isLanOrVpnClient) {
-                        logger.w(
-                            LogEventId.SECURITY_AUTH_REJECTED,
-                            "Allowing authenticated request from non-LAN address $remoteIp for $uri"
-                        )
-                    }
+                    super.serve(session)
                 }
+            }
 
-                return runCatching {
-                    routeRequest(session)
-                }.getOrElse { error ->
-                    logger.e(LogEventId.COMPONENT_FAILED, error, "HTTP request handling failed for ${session.uri}")
-                    newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "internal error")
-                }
+            override fun serveHttp(session: IHTTPSession): Response = routeRequest(session)
+
+            override fun openWebSocket(handshake: IHTTPSession): WebSocket {
+                return createAudioWebSocket(handshake)
             }
         }
 
@@ -128,6 +119,164 @@ class ZCamHttpServer @Inject constructor(
 
     override suspend fun isHealthy(): Boolean = withContext(dispatchers.io) {
         server?.isAlive == true
+    }
+
+    private fun authorizeAndHandleSession(
+        session: NanoHTTPD.IHTTPSession,
+        handler: () -> NanoHTTPD.Response
+    ): NanoHTTPD.Response {
+        val uri = session.uri.orEmpty()
+        val isPublic = isPublicEndpoint(uri, session.method)
+        val remoteIp = session.remoteIpAddress
+        val isLanOrVpnClient = lanAccessPolicy.isLanClient(remoteIp)
+        val allowPublicOverVpn = isPublicPairingEndpoint(uri, session.method)
+
+        if (!isLanOrVpnClient && isPublic && !allowPublicOverVpn) {
+            return NanoHTTPD.newFixedLengthResponse(
+                NanoHTTPD.Response.Status.FORBIDDEN,
+                NanoHTTPD.MIME_PLAINTEXT,
+                "LAN only"
+            )
+        }
+
+        if (!isPublic) {
+            val auth = runBlocking {
+                securityManager.authorizeRequest(
+                    tokenCandidate = extractToken(session),
+                    deviceId = extractDeviceId(session)
+                )
+            }
+            if (!auth.allowed) {
+                return NanoHTTPD.newFixedLengthResponse(
+                    toStatus(auth.statusCode),
+                    JSON_UTF8,
+                    "{\"status\":\"error\",\"reason\":${jsonString(auth.reason)}}"
+                )
+            }
+            if (!isLanOrVpnClient) {
+                logger.w(
+                    LogEventId.SECURITY_AUTH_REJECTED,
+                    "Allowing authenticated request from non-LAN address $remoteIp for $uri"
+                )
+            }
+        }
+
+        return runCatching(handler).getOrElse { error ->
+            logger.e(LogEventId.COMPONENT_FAILED, error, "HTTP request handling failed for ${session.uri}")
+            NanoHTTPD.newFixedLengthResponse(
+                NanoHTTPD.Response.Status.INTERNAL_ERROR,
+                NanoHTTPD.MIME_PLAINTEXT,
+                "internal error"
+            )
+        }
+    }
+
+    private fun createAudioWebSocket(handshake: NanoHTTPD.IHTTPSession): NanoWSD.WebSocket {
+        return AudioWebSocket(handshake)
+    }
+
+    private inner class AudioWebSocket(
+        handshake: NanoHTTPD.IHTTPSession
+    ) : NanoWSD.WebSocket(handshake) {
+
+        private val role = parseAudioSocketRole(handshake)
+        private val connectionId = buildAudioSocketConnectionId(handshake)
+        private val outboundFrames = Channel<ByteArray>(
+            capacity = AUDIO_SOCKET_QUEUE_CAPACITY,
+            onBufferOverflow = BufferOverflow.DROP_OLDEST
+        )
+        private var outboundJob: Job? = null
+
+        override fun onOpen() {
+            when (role) {
+                AudioSocketRole.LIVE -> {
+                    val accepted = runBlocking {
+                        pushToTalkManager.registerLiveAudioSubscriber(connectionId) { frame ->
+                            outboundFrames.trySend(frame)
+                        }
+                    }
+                    if (!accepted) {
+                        rejectSocket("live audio unavailable")
+                        return
+                    }
+                    outboundJob = websocketScope.launch {
+                        for (frame in outboundFrames) {
+                            val sent = runCatching {
+                                send(frame)
+                            }.isSuccess
+                            if (!sent) {
+                                rejectSocket("live audio send failed")
+                                break
+                            }
+                        }
+                    }
+                    sendConfigFrame()
+                }
+
+                AudioSocketRole.PTT -> {
+                    val accepted = runBlocking { pushToTalkManager.openPushToTalkStream(connectionId) }
+                    if (!accepted) {
+                        rejectSocket("push-to-talk unavailable")
+                        return
+                    }
+                    sendConfigFrame()
+                }
+
+                AudioSocketRole.UNKNOWN -> rejectSocket("unsupported audio role")
+            }
+        }
+
+        override fun onClose(
+            code: NanoWSD.WebSocketFrame.CloseCode,
+            reason: String,
+            initiatedByRemote: Boolean
+        ) {
+            outboundFrames.close()
+            outboundJob?.cancel()
+            websocketScope.launch {
+                when (role) {
+                    AudioSocketRole.LIVE -> pushToTalkManager.unregisterLiveAudioSubscriber(connectionId)
+                    AudioSocketRole.PTT -> pushToTalkManager.closePushToTalkStream(connectionId)
+                    AudioSocketRole.UNKNOWN -> Unit
+                }
+            }
+        }
+
+        override fun onMessage(message: NanoWSD.WebSocketFrame) {
+            if (role != AudioSocketRole.PTT) return
+            if (message.opCode != NanoWSD.WebSocketFrame.OpCode.Binary) return
+
+            val accepted = runBlocking {
+                pushToTalkManager.submitPushToTalkAudio(connectionId, message.binaryPayload)
+            }
+            if (!accepted) {
+                rejectSocket("push-to-talk frame rejected")
+            }
+        }
+
+        override fun onPong(pong: NanoWSD.WebSocketFrame) = Unit
+
+        override fun onException(exception: IOException) {
+            logger.w(
+                LogEventId.COMPONENT_FAILED,
+                "Audio websocket exception role=${role.name.lowercase()} message=${exception.message}"
+            )
+        }
+
+        private fun sendConfigFrame() {
+            val config = pushToTalkManager.transportConfig()
+            runCatching {
+                send(audioSocketConfigJson(config, role))
+            }.onFailure {
+                rejectSocket("audio config send failed")
+            }
+        }
+
+        private fun rejectSocket(reason: String) {
+            runCatching {
+                close(NanoWSD.WebSocketFrame.CloseCode.PolicyViolation, reason, false)
+            }
+        }
     }
 
     private fun routeRequest(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
@@ -598,8 +747,8 @@ class ZCamHttpServer @Inject constructor(
     }
 
     private fun handleRecordingDownloadEndpoint(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
-        if (session.method != NanoHTTPD.Method.GET) {
-            return methodNotAllowed("GET")
+        if (session.method != NanoHTTPD.Method.GET && session.method != NanoHTTPD.Method.HEAD) {
+            return methodNotAllowed("GET, HEAD")
         }
         val prefix = "/api/recordings/"
         val encodedName = session.uri.orEmpty().removePrefix(prefix)
@@ -614,16 +763,52 @@ class ZCamHttpServer @Inject constructor(
                 "{\"status\":\"error\",\"reason\":\"recording_not_found\"}"
             )
 
+        val fileLength = file.length().coerceAtLeast(0L)
+        val rawRangeHeader = session.headers["range"]
+        val requestedRange = parseByteRange(rawRangeHeader, fileLength)
+        if (!rawRangeHeader.isNullOrBlank() && requestedRange == null) {
+            return NanoHTTPD.newFixedLengthResponse(
+                NanoHTTPD.Response.Status.RANGE_NOT_SATISFIABLE,
+                JSON_UTF8,
+                "{\"status\":\"error\",\"reason\":\"invalid_range\"}"
+            ).apply {
+                addHeader("Accept-Ranges", "bytes")
+                addHeader("Content-Range", "bytes */$fileLength")
+            }
+        }
+
         return runCatching {
+            val (responseStatus, startOffset, contentLength, contentRangeHeader) = if (requestedRange == null) {
+                RecordingHttpRange(
+                    status = NanoHTTPD.Response.Status.OK,
+                    startOffset = 0L,
+                    contentLength = fileLength,
+                    contentRangeHeader = null
+                )
+            } else {
+                val boundedStart = requestedRange.first.coerceIn(0L, (fileLength - 1L).coerceAtLeast(0L))
+                val boundedEnd = requestedRange.last.coerceIn(boundedStart, (fileLength - 1L).coerceAtLeast(0L))
+                RecordingHttpRange(
+                    status = NanoHTTPD.Response.Status.PARTIAL_CONTENT,
+                    startOffset = boundedStart,
+                    contentLength = (boundedEnd - boundedStart + 1L).coerceAtLeast(0L),
+                    contentRangeHeader = "bytes $boundedStart-$boundedEnd/$fileLength"
+                )
+            }
+            val inputStream = file.inputStream().apply {
+                skipExactly(startOffset)
+            }
             NanoHTTPD.newFixedLengthResponse(
-                NanoHTTPD.Response.Status.OK,
+                responseStatus,
                 "video/mp4",
-                file.inputStream(),
-                file.length()
+                inputStream,
+                contentLength
             ).apply {
                 addHeader("Cache-Control", "no-store")
                 addHeader("Content-Disposition", "inline; filename=\"${file.name}\"")
                 addHeader("Accept-Ranges", "bytes")
+                addHeader("Content-Length", contentLength.toString())
+                contentRangeHeader?.let { addHeader("Content-Range", it) }
             }
         }.getOrElse { error ->
             logger.e(LogEventId.COMPONENT_FAILED, error, "Failed to stream recording ${file.name}")
@@ -670,6 +855,53 @@ class ZCamHttpServer @Inject constructor(
         }
 
         return NanoHTTPD.newFixedLengthResponse(status, JSON_UTF8, body)
+    }
+
+    private fun parseByteRange(headerValue: String?, fileLength: Long): LongRange? {
+        if (headerValue.isNullOrBlank()) return null
+        if (!headerValue.startsWith("bytes=", ignoreCase = true)) return null
+        if (fileLength <= 0L) return null
+
+        val rawRange = headerValue.removePrefix("bytes=").substringBefore(',').trim()
+        val startPart = rawRange.substringBefore('-', missingDelimiterValue = "").trim()
+        val endPart = rawRange.substringAfter('-', missingDelimiterValue = "").trim()
+        if (startPart.isEmpty() && endPart.isEmpty()) return null
+
+        return when {
+            startPart.isNotEmpty() -> {
+                val start = startPart.toLongOrNull() ?: return null
+                val end = if (endPart.isNotEmpty()) {
+                    endPart.toLongOrNull() ?: return null
+                } else {
+                    fileLength - 1L
+                }
+                if (start < 0L || start >= fileLength || end < start) return null
+                start..end
+            }
+
+            else -> {
+                val suffixLength = endPart.toLongOrNull() ?: return null
+                if (suffixLength <= 0L) return null
+                val clampedLength = suffixLength.coerceAtMost(fileLength)
+                val start = (fileLength - clampedLength).coerceAtLeast(0L)
+                start..(fileLength - 1L)
+            }
+        }
+    }
+
+    private fun InputStream.skipExactly(byteCount: Long) {
+        var remaining = byteCount
+        while (remaining > 0L) {
+            val skipped = skip(remaining)
+            if (skipped > 0L) {
+                remaining -= skipped
+                continue
+            }
+            if (read() == -1) {
+                throw IllegalStateException("Unexpected EOF while skipping $byteCount bytes")
+            }
+            remaining -= 1L
+        }
     }
 
     private fun parsePostPayload(session: NanoHTTPD.IHTTPSession): Map<String, String>? {
@@ -757,6 +989,38 @@ class ZCamHttpServer @Inject constructor(
             "android_app", "android", "app", "client" -> PairingClientType.ANDROID_APP
             "web_browser", "browser", "web" -> PairingClientType.WEB_BROWSER
             else -> null
+        }
+    }
+
+    private fun parseAudioSocketRole(session: NanoHTTPD.IHTTPSession): AudioSocketRole {
+        return when (firstQueryValue(session, "role")?.lowercase()) {
+            "live", "listen", "monitor" -> AudioSocketRole.LIVE
+            "ptt", "push-to-talk", "push_to_talk" -> AudioSocketRole.PTT
+            else -> AudioSocketRole.UNKNOWN
+        }
+    }
+
+    private fun buildAudioSocketConnectionId(session: NanoHTTPD.IHTTPSession): String {
+        val deviceId = extractDeviceId(session)?.ifBlank { null } ?: "anonymous"
+        val remoteIp = session.remoteIpAddress.ifBlank { "unknown" }
+        return "audio-$deviceId-$remoteIp-${System.nanoTime()}"
+    }
+
+    private fun audioSocketConfigJson(
+        config: AudioTransportConfig,
+        role: AudioSocketRole
+    ): String {
+        return buildString(capacity = 160) {
+            append('{')
+            append("\"type\":\"config\",")
+            append("\"role\":").append(jsonString(role.wireName)).append(',')
+            append("\"sampleRateHz\":").append(config.sampleRateHz).append(',')
+            append("\"channelCount\":").append(config.channelCount).append(',')
+            append("\"bytesPerSample\":").append(config.bytesPerSample).append(',')
+            append("\"frameDurationMs\":").append(config.frameDurationMs).append(',')
+            append("\"frameBytes\":").append(config.frameBytes).append(',')
+            append("\"encoding\":").append(jsonString(config.encoding))
+            append('}')
         }
     }
 
@@ -978,6 +1242,7 @@ class ZCamHttpServer @Inject constructor(
             -1L
         }
         val audio = pushToTalkManager.snapshotState()
+        val power = powerStatusProvider.snapshot()
 
         return buildString(capacity = 768) {
             append('{')
@@ -999,7 +1264,8 @@ class ZCamHttpServer @Inject constructor(
             append("\"lastFrameAgeMs\":").append(lastFrameAgeMs)
             append("},")
             append("\"cameraControls\":").append(cameraControlStateJson(cameraControls)).append(',')
-            append("\"audio\":").append(audioStateJson(audio))
+            append("\"audio\":").append(audioStateJson(audio)).append(',')
+            append("\"power\":").append(powerStateJson(power))
             append('}')
         }
     }
@@ -1061,6 +1327,15 @@ class ZCamHttpServer @Inject constructor(
             append("\"nightModeEnabled\":").append(state.nightModeEnabled).append(',')
             append("\"lowLightBoostSupported\":").append(state.lowLightBoostSupported).append(',')
             append("\"lastError\":").append(jsonString(state.lastError))
+            append('}')
+        }
+    }
+
+    private fun powerStateJson(state: PowerStatusSnapshot): String {
+        return buildString(capacity = 96) {
+            append('{')
+            append("\"batteryPercent\":").append(state.batteryPercent?.toString() ?: "null").append(',')
+            append("\"charging\":").append(state.charging?.toString() ?: "null")
             append('}')
         }
     }
@@ -1145,9 +1420,12 @@ class ZCamHttpServer @Inject constructor(
                 button.warn { border-color: #8a5e00; }
                 button.err { border-color: #8a2424; }
                 .codeInput { max-width: 180px; letter-spacing: 3px; }
-                img { width: 100%; height: auto; border-radius: 8px; background: #000; border: 1px solid var(--border); }
+                img, video { width: 100%; height: auto; border-radius: 8px; background: #000; border: 1px solid var(--border); }
                 pre { margin: 0; background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; max-height: 260px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 12px; }
                 .chip { display: inline-block; border-radius: 999px; border: 1px solid var(--border); padding: 3px 8px; font-size: 12px; color: var(--muted); }
+                .stack { display: grid; gap: 8px; }
+                .list { display: grid; gap: 6px; max-height: 320px; overflow: auto; }
+                .recordingItem { width: 100%; text-align: left; }
                 .okText { color: var(--ok); }
                 .warnText { color: var(--warn); }
                 .errText { color: var(--err); }
@@ -1242,6 +1520,9 @@ class ZCamHttpServer @Inject constructor(
                       <button class="ok" type="button" onclick="setAudioLive('live', true)">Live listen ON</button>
                       <button type="button" onclick="setAudioLive('live', false)">Live listen OFF</button>
                     </div>
+                    <div class="row" style="margin-top:8px;">
+                      <span class="chip mono" id="audioSocketState">audio socket: idle</span>
+                    </div>
                   </div>
 
                   <div class="card">
@@ -1255,6 +1536,47 @@ class ZCamHttpServer @Inject constructor(
                       <input id="volumeRange" type="range" min="0" max="85" value="40" />
                       <span id="volumeLabel" class="mono">40%</span>
                       <button type="button" onclick="setVolumeNow()">Set volume</button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="card">
+                  <h2 class="title">Recordings</h2>
+                  <p class="sub">Browse loop recordings directly in the browser. Event markers jump to the closest clip timestamp when metadata is available.</p>
+                  <div class="grid3">
+                    <div>
+                      <label for="recordingsFromInput">From</label>
+                      <input id="recordingsFromInput" type="datetime-local" />
+                    </div>
+                    <div>
+                      <label for="recordingsToInput">To</label>
+                      <input id="recordingsToInput" type="datetime-local" />
+                    </div>
+                    <div>
+                      <label>&nbsp;</label>
+                      <div class="row">
+                        <button id="loadRecordingsBtn" type="button">Load recordings</button>
+                        <button id="loadRecentRecordingsBtn" type="button">Last 12h</button>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="grid2" style="margin-top:10px;">
+                    <div class="stack">
+                      <video id="recordingPlayer" controls preload="metadata" playsinline></video>
+                      <div class="row">
+                        <span class="chip mono" id="recordingsState">recordings: idle</span>
+                        <span class="chip mono" id="recordingSelection">selected: none</span>
+                      </div>
+                    </div>
+                    <div class="stack">
+                      <div>
+                        <label>Recording list</label>
+                        <div id="recordingsList" class="list"></div>
+                      </div>
+                      <div>
+                        <label>Event markers</label>
+                        <div id="recordingsEvents" class="list"></div>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -1285,6 +1607,16 @@ class ZCamHttpServer @Inject constructor(
                 const snapshotLink = document.getElementById('snapshotLink');
                 const volumeRange = document.getElementById('volumeRange');
                 const volumeLabel = document.getElementById('volumeLabel');
+                const audioSocketState = document.getElementById('audioSocketState');
+                const recordingsFromInput = document.getElementById('recordingsFromInput');
+                const recordingsToInput = document.getElementById('recordingsToInput');
+                const loadRecordingsBtn = document.getElementById('loadRecordingsBtn');
+                const loadRecentRecordingsBtn = document.getElementById('loadRecentRecordingsBtn');
+                const recordingsState = document.getElementById('recordingsState');
+                const recordingSelection = document.getElementById('recordingSelection');
+                const recordingsList = document.getElementById('recordingsList');
+                const recordingsEvents = document.getElementById('recordingsEvents');
+                const recordingPlayer = document.getElementById('recordingPlayer');
                 const STORAGE = {
                   token: 'zcam.panel.token',
                   deviceId: 'zcam.panel.deviceId',
@@ -1292,6 +1624,29 @@ class ZCamHttpServer @Inject constructor(
                   pendingRequestId: 'zcam.panel.pendingRequestId',
                   pendingExpiresAt: 'zcam.panel.pendingExpiresAt'
                 };
+                const DEFAULT_AUDIO_CONFIG = {
+                  sampleRateHz: 16000,
+                  channelCount: 1,
+                  bytesPerSample: 2,
+                  frameDurationMs: 20,
+                  frameBytes: 640,
+                  encoding: 'pcm_s16le'
+                };
+                let liveSocket = null;
+                let pttSocket = null;
+                let liveAudioContext = null;
+                let liveAudioConfig = { ...DEFAULT_AUDIO_CONFIG };
+                let pttAudioContext = null;
+                let pttAudioConfig = { ...DEFAULT_AUDIO_CONFIG };
+                let livePlaybackCursor = 0;
+                let pttMediaStream = null;
+                let pttProcessor = null;
+                let pttSourceNode = null;
+                let pttMuteNode = null;
+                let recordingsCache = [];
+                let recordingEventsCache = [];
+                let selectedRecordingName = '';
+                let pendingSeekSeconds = null;
 
                 function readAuth() {
                   return {
@@ -1402,6 +1757,387 @@ class ZCamHttpServer @Inject constructor(
                   snapshotLink.href = '/snapshot.jpg' + query;
                 }
 
+                function audioSocketUrl(role) {
+                  const auth = readAuth();
+                  const query = new URLSearchParams();
+                  query.set('role', role);
+                  if (auth.token) query.set('token', auth.token);
+                  if (auth.deviceId) query.set('deviceId', auth.deviceId);
+                  const protocol = location.protocol === 'https:' ? 'wss://' : 'ws://';
+                  return protocol + location.host + '${AUDIO_SOCKET_PATH}?' + query.toString();
+                }
+
+                function updateAudioSocketState(label, toneClass) {
+                  audioSocketState.textContent = label;
+                  audioSocketState.className = 'chip mono ' + (toneClass || '');
+                }
+
+                function parseAudioConfigMessage(raw) {
+                  try {
+                    const parsed = JSON.parse(raw);
+                    return parsed && parsed.type === 'config' ? parsed : null;
+                  } catch (_) {
+                    return null;
+                  }
+                }
+
+                async function ensureLiveAudioContext() {
+                  if (!liveAudioContext) {
+                    const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+                    liveAudioContext = AudioContextCtor ? new AudioContextCtor() : null;
+                  }
+                  if (!liveAudioContext) {
+                    return false;
+                  }
+                  if (liveAudioContext.state === 'suspended') {
+                    await liveAudioContext.resume();
+                  }
+                  livePlaybackCursor = Math.max(livePlaybackCursor, liveAudioContext.currentTime);
+                  return true;
+                }
+
+                function playLiveAudioFrame(arrayBuffer) {
+                  if (!liveAudioContext) return;
+                  const sampleCount = Math.floor(arrayBuffer.byteLength / 2);
+                  if (sampleCount <= 0) return;
+                  const dataView = new DataView(arrayBuffer);
+                  const audioBuffer = liveAudioContext.createBuffer(1, sampleCount, liveAudioConfig.sampleRateHz || 16000);
+                  const channel = audioBuffer.getChannelData(0);
+                  for (let index = 0; index < sampleCount; index += 1) {
+                    channel[index] = Math.max(-1, Math.min(1, dataView.getInt16(index * 2, true) / 32768));
+                  }
+                  const source = liveAudioContext.createBufferSource();
+                  source.buffer = audioBuffer;
+                  source.connect(liveAudioContext.destination);
+                  const startAt = Math.max(liveAudioContext.currentTime + 0.02, livePlaybackCursor);
+                  source.start(startAt);
+                  livePlaybackCursor = startAt + audioBuffer.duration;
+                }
+
+                function downsampleToPcm16(inputSamples, inputSampleRate, targetSampleRate) {
+                  if (!inputSamples || inputSamples.length === 0) {
+                    return new ArrayBuffer(0);
+                  }
+                  const ratio = inputSampleRate / targetSampleRate;
+                  const outputLength = Math.max(1, Math.round(inputSamples.length / ratio));
+                  const output = new ArrayBuffer(outputLength * 2);
+                  const view = new DataView(output);
+                  let outputIndex = 0;
+                  let inputIndex = 0;
+                  while (outputIndex < outputLength) {
+                    const nextIndex = Math.min(inputSamples.length, Math.round((outputIndex + 1) * ratio));
+                    let sum = 0;
+                    let count = 0;
+                    while (inputIndex < nextIndex) {
+                      sum += inputSamples[inputIndex];
+                      inputIndex += 1;
+                      count += 1;
+                    }
+                    const averaged = count > 0 ? (sum / count) : 0;
+                    const clamped = Math.max(-1, Math.min(1, averaged));
+                    view.setInt16(outputIndex * 2, clamped < 0 ? clamped * 32768 : clamped * 32767, true);
+                    outputIndex += 1;
+                  }
+                  return output;
+                }
+
+                function stopBrowserLiveListenAudio() {
+                  if (liveSocket) {
+                    try { liveSocket.close(1000, 'live_stopped'); } catch (_) {}
+                  }
+                  liveSocket = null;
+                  livePlaybackCursor = 0;
+                  updateAudioSocketState('audio socket: idle', '');
+                }
+
+                async function startBrowserLiveListenAudio() {
+                  if (!(await ensureLiveAudioContext())) {
+                    return { ok: false, reason: 'browser_audio_output_unavailable' };
+                  }
+                  stopBrowserLiveListenAudio();
+                  return await new Promise((resolve) => {
+                    const socket = new WebSocket(audioSocketUrl('live'));
+                    socket.binaryType = 'arraybuffer';
+                    let settled = false;
+                    socket.onopen = () => {
+                      liveSocket = socket;
+                      updateAudioSocketState('audio socket: live listen', 'okText');
+                      if (!settled) {
+                        settled = true;
+                        resolve({ ok: true });
+                      }
+                    };
+                    socket.onmessage = async (event) => {
+                      if (typeof event.data === 'string') {
+                        const config = parseAudioConfigMessage(event.data);
+                        if (config) {
+                          liveAudioConfig = { ...DEFAULT_AUDIO_CONFIG, ...config };
+                        }
+                        return;
+                      }
+                      await ensureLiveAudioContext();
+                      playLiveAudioFrame(event.data);
+                    };
+                    socket.onerror = () => {
+                      updateAudioSocketState('audio socket: live error', 'errText');
+                      if (!settled) {
+                        settled = true;
+                        resolve({ ok: false, reason: 'live_socket_failed' });
+                      }
+                    };
+                    socket.onclose = () => {
+                      if (liveSocket === socket) {
+                        liveSocket = null;
+                        updateAudioSocketState('audio socket: idle', '');
+                      }
+                    };
+                  });
+                }
+
+                function stopBrowserPushToTalkAudio() {
+                  if (pttProcessor) {
+                    try { pttProcessor.disconnect(); } catch (_) {}
+                    pttProcessor.onaudioprocess = null;
+                  }
+                  if (pttSourceNode) {
+                    try { pttSourceNode.disconnect(); } catch (_) {}
+                  }
+                  if (pttMuteNode) {
+                    try { pttMuteNode.disconnect(); } catch (_) {}
+                  }
+                  if (pttMediaStream) {
+                    pttMediaStream.getTracks().forEach((track) => track.stop());
+                  }
+                  if (pttAudioContext) {
+                    try { pttAudioContext.close(); } catch (_) {}
+                  }
+                  if (pttSocket) {
+                    try { pttSocket.close(1000, 'ptt_stopped'); } catch (_) {}
+                  }
+                  pttProcessor = null;
+                  pttSourceNode = null;
+                  pttMuteNode = null;
+                  pttMediaStream = null;
+                  pttAudioContext = null;
+                  pttSocket = null;
+                  updateAudioSocketState('audio socket: idle', '');
+                }
+
+                async function startBrowserPushToTalkAudio() {
+                  if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    return { ok: false, reason: 'browser_microphone_requires_https_or_localhost' };
+                  }
+
+                  stopBrowserPushToTalkAudio();
+                  const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+                  if (!AudioContextCtor) {
+                    return { ok: false, reason: 'browser_audio_input_unavailable' };
+                  }
+
+                  try {
+                    pttMediaStream = await navigator.mediaDevices.getUserMedia({
+                      audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                      }
+                    });
+                  } catch (error) {
+                    return { ok: false, reason: 'microphone_access_denied', detail: String(error) };
+                  }
+
+                  pttAudioContext = new AudioContextCtor();
+                  await pttAudioContext.resume();
+
+                  return await new Promise((resolve) => {
+                    const socket = new WebSocket(audioSocketUrl('ptt'));
+                    let settled = false;
+                    socket.binaryType = 'arraybuffer';
+                    socket.onopen = () => {
+                      pttSocket = socket;
+                      pttSourceNode = pttAudioContext.createMediaStreamSource(pttMediaStream);
+                      pttProcessor = pttAudioContext.createScriptProcessor(2048, 1, 1);
+                      pttMuteNode = pttAudioContext.createGain();
+                      pttMuteNode.gain.value = 0;
+                      pttProcessor.onaudioprocess = (event) => {
+                        if (!pttSocket || pttSocket.readyState !== WebSocket.OPEN) return;
+                        const channel = event.inputBuffer.getChannelData(0);
+                        const payload = downsampleToPcm16(
+                          channel,
+                          pttAudioContext.sampleRate,
+                          pttAudioConfig.sampleRateHz || 16000
+                        );
+                        if (payload.byteLength > 0) {
+                          pttSocket.send(payload);
+                        }
+                      };
+                      pttSourceNode.connect(pttProcessor);
+                      pttProcessor.connect(pttMuteNode);
+                      pttMuteNode.connect(pttAudioContext.destination);
+                      updateAudioSocketState('audio socket: push-to-talk', 'okText');
+                      if (!settled) {
+                        settled = true;
+                        resolve({ ok: true });
+                      }
+                    };
+                    socket.onmessage = (event) => {
+                      if (typeof event.data !== 'string') return;
+                      const config = parseAudioConfigMessage(event.data);
+                      if (config) {
+                        pttAudioConfig = { ...DEFAULT_AUDIO_CONFIG, ...config };
+                      }
+                    };
+                    socket.onerror = () => {
+                      updateAudioSocketState('audio socket: ptt error', 'errText');
+                      if (!settled) {
+                        settled = true;
+                        resolve({ ok: false, reason: 'ptt_socket_failed' });
+                      }
+                    };
+                    socket.onclose = () => {
+                      if (pttSocket === socket) {
+                        stopBrowserPushToTalkAudio();
+                      }
+                    };
+                  });
+                }
+
+                function localDateTimeValue(epochMs) {
+                  const date = new Date(epochMs);
+                  const pad = (value) => String(value).padStart(2, '0');
+                  return date.getFullYear() + '-' +
+                    pad(date.getMonth() + 1) + '-' +
+                    pad(date.getDate()) + 'T' +
+                    pad(date.getHours()) + ':' +
+                    pad(date.getMinutes());
+                }
+
+                function parseLocalDateTimeInput(value) {
+                  if (!value) return null;
+                  const parsed = new Date(value);
+                  const epochMs = parsed.getTime();
+                  return Number.isFinite(epochMs) ? epochMs : null;
+                }
+
+                function setRecentRecordingsRange(hoursBack) {
+                  const now = Date.now();
+                  recordingsFromInput.value = localDateTimeValue(now - (hoursBack * 60 * 60 * 1000));
+                  recordingsToInput.value = localDateTimeValue(now);
+                }
+
+                function buildAuthorizedUrl(path, extraParams) {
+                  const params = new URLSearchParams();
+                  const auth = readAuth();
+                  if (auth.token) params.set('token', auth.token);
+                  if (auth.deviceId) params.set('deviceId', auth.deviceId);
+                  Object.entries(extraParams || {}).forEach(([key, value]) => {
+                    if (value !== null && value !== undefined && value !== '') {
+                      params.set(key, String(value));
+                    }
+                  });
+                  const serialized = params.toString();
+                  return serialized ? (path + '?' + serialized) : path;
+                }
+
+                function formatRecordingLabel(item) {
+                  const started = new Date(item.startedAtEpochMs).toLocaleString();
+                  const seconds = Math.round((item.durationMs || 0) / 1000);
+                  const sizeMb = ((item.sizeBytes || 0) / (1024 * 1024)).toFixed(1);
+                  return started + ' | ' + seconds + 's | ' + sizeMb + ' MB';
+                }
+
+                function selectRecording(fileName, seekSeconds) {
+                  const item = recordingsCache.find((entry) => entry.fileName === fileName);
+                  if (!item) return;
+                  selectedRecordingName = fileName;
+                  pendingSeekSeconds = Number.isFinite(seekSeconds) ? Math.max(0, seekSeconds) : null;
+                  recordingSelection.textContent = 'selected: ' + fileName;
+                  recordingPlayer.src = buildAuthorizedUrl('/api/recordings/' + encodeURIComponent(fileName), {});
+                  recordingsState.textContent = 'recordings: ' + recordingsCache.length + ' clip(s)';
+                  renderRecordings();
+                }
+
+                function jumpToRecordingEvent(eventItem) {
+                  const directClip = eventItem.recordingFileName
+                    ? recordingsCache.find((entry) => entry.fileName === eventItem.recordingFileName)
+                    : null;
+                  const targetClip = directClip || recordingsCache.find((entry) => (
+                    eventItem.epochMs >= entry.startedAtEpochMs && eventItem.epochMs <= entry.endedAtEpochMs
+                  ));
+                  if (!targetClip) return;
+                  const seekSeconds = Math.max(0, Math.floor((eventItem.epochMs - targetClip.startedAtEpochMs) / 1000));
+                  selectRecording(targetClip.fileName, seekSeconds);
+                }
+
+                function renderRecordings() {
+                  recordingsList.innerHTML = '';
+                  if (recordingsCache.length === 0) {
+                    recordingsList.innerHTML = '<div class="sub">No recordings in the selected range.</div>';
+                  } else {
+                    recordingsCache.forEach((item) => {
+                      const button = document.createElement('button');
+                      button.type = 'button';
+                      button.className = 'recordingItem' + (selectedRecordingName === item.fileName ? ' primary' : '');
+                      button.textContent = formatRecordingLabel(item);
+                      button.addEventListener('click', () => selectRecording(item.fileName, null));
+                      recordingsList.appendChild(button);
+                    });
+                  }
+
+                  recordingsEvents.innerHTML = '';
+                  if (recordingEventsCache.length === 0) {
+                    recordingsEvents.innerHTML = '<div class="sub">No event markers in the selected range.</div>';
+                  } else {
+                    recordingEventsCache.forEach((eventItem) => {
+                      const button = document.createElement('button');
+                      button.type = 'button';
+                      button.className = 'recordingItem';
+                      button.textContent = new Date(eventItem.epochMs).toLocaleString() + ' | ' + eventItem.confidencePercent + '% | ' + eventItem.source;
+                      button.addEventListener('click', () => jumpToRecordingEvent(eventItem));
+                      recordingsEvents.appendChild(button);
+                    });
+                  }
+                }
+
+                async function loadRecordings() {
+                  const fromEpochMs = parseLocalDateTimeInput(recordingsFromInput.value);
+                  const toEpochMs = parseLocalDateTimeInput(recordingsToInput.value);
+                  recordingsState.textContent = 'recordings: loading';
+                  try {
+                    const recordingsUrl = buildAuthorizedUrl('/api/recordings', {
+                      fromEpochMs,
+                      toEpochMs,
+                      limit: 240
+                    });
+                    const eventsUrl = buildAuthorizedUrl('/api/recordings/events', {
+                      fromEpochMs,
+                      toEpochMs,
+                      limit: 500
+                    });
+                    const [recordingsResponse, eventsResponse] = await Promise.all([
+                      fetch(recordingsUrl, { headers: authHeaders(), cache: 'no-store' }),
+                      fetch(eventsUrl, { headers: authHeaders(), cache: 'no-store' })
+                    ]);
+                    const recordingsPayload = await recordingsResponse.json();
+                    const eventsPayload = await eventsResponse.json();
+                    recordingsCache = Array.isArray(recordingsPayload.recordings) ? recordingsPayload.recordings : [];
+                    recordingEventsCache = Array.isArray(eventsPayload.events) ? eventsPayload.events : [];
+                    if (selectedRecordingName && !recordingsCache.some((item) => item.fileName === selectedRecordingName)) {
+                      selectedRecordingName = '';
+                      recordingSelection.textContent = 'selected: none';
+                    }
+                    recordingsState.textContent = 'recordings: ' + recordingsCache.length + ' clip(s), ' + recordingEventsCache.length + ' event(s)';
+                    if (!selectedRecordingName && recordingsCache.length > 0) {
+                      selectRecording(recordingsCache[0].fileName, null);
+                    } else {
+                      renderRecordings();
+                    }
+                  } catch (error) {
+                    recordingsState.textContent = 'recordings: load failed';
+                    appendLog('recordings load failed: ' + error);
+                  }
+                }
+
                 function appendLog(line) {
                   const stamp = new Date().toISOString();
                   apiLog.textContent = '[' + stamp + '] ' + line + '\n' + apiLog.textContent;
@@ -1496,12 +2232,17 @@ class ZCamHttpServer @Inject constructor(
                     const streamClients = data?.server?.streamClients ?? '?';
                     const torch = data?.cameraControls?.torchEnabled;
                     const night = data?.cameraControls?.nightModeEnabled;
+                    const batteryPercent = data?.power?.batteryPercent;
+                    const charging = data?.power?.charging;
+                    const batteryLabel = Number.isFinite(batteryPercent)
+                      ? (' battery=' + batteryPercent + '%' + (charging === true ? ' charging' : ''))
+                      : '';
                     const audioVolume = data?.audio?.volumePercent;
                     if (Number.isFinite(audioVolume)) {
                       volumeRange.value = String(audioVolume);
                       volumeLabel.textContent = audioVolume + '%';
                     }
-                    statusLine.textContent = 'status: http=' + response.status + ' alive=' + serverAlive + ' clients=' + streamClients + ' torch=' + torch + ' night=' + night;
+                    statusLine.textContent = 'status: http=' + response.status + ' alive=' + serverAlive + ' clients=' + streamClients + ' torch=' + torch + ' night=' + night + batteryLabel;
                     statusLine.className = 'chip mono ' + (response.ok ? 'okText' : 'errText');
                   } catch (error) {
                     statusJson.textContent = 'status error: ' + error;
@@ -1529,7 +2270,35 @@ class ZCamHttpServer @Inject constructor(
                 }
 
                 async function setAudioLive(mode, enabled) {
-                  await apiPost('/api/audio/live', { mode, enabled });
+                  const { response } = await apiPost('/api/audio/live', { mode, enabled });
+                  if (!response.ok) {
+                    await refreshStatus();
+                    return;
+                  }
+
+                  if (mode === 'live') {
+                    if (enabled) {
+                      const started = await startBrowserLiveListenAudio();
+                      if (!started.ok) {
+                        appendLog('live listen unavailable: ' + started.reason);
+                        stopBrowserLiveListenAudio();
+                        await apiPost('/api/audio/live', { mode, enabled: false });
+                      }
+                    } else {
+                      stopBrowserLiveListenAudio();
+                    }
+                  } else if (mode === 'ptt') {
+                    if (enabled) {
+                      const started = await startBrowserPushToTalkAudio();
+                      if (!started.ok) {
+                        appendLog('push-to-talk unavailable: ' + started.reason + (started.detail ? ' | ' + started.detail : ''));
+                        stopBrowserPushToTalkAudio();
+                        await apiPost('/api/audio/live', { mode, enabled: false });
+                      }
+                    } else {
+                      stopBrowserPushToTalkAudio();
+                    }
+                  }
                   await refreshStatus();
                 }
 
@@ -1547,14 +2316,19 @@ class ZCamHttpServer @Inject constructor(
                 }
 
                 document.getElementById('applyAuthBtn').addEventListener('click', () => {
+                  stopBrowserLiveListenAudio();
+                  stopBrowserPushToTalkAudio();
                   saveAuthInputs();
                   updateAuthState();
                   updatePairingState();
                   applyPreviewSources();
                   refreshStatus();
+                  loadRecordings();
                 });
 
                 document.getElementById('clearAuthBtn').addEventListener('click', () => {
+                  stopBrowserLiveListenAudio();
+                  stopBrowserPushToTalkAudio();
                   tokenInput.value = '';
                   localStorage.removeItem(STORAGE.token);
                   clearPendingPairing(true);
@@ -1562,6 +2336,12 @@ class ZCamHttpServer @Inject constructor(
                   updatePairingState();
                   applyPreviewSources();
                   refreshStatus();
+                  recordingsCache = [];
+                  recordingEventsCache = [];
+                  selectedRecordingName = '';
+                  recordingPlayer.removeAttribute('src');
+                  recordingPlayer.load();
+                  renderRecordings();
                 });
 
                 document.getElementById('requestPairingBtn').addEventListener('click', () => {
@@ -1576,6 +2356,15 @@ class ZCamHttpServer @Inject constructor(
                   applyPreviewSources();
                 });
 
+                loadRecordingsBtn.addEventListener('click', () => {
+                  loadRecordings();
+                });
+
+                loadRecentRecordingsBtn.addEventListener('click', () => {
+                  setRecentRecordingsRange(12);
+                  loadRecordings();
+                });
+
                 volumeRange.addEventListener('input', () => {
                   volumeLabel.textContent = volumeRange.value + '%';
                 });
@@ -1584,20 +2373,37 @@ class ZCamHttpServer @Inject constructor(
                   pairingCodeInput.value = pairingCodeInput.value.replace(/[^0-9]/g, '').slice(0, 6);
                 });
 
+                recordingPlayer.addEventListener('loadedmetadata', () => {
+                  if (pendingSeekSeconds !== null) {
+                    try {
+                      recordingPlayer.currentTime = pendingSeekSeconds;
+                    } catch (_) {}
+                    pendingSeekSeconds = null;
+                  }
+                });
+
+                window.addEventListener('beforeunload', () => {
+                  stopBrowserLiveListenAudio();
+                  stopBrowserPushToTalkAudio();
+                });
+
                 tokenInput.value = localStorage.getItem(STORAGE.token) || '';
                 deviceIdInput.value = localStorage.getItem(STORAGE.deviceId) || '';
                 browserNameInput.value = localStorage.getItem(STORAGE.browserName) || '';
+                setRecentRecordingsRange(12);
                 ensureBrowserIdentity();
                 updateAuthState();
                 updatePairingState();
                 applyPreviewSources();
                 refreshStatus();
+                loadRecordings();
                 setInterval(refreshStatus, 3000);
                 window.setTorch = setTorch;
                 window.setNightMode = setNightMode;
                 window.setAudioLive = setAudioLive;
                 window.playSound = playSound;
                 window.setVolumeNow = setVolumeNow;
+                window.loadRecordings = loadRecordings;
                 window.requestBrowserPairing = requestBrowserPairing;
                 window.completeBrowserPairing = completeBrowserPairing;
               </script>
@@ -1614,12 +2420,20 @@ class ZCamHttpServer @Inject constructor(
         }
     }
 
+    private enum class AudioSocketRole(val wireName: String) {
+        LIVE("live"),
+        PTT("ptt"),
+        UNKNOWN("unknown")
+    }
+
     private companion object {
         const val DEFAULT_PORT = 8080
         const val BOUNDARY = "zcamframe"
+        const val AUDIO_SOCKET_PATH = "/ws/audio"
         const val JSON_UTF8 = "application/json; charset=utf-8"
         const val DEFAULT_RECORDINGS_LIST_LIMIT = 120
         const val MAX_RECORDINGS_LIST_LIMIT = 500
+        const val AUDIO_SOCKET_QUEUE_CAPACITY = 48
 
         val JSON_PAIR_REGEX =
             Regex("\"([^\"]+)\"\\s*:\\s*(\"(?:\\\\.|[^\"])*\"|true|false|null|-?\\d+(?:\\.\\d+)?)")
@@ -1629,6 +2443,13 @@ class ZCamHttpServer @Inject constructor(
             override fun getRequestStatus(): Int = 429
         }
     }
+
+    private data class RecordingHttpRange(
+        val status: NanoHTTPD.Response.Status,
+        val startOffset: Long,
+        val contentLength: Long,
+        val contentRangeHeader: String?
+    )
 }
 
 private class MjpegMultipartInputStream(

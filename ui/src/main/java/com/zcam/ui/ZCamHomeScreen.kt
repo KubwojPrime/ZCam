@@ -41,15 +41,21 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.Color as ComposeColor
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import com.zcam.core.domain.config.FeatureFlag
@@ -1000,6 +1006,7 @@ private fun InfoCard(
 
 @Composable
 private fun PreviewCard(state: ZCamUiState) {
+    var showFullScreen by remember(state.mode, state.previewStreamUrl) { mutableStateOf(false) }
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
@@ -1019,10 +1026,67 @@ private fun PreviewCard(state: ZCamUiState) {
                         "Preview unavailable"
                     }
                 },
+                fallbackFrameJpeg = state.previewFrameJpeg,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(210.dp)
             )
+            if (state.mode == ZCamMode.CLIENT) {
+                OutlinedButton(
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = state.previewStreamUrl.isNotBlank(),
+                    onClick = { showFullScreen = true }
+                ) {
+                    Text("Full screen preview")
+                }
+            }
+        }
+    }
+
+    if (showFullScreen) {
+        Dialog(
+            onDismissRequest = { showFullScreen = false },
+            properties = DialogProperties(
+                usePlatformDefaultWidth = false,
+                dismissOnClickOutside = false
+            )
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(MaterialTheme.colorScheme.scrim)
+            ) {
+                LivePreviewSurface(
+                    previewStreamUrl = state.previewStreamUrl,
+                    previewLabel = state.previewLabel.ifBlank { "Preview unavailable" },
+                    fallbackFrameJpeg = state.previewFrameJpeg,
+                    modifier = Modifier.fillMaxSize(),
+                    zoomable = true,
+                    containPreview = true
+                )
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .fillMaxWidth()
+                        .padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        Button(onClick = { showFullScreen = false }) {
+                            Text("Close")
+                        }
+                    }
+                    Text(
+                        text = "Pinch to zoom",
+                        color = MaterialTheme.colorScheme.onSurface,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.align(Alignment.CenterHorizontally)
+                    )
+                }
+            }
         }
     }
 }
@@ -1041,6 +1105,7 @@ private fun RuntimeControls(
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             StatusChip(label = "Runtime: ${state.runtimeLabel}", tone = state.runtimeTone)
+            StatusChip(label = state.serverBatteryLabel, tone = state.serverBatteryTone)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -1266,6 +1331,10 @@ private fun ClientSection(
                 label = state.clientStatusLabel,
                 tone = if (state.clientReachable) StatusTone.HEALTHY else StatusTone.WARNING
             )
+            StatusChip(
+                label = state.serverBatteryLabel,
+                tone = state.serverBatteryTone
+            )
         }
     }
 }
@@ -1332,7 +1401,7 @@ private fun StatusChip(
 ) {
     val (container, content) = when (tone) {
         StatusTone.NEUTRAL -> MaterialTheme.colorScheme.surfaceVariant to MaterialTheme.colorScheme.onSurfaceVariant
-        StatusTone.HEALTHY -> MaterialTheme.colorScheme.tertiaryContainer to MaterialTheme.colorScheme.onTertiaryContainer
+        StatusTone.HEALTHY -> ComposeColor(0xFF1F7A3D) to ComposeColor(0xFFFFFFFF)
         StatusTone.WARNING -> MaterialTheme.colorScheme.secondaryContainer to MaterialTheme.colorScheme.onSecondaryContainer
         StatusTone.ERROR -> MaterialTheme.colorScheme.errorContainer to MaterialTheme.colorScheme.onErrorContainer
     }

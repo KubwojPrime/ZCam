@@ -35,7 +35,8 @@ class DataStoreClientSessionRepository @Inject constructor(
                 displayName = prefs[DISPLAY_NAME].orEmpty(),
                 issuedToken = prefs[ISSUED_TOKEN].orEmpty(),
                 pairedAtEpochMs = prefs[PAIRED_AT_EPOCH_MS] ?: 0L,
-                lastUpdatedAtEpochMs = prefs[LAST_UPDATED_AT_EPOCH_MS] ?: 0L
+                lastUpdatedAtEpochMs = prefs[LAST_UPDATED_AT_EPOCH_MS] ?: 0L,
+                lastModeName = prefs[LAST_MODE_NAME].orEmpty()
             )
         }
         .flowOn(ioDispatcher)
@@ -50,6 +51,7 @@ class DataStoreClientSessionRepository @Inject constructor(
                 prefs[ISSUED_TOKEN] = session.issuedToken
                 prefs[PAIRED_AT_EPOCH_MS] = session.pairedAtEpochMs
                 prefs[LAST_UPDATED_AT_EPOCH_MS] = session.lastUpdatedAtEpochMs
+                prefs[LAST_MODE_NAME] = session.lastModeName
             }
         }
     }
@@ -72,5 +74,6 @@ class DataStoreClientSessionRepository @Inject constructor(
         val ISSUED_TOKEN = stringPreferencesKey("issued_token")
         val PAIRED_AT_EPOCH_MS = longPreferencesKey("paired_at_epoch_ms")
         val LAST_UPDATED_AT_EPOCH_MS = longPreferencesKey("last_updated_at_epoch_ms")
+        val LAST_MODE_NAME = stringPreferencesKey("last_mode_name")
     }
 }

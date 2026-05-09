@@ -43,6 +43,7 @@ hilt-compiler = { group = "com.google.dagger", name = "hilt-android-compiler", v
 timber = { group = "com.jakewharton.timber", name = "timber", version.ref = "timber" }
 okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
 nanohttpd = { group = "org.nanohttpd", name = "nanohttpd", version.ref = "nanohttpd" }
+nanohttpd-websocket = { group = "org.nanohttpd", name = "nanohttpd-websocket", version.ref = "nanohttpd" }
 google-material = { group = "com.google.android.material", name = "material", version.ref = "material" }
 junit4 = { group = "junit", name = "junit", version.ref = "junit4" }
 guava = { group = "com.google.guava", name = "guava", version.ref = "guava" }

@@ -1,6 +1,7 @@
 ﻿package com.zcam.service.runtime
 
 import com.zcam.audio.PushToTalkManager
+import com.zcam.audio.AudioTransportConfig
 import com.zcam.camera.CameraRuntime
 import com.zcam.core.dispatchers.DispatcherProvider
 import com.zcam.core.domain.config.FeatureFlags
@@ -749,6 +750,21 @@ class ZCamRuntimeCoordinatorRecoveryTest {
         override suspend fun setVolume(levelPercent: Int): com.zcam.audio.AudioCommandResult {
             return com.zcam.audio.AudioCommandResult.Success(snapshotState(), "ok")
         }
+
+        override fun transportConfig(): AudioTransportConfig = AudioTransportConfig()
+
+        override suspend fun registerLiveAudioSubscriber(
+            subscriberId: String,
+            onFrame: (ByteArray) -> Unit
+        ): Boolean = true
+
+        override suspend fun unregisterLiveAudioSubscriber(subscriberId: String) = Unit
+
+        override suspend fun openPushToTalkStream(streamId: String): Boolean = true
+
+        override suspend fun submitPushToTalkAudio(streamId: String, pcmFrame: ByteArray): Boolean = true
+
+        override suspend fun closePushToTalkStream(streamId: String) = Unit
 
         override fun snapshotState(): com.zcam.audio.AudioStateSnapshot {
             return com.zcam.audio.AudioStateSnapshot(

@@ -25,6 +25,7 @@ android {
 
 dependencies {
     implementation(project(":core"))
+    implementation(project(":audio"))
     implementation(project(":security"))
 
     implementation(libs.okhttp)

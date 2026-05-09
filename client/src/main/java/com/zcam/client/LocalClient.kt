@@ -22,7 +22,9 @@ data class ClientServerStatus(
     val audioPlayingBack: Boolean,
     val audioVolumePercent: Int?,
     val audioMinVolumePercent: Int?,
-    val audioMaxVolumePercent: Int?
+    val audioMaxVolumePercent: Int?,
+    val batteryPercent: Int?,
+    val charging: Boolean?
 )
 
 data class ClientPairingQr(

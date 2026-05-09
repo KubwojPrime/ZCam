@@ -124,6 +124,11 @@ class CameraRuntimeImpl @Inject constructor(
             val provider = awaitCameraProvider()
             val encoder = Nv21JpegEncoder()
             val minFrameIntervalMs = (1000L / normalizedFps).coerceAtLeast(1L)
+            val targetRecordingBitrate = recommendedRecordingBitrate(
+                width = config.resolution.width,
+                height = config.resolution.height,
+                fps = normalizedFps
+            )
 
             runOnMainExecutor {
                 lifecycleOwner.moveToStarted()
@@ -143,6 +148,7 @@ class CameraRuntimeImpl @Inject constructor(
                     .build()
                 val recorder = Recorder.Builder()
                     .setExecutor(cameraExecutor)
+                    .setTargetVideoEncodingBitRate(targetRecordingBitrate)
                     .setQualitySelector(
                         QualitySelector.fromOrderedList(
                             listOf(Quality.HD, Quality.FHD, Quality.SD, Quality.LOWEST)
@@ -767,5 +773,25 @@ class CameraRuntimeImpl @Inject constructor(
         val PLACEHOLDER_JPEG: ByteArray = Base64.getDecoder().decode(
             "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAkGBxAQEBIQEA8PEA8PDw8PDw8PDw8PDw8PFREWFhURFRUYHSggGBolGxUVITEhJSkrLi4uFx8zODMsNygtLisBCgoKDg0OGhAQGi0mHyYtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLf/AABEIAAEAAQMBEQACEQEDEQH/xAAXAAEAAwAAAAAAAAAAAAAAAAAAAQID/8QAFhEBAQEAAAAAAAAAAAAAAAAAAAER/9oADAMBAAIQAxAAAAG0A//EABkQAQADAQEAAAAAAAAAAAAAAAIAAREhMf/aAAgBAQABBQJQ0ZQ4x4f/xAAVEQEBAAAAAAAAAAAAAAAAAAAAEf/aAAgBAwEBPwFH/8QAFhEBAQEAAAAAAAAAAAAAAAAAABEh/9oACAECAQE/AYf/xAAbEAACAgMBAAAAAAAAAAAAAAABEQAhMUFhcf/aAAgBAQAGPwKQ4Yq0cYv/xAAZEAEAAgMAAAAAAAAAAAAAAAABABEhMUH/2gAIAQEAAT8h0qVI0rWg/wD/2Q=="
         )
+    }
+
+    private fun recommendedRecordingBitrate(
+        width: Int,
+        height: Int,
+        fps: Int
+    ): Int {
+        val pixels = width * height
+        val baseBitrate = when {
+            pixels >= 1920 * 1080 -> 6_000_000
+            pixels >= 1280 * 720 -> 4_000_000
+            pixels >= 960 * 540 -> 3_000_000
+            pixels >= 854 * 480 -> 2_200_000
+            else -> 1_600_000
+        }
+        return when {
+            fps >= 24 -> (baseBitrate * 1.2f).toInt()
+            fps <= 10 -> (baseBitrate * 0.85f).toInt()
+            else -> baseBitrate
+        }
     }
 }

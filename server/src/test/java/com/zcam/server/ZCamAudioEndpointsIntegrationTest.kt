@@ -10,6 +10,8 @@ import com.zcam.camera.CameraControlsSnapshot
 import com.zcam.camera.FramePipelineStatus
 import com.zcam.camera.FramePipelineStatusSource
 import com.zcam.camera.MjpegFrameSource
+import com.zcam.core.device.PowerStatusProvider
+import com.zcam.core.device.PowerStatusSnapshot
 import com.zcam.core.dispatchers.DispatcherProvider
 import com.zcam.core.domain.config.TrustedDevice
 import com.zcam.core.logging.ZCamLogger
@@ -34,12 +36,18 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import java.net.ServerSocket
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 class ZCamAudioEndpointsIntegrationTest {
 
@@ -70,6 +78,7 @@ class ZCamAudioEndpointsIntegrationTest {
             pushToTalkManager = audioManager,
             loopRecordingManager = NoopLoopRecordingManager(),
             securityManager = securityManager,
+            powerStatusProvider = FakePowerStatusProvider(),
             dispatchers = dispatchers,
             logger = logger,
             lanAccessPolicy = LanAccessPolicy()
@@ -102,6 +111,24 @@ class ZCamAudioEndpointsIntegrationTest {
             assertTrue(payload.contains("\"status\":\"ok\""))
             assertTrue(payload.contains("\"transmitting\":true"))
             assertTrue(payload.contains("\"liveListening\":false"))
+        }
+    }
+
+    @Test
+    fun status_endpoint_reports_power_state() {
+        val response = client.newCall(
+            Request.Builder()
+                .url("http://127.0.0.1:$port/api/status")
+                .get()
+                .build()
+        ).execute()
+
+        response.use {
+            val payload = it.body?.string().orEmpty()
+            assertEquals(200, it.code)
+            assertTrue(payload.contains("\"power\""))
+            assertTrue(payload.contains("\"batteryPercent\":73"))
+            assertTrue(payload.contains("\"charging\":true"))
         }
     }
 
@@ -186,6 +213,41 @@ class ZCamAudioEndpointsIntegrationTest {
             assertEquals(503, it.code)
             assertTrue(payload.contains("\"code\":\"engine_not_ready\""))
         }
+    }
+
+    @Test
+    fun audio_websocket_sends_transport_config_after_live_mode_enable() {
+        postJson(
+            path = "/api/audio/live",
+            body = """{"mode":"live","enabled":true}"""
+        ).use {
+            assertEquals(200, it.code)
+        }
+
+        val opened = CountDownLatch(1)
+        val messageReceived = CountDownLatch(1)
+        val configMessage = AtomicReference<String>("")
+        val socket = client.newWebSocket(
+            Request.Builder()
+                .url("ws://127.0.0.1:$port/ws/audio?role=live")
+                .build(),
+            object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    opened.countDown()
+                }
+
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    configMessage.set(text)
+                    messageReceived.countDown()
+                }
+            }
+        )
+
+        assertTrue(opened.await(5, TimeUnit.SECONDS))
+        assertTrue(messageReceived.await(5, TimeUnit.SECONDS))
+        socket.close(1000, "done")
+        assertTrue(configMessage.get().contains("\"type\":\"config\""))
+        assertTrue(configMessage.get().contains("\"role\":\"live\""))
     }
 
     @Test
@@ -310,6 +372,15 @@ class ZCamAudioEndpointsIntegrationTest {
                 actualPercent = levelPercent,
                 streamVolume = levelPercent,
                 streamMaxVolume = 100
+            )
+        }
+    }
+
+    private class FakePowerStatusProvider : PowerStatusProvider {
+        override fun snapshot(): PowerStatusSnapshot {
+            return PowerStatusSnapshot(
+                batteryPercent = 73,
+                charging = true
             )
         }
     }
