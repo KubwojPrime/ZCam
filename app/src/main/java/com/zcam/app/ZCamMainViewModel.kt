@@ -1,9 +1,12 @@
 package com.zcam.app
 
+import android.content.ContentValues
 import android.content.Context
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import android.os.PowerManager
+import android.provider.MediaStore
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -54,6 +57,8 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.io.File
 import java.net.URLDecoder
 import java.net.Inet4Address
 import java.net.NetworkInterface
@@ -61,6 +66,7 @@ import java.nio.charset.StandardCharsets
 import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.Locale
 import javax.inject.Inject
 
 @HiltViewModel
@@ -84,6 +90,8 @@ class ZCamMainViewModel @Inject constructor(
     private var settingsSnapshot: RuntimeSettings = RuntimeSettingsDefaults.value
     private var volumeSyncJob: Job? = null
     private var clientSessionSyncJob: Job? = null
+    private var playbackLoadJob: Job? = null
+    private var recordingDownloadJob: Job? = null
 
     init {
         observeSettings()
@@ -114,6 +122,8 @@ class ZCamMainViewModel @Inject constructor(
                     viewModelScope.launch(dispatchers.io) {
                         localAudioTransport.stopAll()
                     }
+                    playbackLoadJob?.cancel()
+                    recordingDownloadJob?.cancel()
                 }
                 _state.update { current ->
                     current.copy(
@@ -154,6 +164,8 @@ class ZCamMainViewModel @Inject constructor(
 
             is ZCamUiAction.SetTorchEnabled -> setTorchEnabled(action.enabled)
             is ZCamUiAction.SetNightModeEnabled -> setNightModeEnabled(action.enabled)
+            is ZCamUiAction.AdjustClientZoom -> adjustClientZoom(action.deltaLinear)
+            ZCamUiAction.ResetClientZoom -> resetClientZoom()
             is ZCamUiAction.PushToTalkChanged -> setPushToTalk(action.pressed)
             ZCamUiAction.ToggleLiveListen -> toggleLiveListen()
             is ZCamUiAction.PlayQuickSound -> playQuickSound(action.clipId, action.aversive)
@@ -166,6 +178,7 @@ class ZCamMainViewModel @Inject constructor(
             }
             ZCamUiAction.FetchRecordings -> fetchRecordingsForRange()
             is ZCamUiAction.PlayRecording -> playRecording(action.fileName, action.seekToEpochMs)
+            is ZCamUiAction.DownloadRecording -> downloadRecordingToDevice(action.fileName)
 
             ZCamUiAction.RequestPairingQr -> requestPairingQr()
             is ZCamUiAction.PairingPayloadChanged -> _state.update {
@@ -333,10 +346,18 @@ class ZCamMainViewModel @Inject constructor(
                 ""
             }
         }
+        val previewLabel = when {
+            streamUrl.isNotBlank() && current.previewStateTone == StatusTone.WARNING -> "Preview reconnecting..."
+            streamUrl.isNotBlank() && current.previewStateTone == StatusTone.ERROR -> "Preview unavailable"
+            streamUrl.isBlank() && current.mode == ZCamMode.SERVER && !current.runtimeOn -> "Start runtime to see live preview."
+            streamUrl.isBlank() && current.mode == ZCamMode.CLIENT && current.clientHost.isBlank() -> "Set server host to see preview."
+            streamUrl.isBlank() && current.mode == ZCamMode.CLIENT -> "Preview unavailable"
+            else -> ""
+        }
         _state.update {
             it.copy(
                 previewStreamUrl = streamUrl,
-                previewLabel = if (streamUrl.isBlank()) "Preview unavailable" else "",
+                previewLabel = previewLabel,
                 previewFrameJpeg = if (streamUrl.isBlank()) null else it.previewFrameJpeg
             )
         }
@@ -366,13 +387,42 @@ class ZCamMainViewModel @Inject constructor(
                 when (val result = localClient.fetchSnapshot(currentTargetForCommands())) {
                     is ClientCallResult.Success -> _state.update { latest ->
                         if (shouldRefreshPreviewSnapshots(latest)) {
-                            latest.copy(previewFrameJpeg = result.value)
+                            latest.copy(
+                                previewFrameJpeg = result.value,
+                                previewStateLabel = if (latest.clientReachable || latest.mode == ZCamMode.SERVER) {
+                                    "Preview live"
+                                } else {
+                                    latest.previewStateLabel
+                                },
+                                previewStateTone = if (latest.clientReachable || latest.mode == ZCamMode.SERVER) {
+                                    StatusTone.HEALTHY
+                                } else {
+                                    latest.previewStateTone
+                                }
+                            )
                         } else {
                             latest
                         }
                     }
 
-                    is ClientCallResult.Failure -> Unit
+                    is ClientCallResult.Failure -> _state.update { latest ->
+                        if (shouldRefreshPreviewSnapshots(latest)) {
+                            latest.copy(
+                                previewStateLabel = if (latest.clientReachable || latest.mode == ZCamMode.SERVER) {
+                                    "Preview reconnecting"
+                                } else {
+                                    "Preview offline"
+                                },
+                                previewStateTone = if (latest.clientReachable || latest.mode == ZCamMode.SERVER) {
+                                    StatusTone.WARNING
+                                } else {
+                                    StatusTone.ERROR
+                                }
+                            )
+                        } else {
+                            latest
+                        }
+                    }
                 }
                 delay(PREVIEW_SNAPSHOT_REFRESH_MS)
             }
@@ -382,11 +432,19 @@ class ZCamMainViewModel @Inject constructor(
     private fun refreshClientStatusNow() {
         viewModelScope.launch(dispatchers.io) {
             val result = localClient.fetchStatus(currentTargetForCommands())
+            var shouldStopPushToTalk = false
+            var shouldStopLiveListen = false
+            var shouldRecoverLiveListen = false
             _state.update { current ->
                 when (result) {
                     is ClientCallResult.Success -> {
                         val status = result.value
                         val syncVolumeFromServer = volumeSyncJob?.isActive != true
+                        shouldStopPushToTalk = !status.audioTransmitting
+                        shouldStopLiveListen = !status.audioLiveListening
+                        shouldRecoverLiveListen = current.mode == ZCamMode.CLIENT &&
+                            status.audioLiveListening &&
+                            !current.liveListenEnabled
                         val serverVolume = status.audioVolumePercent
                             ?.coerceIn(
                                 status.audioMinVolumePercent ?: 0,
@@ -397,14 +455,37 @@ class ZCamMainViewModel @Inject constructor(
                             charging = status.charging,
                             remote = current.mode == ZCamMode.CLIENT
                         )
+                        val previewUi = when {
+                            !status.alive -> "Preview offline" to StatusTone.ERROR
+                            !status.videoRunning -> "Preview stopped" to StatusTone.WARNING
+                            status.lastFrameAgeMs >= PREVIEW_STALE_FRAME_MS -> "Preview reconnecting" to StatusTone.WARNING
+                            else -> "Preview live" to StatusTone.HEALTHY
+                        }
+                        val audioUi = when {
+                            !status.alive -> "Audio unavailable" to StatusTone.ERROR
+                            shouldRecoverLiveListen -> "Live listen reconnecting" to StatusTone.WARNING
+                            status.audioTransmitting && !current.pttPressed -> "Push-to-talk active on server" to StatusTone.WARNING
+                            status.audioTransmitting && status.audioLiveListening -> "Audio live + push-to-talk active" to StatusTone.HEALTHY
+                            status.audioTransmitting -> "Push-to-talk active" to StatusTone.HEALTHY
+                            status.audioLiveListening -> "Live listen active" to StatusTone.HEALTHY
+                            status.audioPlayingBack -> "Audio playback active" to StatusTone.HEALTHY
+                            else -> "Audio idle" to StatusTone.NEUTRAL
+                        }
                         current.copy(
                             clientReachable = status.alive,
                             clientStatusLabel = if (status.alive) "Connected" else "Unavailable",
+                            audioRuntimeLabel = audioUi.first,
+                            audioRuntimeTone = audioUi.second,
                             clientTorchEnabled = status.torchEnabled,
                             clientNightModeEnabled = status.nightModeEnabled,
                             clientLowLightBoostSupported = status.lowLightBoostSupported,
+                            clientZoomLinear = status.zoomLinear.coerceIn(0f, 1f),
+                            clientZoomRatio = status.zoomRatio.coerceAtLeast(1f),
+                            clientMaxZoomRatio = status.maxZoomRatio.coerceAtLeast(1f),
                             pttPressed = status.audioTransmitting,
                             liveListenEnabled = status.audioLiveListening,
+                            previewStateLabel = previewUi.first,
+                            previewStateTone = previewUi.second,
                             serverBatteryPercent = status.batteryPercent,
                             serverCharging = status.charging,
                             serverBatteryLabel = power.label,
@@ -426,6 +507,18 @@ class ZCamMainViewModel @Inject constructor(
                         current.copy(
                             clientReachable = false,
                             clientStatusLabel = "Unavailable",
+                            previewStateLabel = if (current.mode == ZCamMode.SERVER && !current.runtimeOn) {
+                                "Preview stopped"
+                            } else {
+                                "Preview offline"
+                            },
+                            previewStateTone = if (current.mode == ZCamMode.SERVER && !current.runtimeOn) {
+                                StatusTone.NEUTRAL
+                            } else {
+                                StatusTone.ERROR
+                            },
+                            audioRuntimeLabel = "Audio unavailable",
+                            audioRuntimeTone = StatusTone.ERROR,
                             serverBatteryPercent = if (current.mode == ZCamMode.CLIENT) null else current.serverBatteryPercent,
                             serverCharging = if (current.mode == ZCamMode.CLIENT) null else current.serverCharging,
                             serverBatteryLabel = failureBatteryLabel,
@@ -435,11 +528,30 @@ class ZCamMainViewModel @Inject constructor(
                 }
             }
             if (result is ClientCallResult.Success) {
-                if (!result.value.audioTransmitting) {
+                if (shouldStopPushToTalk) {
                     localAudioTransport.stopPushToTalk()
                 }
-                if (!result.value.audioLiveListening) {
+                if (shouldStopLiveListen) {
                     localAudioTransport.stopLiveListen()
+                }
+                if (shouldRecoverLiveListen) {
+                    when (val audioResult = localAudioTransport.startLiveListen(currentTargetForCommands())) {
+                        LocalAudioTransportResult.Success -> _state.update {
+                            it.copy(
+                                audioRuntimeLabel = "Live listen active",
+                                audioRuntimeTone = StatusTone.HEALTHY,
+                                errorMessage = null
+                            )
+                        }
+
+                        is LocalAudioTransportResult.Failure -> _state.update {
+                            it.copy(
+                                audioRuntimeLabel = "Live listen reconnect failed",
+                                audioRuntimeTone = StatusTone.WARNING,
+                                errorMessage = "Live listen reconnect failed: ${audioResult.reason}${audioResult.detail?.let { detail -> " ($detail)" } ?: ""}"
+                            )
+                        }
+                    }
                 }
             }
             refreshPreviewTarget()
@@ -511,25 +623,41 @@ class ZCamMainViewModel @Inject constructor(
                     if (pressed) {
                         when (val audioResult = localAudioTransport.startPushToTalk(target)) {
                             LocalAudioTransportResult.Success -> _state.update {
-                                it.copy(pttPressed = true, errorMessage = null)
+                                it.copy(
+                                    pttPressed = true,
+                                    audioRuntimeLabel = "Push-to-talk active",
+                                    audioRuntimeTone = StatusTone.HEALTHY,
+                                    errorMessage = null
+                                )
                             }
                             is LocalAudioTransportResult.Failure -> {
                                 localClient.setPushToTalk(target, enabled = false)
                                 _state.update {
                                     it.copy(
                                         pttPressed = false,
+                                        audioRuntimeLabel = "Push-to-talk failed",
+                                        audioRuntimeTone = StatusTone.ERROR,
                                         errorMessage = "Push-to-talk transport failed: ${audioResult.reason}${audioResult.detail?.let { detail -> " ($detail)" } ?: ""}"
                                     )
                                 }
                             }
                         }
                     } else {
-                        _state.update { it.copy(pttPressed = false, errorMessage = null) }
+                        _state.update {
+                            it.copy(
+                                pttPressed = false,
+                                audioRuntimeLabel = if (it.liveListenEnabled) "Live listen active" else "Audio idle",
+                                audioRuntimeTone = if (it.liveListenEnabled) StatusTone.HEALTHY else StatusTone.NEUTRAL,
+                                errorMessage = null
+                            )
+                        }
                     }
                 }
                 is ClientCallResult.Failure -> {
                     _state.update {
                         it.copy(
+                            audioRuntimeLabel = "Push-to-talk request failed",
+                            audioRuntimeTone = StatusTone.ERROR,
                             errorMessage = "Push-to-talk failed: ${result.reason}${result.responseBody?.let { body -> " ($body)" } ?: ""}"
                         )
                     }
@@ -577,25 +705,41 @@ class ZCamMainViewModel @Inject constructor(
                     if (enabled) {
                         when (val audioResult = localAudioTransport.startLiveListen(target)) {
                             LocalAudioTransportResult.Success -> _state.update {
-                                it.copy(liveListenEnabled = true, errorMessage = null)
+                                it.copy(
+                                    liveListenEnabled = true,
+                                    audioRuntimeLabel = "Live listen active",
+                                    audioRuntimeTone = StatusTone.HEALTHY,
+                                    errorMessage = null
+                                )
                             }
                             is LocalAudioTransportResult.Failure -> {
                                 localClient.setLiveListen(target, enabled = false)
                                 _state.update {
                                     it.copy(
                                         liveListenEnabled = false,
+                                        audioRuntimeLabel = "Live listen failed",
+                                        audioRuntimeTone = StatusTone.ERROR,
                                         errorMessage = "Live listen transport failed: ${audioResult.reason}${audioResult.detail?.let { detail -> " ($detail)" } ?: ""}"
                                     )
                                 }
                             }
                         }
                     } else {
-                        _state.update { it.copy(liveListenEnabled = false, errorMessage = null) }
+                        _state.update {
+                            it.copy(
+                                liveListenEnabled = false,
+                                audioRuntimeLabel = if (it.pttPressed) "Push-to-talk active" else "Audio idle",
+                                audioRuntimeTone = if (it.pttPressed) StatusTone.HEALTHY else StatusTone.NEUTRAL,
+                                errorMessage = null
+                            )
+                        }
                     }
                 }
                 is ClientCallResult.Failure -> {
                     _state.update {
                         it.copy(
+                            audioRuntimeLabel = "Live listen request failed",
+                            audioRuntimeTone = StatusTone.ERROR,
                             errorMessage = "Live listen failed: ${result.reason}${result.responseBody?.let { body -> " ($body)" } ?: ""}"
                         )
                     }
@@ -681,15 +825,18 @@ class ZCamMainViewModel @Inject constructor(
                 it.copy(
                     recordings = it.recordings.copy(
                         loading = true,
-                        resultMessage = "Loading recordings..."
+                        resultMessage = "Loading recordings...",
+                        resultTone = StatusTone.NEUTRAL
                     ),
                     errorMessage = null
                 )
             }
 
+            val target = currentTargetForCommands()
+
             when (
                 val result = localClient.fetchRecordings(
-                    target = currentTargetForCommands(),
+                    target = target,
                     fromEpochMs = fromParsed,
                     toEpochMs = toParsed,
                     limit = 200
@@ -702,45 +849,78 @@ class ZCamMainViewModel @Inject constructor(
                             startedAtEpochMs = clip.startedAtEpochMs,
                             endedAtEpochMs = clip.endedAtEpochMs,
                             durationMs = clip.durationMs,
-                            sizeBytes = clip.sizeBytes
+                            sizeBytes = clip.sizeBytes,
+                            container = clip.container,
+                            codec = clip.codec
                         )
                     }
-                    val events = when (
+                    val eventsResult = when (
                         val eventsResult = localClient.fetchRecordingEvents(
-                            target = currentTargetForCommands(),
+                            target = target,
                             fromEpochMs = fromParsed,
                             toEpochMs = toParsed,
                             limit = 400
                         )
                     ) {
-                        is ClientCallResult.Success -> eventsResult.value.map { event ->
-                            RecordingEventUi(
-                                epochMs = event.epochMs,
-                                confidencePercent = event.confidencePercent,
-                                source = event.source,
-                                recordingFileName = event.recordingFileName
-                            )
-                        }
-                        is ClientCallResult.Failure -> emptyList()
+                        is ClientCallResult.Success -> mapRecordingEvents(items, eventsResult.value) to null
+                        is ClientCallResult.Failure -> emptyList<RecordingEventUi>() to eventsResult.reason
                     }
+                    val events = eventsResult.first
+                    val eventsFailureReason = eventsResult.second
                     _state.update {
                         val selectedFileName = it.recordings.selectedFileName
                             .takeIf { fileName -> items.any { item -> item.fileName == fileName } }
                             ?: items.firstOrNull()?.fileName.orEmpty()
-                        val selectedPlaybackUrl = if (selectedFileName.isBlank()) {
-                            ""
+                        val selectedItem = items.firstOrNull { item -> item.fileName == selectedFileName }
+                        val cachedPlaybackUrl = selectedItem?.let(::cachedPlaybackUrlFor)
+                        val preservedPlaybackUrl = if (selectedFileName.isNotBlank() && selectedFileName == it.recordings.selectedFileName) {
+                            it.recordings.selectedPlaybackUrl.ifBlank { cachedPlaybackUrl.orEmpty() }
                         } else {
-                            localClient.buildRecordingPlaybackUrl(currentTargetForCommands(), selectedFileName)
+                            cachedPlaybackUrl.orEmpty()
+                        }
+                        val resultMessage = buildString {
+                            append("Found ${items.size} recording(s)")
+                            if (eventsFailureReason == null) {
+                                append(" and ${events.size} event marker(s)")
+                            } else {
+                                append(". Event markers unavailable: $eventsFailureReason")
+                            }
                         }
                         it.copy(
                             recordings = it.recordings.copy(
                                 loading = false,
-                                resultMessage = "Found ${items.size} recording(s)",
+                                resultMessage = resultMessage,
+                                resultTone = if (eventsFailureReason == null) StatusTone.HEALTHY else StatusTone.WARNING,
                                 items = items,
                                 events = events,
                                 selectedFileName = selectedFileName,
-                                selectedPlaybackUrl = selectedPlaybackUrl,
-                                selectedPlaybackOffsetMs = 0L
+                                selectedPlaybackUrl = preservedPlaybackUrl,
+                                selectedPlaybackOffsetMs = if (selectedFileName == it.recordings.selectedFileName) {
+                                    it.recordings.selectedPlaybackOffsetMs
+                                } else {
+                                    0L
+                                },
+                                selectedPlaybackSourceLabel = recordingSourceLabel(target),
+                                playbackLoading = if (selectedFileName == it.recordings.selectedFileName) {
+                                    it.recordings.playbackLoading
+                                } else {
+                                    false
+                                },
+                                playbackLoadingMessage = if (selectedFileName == it.recordings.selectedFileName) {
+                                    it.recordings.playbackLoadingMessage
+                                } else {
+                                    ""
+                                },
+                                playbackDownloadedBytes = if (selectedFileName == it.recordings.selectedFileName) {
+                                    it.recordings.playbackDownloadedBytes
+                                } else {
+                                    0L
+                                },
+                                playbackTotalBytes = if (selectedFileName == it.recordings.selectedFileName) {
+                                    it.recordings.playbackTotalBytes
+                                } else {
+                                    null
+                                }
                             ),
                             errorMessage = null
                         )
@@ -751,7 +931,8 @@ class ZCamMainViewModel @Inject constructor(
                         it.copy(
                             recordings = it.recordings.copy(
                                 loading = false,
-                                resultMessage = "Recordings request failed: ${result.reason}"
+                                resultMessage = "Recordings request failed: ${result.reason}",
+                                resultTone = StatusTone.ERROR
                             ),
                             errorMessage = "Recordings request failed: ${result.reason}${result.responseBody?.let { body -> " ($body)" } ?: ""}"
                         )
@@ -762,24 +943,273 @@ class ZCamMainViewModel @Inject constructor(
     }
 
     private fun playRecording(fileName: String, seekToEpochMs: Long?) {
-        viewModelScope.launch(dispatchers.io) {
-            if (fileName.isBlank()) return@launch
-            val url = localClient.buildRecordingPlaybackUrl(currentTargetForCommands(), fileName)
-            val item = state.value.recordings.items.firstOrNull { it.fileName == fileName }
-            val offsetMs = if (item != null && seekToEpochMs != null) {
-                (seekToEpochMs - item.startedAtEpochMs).coerceAtLeast(0L)
-            } else {
-                0L
+        if (fileName.isBlank()) return
+
+        val current = state.value
+        val item = current.recordings.items.firstOrNull { it.fileName == fileName } ?: return
+        val offsetMs = seekToEpochMs?.let { (it - item.startedAtEpochMs).coerceAtLeast(0L) } ?: 0L
+        val cachedPlaybackUrl = cachedPlaybackUrlFor(item)
+        val target = currentTargetForCommands()
+        val playbackUrl = cachedPlaybackUrl.orEmpty()
+
+        _state.update {
+            it.copy(
+                recordings = it.recordings.copy(
+                    selectedFileName = fileName,
+                    selectedPlaybackUrl = playbackUrl,
+                    selectedPlaybackOffsetMs = offsetMs.coerceAtMost(item.durationMs),
+                    selectedPlaybackSourceLabel = recordingSourceLabel(target),
+                    playbackLoading = cachedPlaybackUrl == null,
+                    playbackLoadingMessage = if (cachedPlaybackUrl == null) "Loading video from server..." else "",
+                    playbackDownloadedBytes = if (cachedPlaybackUrl == null) 0L else item.sizeBytes,
+                    playbackTotalBytes = if (cachedPlaybackUrl == null) item.sizeBytes.takeIf { it > 0L } else item.sizeBytes
+                ),
+                errorMessage = null
+            )
+        }
+
+        if (cachedPlaybackUrl != null) {
+            return
+        }
+
+        playbackLoadJob?.cancel()
+        playbackLoadJob = viewModelScope.launch(dispatchers.io) {
+            val cacheFile = playbackCacheFile(fileName)
+            val tempFile = File(cacheFile.parentFile, "${cacheFile.name}.part")
+            tempFile.parentFile?.mkdirs()
+            tempFile.delete()
+
+            val downloadResult = runCatching {
+                localClient.downloadRecording(
+                    target = target,
+                    fileName = fileName,
+                    destination = tempFile.outputStream()
+                ) { downloadedBytes, totalBytes ->
+                    _state.update { latest ->
+                        if (latest.recordings.selectedFileName != fileName) {
+                            latest
+                        } else {
+                            latest.copy(
+                                recordings = latest.recordings.copy(
+                                    playbackLoading = true,
+                                    playbackLoadingMessage = "Loading video from server...",
+                                    playbackDownloadedBytes = downloadedBytes,
+                                    playbackTotalBytes = totalBytes ?: item.sizeBytes.takeIf { it > 0L }
+                                )
+                            )
+                        }
+                    }
+                }
+            }.getOrElse { error ->
+                tempFile.delete()
+                ClientCallResult.Failure(
+                    code = null,
+                    reason = "io_error",
+                    responseBody = error.message
+                )
             }
+
+            when (downloadResult) {
+                is ClientCallResult.Success -> {
+                    tempFile.copyTo(cacheFile, overwrite = true)
+                    tempFile.delete()
+                    val completedUrl = Uri.fromFile(cacheFile).toString()
+                    _state.update { latest ->
+                        if (latest.recordings.selectedFileName != fileName) {
+                            latest
+                        } else {
+                            latest.copy(
+                                recordings = latest.recordings.copy(
+                                    selectedPlaybackUrl = completedUrl,
+                                    playbackLoading = false,
+                                    playbackLoadingMessage = "",
+                                    playbackDownloadedBytes = item.sizeBytes,
+                                    playbackTotalBytes = item.sizeBytes
+                                ),
+                                errorMessage = null
+                            )
+                        }
+                    }
+                }
+
+                is ClientCallResult.Failure -> {
+                    tempFile.delete()
+                    val fallbackUrl = localClient.buildRecordingPlaybackUrl(target, fileName)
+                    _state.update { latest ->
+                        if (latest.recordings.selectedFileName != fileName) {
+                            latest
+                        } else {
+                            latest.copy(
+                                recordings = latest.recordings.copy(
+                                    selectedPlaybackUrl = fallbackUrl,
+                                    playbackLoading = false,
+                                    playbackLoadingMessage = "Video load failed. Falling back to direct playback.",
+                                    playbackDownloadedBytes = 0L,
+                                    playbackTotalBytes = null
+                                ),
+                                errorMessage = "Playback load failed: ${downloadResult.reason}${downloadResult.responseBody?.let { body -> " ($body)" } ?: ""}"
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun adjustClientZoom(deltaLinear: Float) {
+        val targetZoom = (state.value.clientZoomLinear + deltaLinear).coerceIn(0f, 1f)
+        applyClientZoom(targetZoom)
+    }
+
+    private fun resetClientZoom() {
+        applyClientZoom(0f)
+    }
+
+    private fun applyClientZoom(linearZoom: Float) {
+        viewModelScope.launch(dispatchers.io) {
+            val normalizedZoom = linearZoom.coerceIn(0f, 1f)
+            when (val result = localClient.setZoomLinear(currentTargetForCommands(), normalizedZoom)) {
+                is ClientCallResult.Success -> _state.update {
+                    val maxZoomRatio = it.clientMaxZoomRatio.coerceAtLeast(1f)
+                    val approximatedRatio = 1f + ((maxZoomRatio - 1f) * normalizedZoom)
+                    it.copy(
+                        clientZoomLinear = normalizedZoom,
+                        clientZoomRatio = approximatedRatio.coerceAtLeast(1f),
+                        errorMessage = null
+                    )
+                }
+
+                is ClientCallResult.Failure -> _state.update {
+                    it.copy(
+                        errorMessage = "Zoom update failed: ${result.reason}${result.responseBody?.let { body -> " ($body)" } ?: ""}"
+                    )
+                }
+            }
+        }
+    }
+
+    private fun downloadRecordingToDevice(fileName: String) {
+        if (fileName.isBlank()) return
+        val item = state.value.recordings.items.firstOrNull { it.fileName == fileName } ?: return
+        val target = currentTargetForCommands()
+
+        recordingDownloadJob?.cancel()
+        recordingDownloadJob = viewModelScope.launch(dispatchers.io) {
             _state.update {
                 it.copy(
                     recordings = it.recordings.copy(
-                        selectedFileName = fileName,
-                        selectedPlaybackUrl = url,
-                        selectedPlaybackOffsetMs = offsetMs
+                        activeDownloadFileName = fileName,
+                        downloadLoading = true,
+                        downloadMessage = "Downloading ${item.fileName}...",
+                        downloadDownloadedBytes = 0L,
+                        downloadTotalBytes = item.sizeBytes.takeIf { size -> size > 0L }
                     ),
                     errorMessage = null
                 )
+            }
+
+            val destination = createRecordingDownloadDestination(item)
+            if (destination == null) {
+                _state.update {
+                    it.copy(
+                        recordings = it.recordings.copy(
+                            activeDownloadFileName = "",
+                            downloadLoading = false,
+                            downloadMessage = "Download failed: unable to create destination.",
+                            downloadDownloadedBytes = 0L,
+                            downloadTotalBytes = null
+                        ),
+                        errorMessage = "Download failed: unable to create destination."
+                    )
+                }
+                return@launch
+            }
+
+            val cachedFile = playbackCacheFile(fileName)
+                .takeIf { it.exists() && it.length() > 0L }
+
+            val result = runCatching {
+                destination.openOutputStream().use { output ->
+                    if (output == null) {
+                        return@use ClientCallResult.Failure(code = null, reason = "destination_unavailable")
+                    }
+                    if (cachedFile != null) {
+                        copyLocalFileWithProgress(cachedFile, output) { copiedBytes, totalBytes ->
+                            _state.update { latest ->
+                                latest.copy(
+                                    recordings = latest.recordings.copy(
+                                        activeDownloadFileName = fileName,
+                                        downloadLoading = true,
+                                        downloadMessage = "Downloading ${destination.displayName}...",
+                                        downloadDownloadedBytes = copiedBytes,
+                                        downloadTotalBytes = totalBytes
+                                    )
+                                )
+                            }
+                        }
+                        ClientCallResult.Success(Unit)
+                    } else {
+                        localClient.downloadRecording(
+                            target = target,
+                            fileName = fileName,
+                            destination = output
+                        ) { downloadedBytes, totalBytes ->
+                            _state.update { latest ->
+                                latest.copy(
+                                    recordings = latest.recordings.copy(
+                                        activeDownloadFileName = fileName,
+                                        downloadLoading = true,
+                                        downloadMessage = "Downloading ${destination.displayName}...",
+                                        downloadDownloadedBytes = downloadedBytes,
+                                        downloadTotalBytes = totalBytes ?: item.sizeBytes.takeIf { size -> size > 0L }
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+            }.getOrElse { error ->
+                ClientCallResult.Failure(
+                    code = null,
+                    reason = "io_error",
+                    responseBody = error.message
+                )
+            }
+
+            when (result) {
+                is ClientCallResult.Success -> {
+                    destination.commit()
+                    _state.update {
+                        it.copy(
+                            recordings = it.recordings.copy(
+                                activeDownloadFileName = "",
+                                downloadLoading = false,
+                                downloadMessage = "Saved ${destination.displayName}",
+                                downloadDownloadedBytes = item.sizeBytes,
+                                downloadTotalBytes = item.sizeBytes,
+                                resultMessage = "Saved ${destination.displayName}",
+                                resultTone = StatusTone.HEALTHY
+                            ),
+                            errorMessage = null
+                        )
+                    }
+                }
+
+                is ClientCallResult.Failure -> {
+                    destination.abort()
+                    _state.update {
+                        it.copy(
+                            recordings = it.recordings.copy(
+                                activeDownloadFileName = "",
+                                downloadLoading = false,
+                                downloadMessage = "Download failed: ${result.reason}",
+                                downloadDownloadedBytes = 0L,
+                                downloadTotalBytes = null
+                            ),
+                            errorMessage = "Download failed: ${result.reason}${result.responseBody?.let { body -> " ($body)" } ?: ""}"
+                        )
+                    }
+                }
             }
         }
     }
@@ -896,15 +1326,18 @@ class ZCamMainViewModel @Inject constructor(
                     persistClientSession()
                 }
 
-                is ClientCallResult.Failure -> _state.update {
-                    it.copy(
-                        pairing = it.pairing.copy(
-                            loading = false,
-                            resultMessage = "Pairing request failed: ${result.reason}",
-                            resultTone = StatusTone.ERROR
-                        ),
-                        errorMessage = "Pairing request failed: ${result.reason}${result.responseBody?.let { body -> " ($body)" } ?: ""}"
-                    )
+                is ClientCallResult.Failure -> {
+                    val failureMessage = pairingFailureMessage(result, prefix = "Pairing request failed")
+                    _state.update {
+                        it.copy(
+                            pairing = it.pairing.copy(
+                                loading = false,
+                                resultMessage = failureMessage,
+                                resultTone = StatusTone.ERROR
+                            ),
+                            errorMessage = failureMessage
+                        )
+                    }
                 }
             }
         }
@@ -949,15 +1382,18 @@ class ZCamMainViewModel @Inject constructor(
                     persistClientSession()
                 }
 
-                is ClientCallResult.Failure -> _state.update { current ->
-                    current.copy(
-                        pairing = current.pairing.copy(
-                            loading = false,
-                            resultMessage = "Pairing failed: ${result.reason}",
-                            resultTone = StatusTone.ERROR
-                        ),
-                        errorMessage = "Pairing failed: ${result.reason}${result.responseBody?.let { body -> " ($body)" } ?: ""}"
-                    )
+                is ClientCallResult.Failure -> {
+                    val failureMessage = pairingFailureMessage(result, prefix = "Pairing failed")
+                    _state.update { current ->
+                        current.copy(
+                            pairing = current.pairing.copy(
+                                loading = false,
+                                resultMessage = failureMessage,
+                                resultTone = StatusTone.ERROR
+                            ),
+                            errorMessage = failureMessage
+                        )
+                    }
                 }
             }
         }
@@ -970,6 +1406,191 @@ class ZCamMainViewModel @Inject constructor(
                 securityManager.cancelPairingRequest(requestId)
             }
         }
+    }
+
+    private fun recordingSourceLabel(target: ClientTarget): String = "${target.host}:${target.port}"
+
+    private fun mapRecordingEvents(
+        items: List<com.zcam.ui.RecordingItemUi>,
+        events: List<com.zcam.client.ClientRecordingEvent>
+    ): List<RecordingEventUi> {
+        return events.map { event ->
+            val matchedItem = event.recordingFileName
+                ?.let { fileName -> items.firstOrNull { item -> item.fileName == fileName } }
+                ?: matchRecordingItemForEvent(items, event.epochMs)
+            val startedAtEpochMs = matchedItem?.startedAtEpochMs ?: event.recordingStartedAtEpochMs
+            val endedAtEpochMs = matchedItem?.endedAtEpochMs ?: event.recordingEndedAtEpochMs
+            val durationMs = if (startedAtEpochMs != null && endedAtEpochMs != null) {
+                (endedAtEpochMs - startedAtEpochMs).coerceAtLeast(0L)
+            } else {
+                null
+            }
+            val offsetMs = (
+                matchedItem?.let { item -> event.epochMs - item.startedAtEpochMs }
+                    ?: event.recordingOffsetMs
+                    ?: startedAtEpochMs?.let { start -> event.epochMs - start }
+                )?.coerceAtLeast(0L)
+            RecordingEventUi(
+                epochMs = event.epochMs,
+                confidencePercent = event.confidencePercent,
+                source = event.source,
+                recordingFileName = matchedItem?.fileName ?: event.recordingFileName,
+                recordingStartedAtEpochMs = startedAtEpochMs,
+                recordingEndedAtEpochMs = endedAtEpochMs,
+                recordingOffsetMs = if (durationMs != null && offsetMs != null) {
+                    offsetMs.coerceAtMost(durationMs)
+                } else {
+                    offsetMs
+                }
+            )
+        }.sortedBy(RecordingEventUi::epochMs)
+    }
+
+    private fun matchRecordingItemForEvent(
+        items: List<com.zcam.ui.RecordingItemUi>,
+        eventEpochMs: Long
+    ): com.zcam.ui.RecordingItemUi? {
+        val directMatch = items.firstOrNull { item ->
+            eventEpochMs in item.startedAtEpochMs..item.endedAtEpochMs
+        }
+        if (directMatch != null) return directMatch
+
+        return items.minByOrNull { item ->
+            when {
+                eventEpochMs < item.startedAtEpochMs -> item.startedAtEpochMs - eventEpochMs
+                eventEpochMs > item.endedAtEpochMs -> eventEpochMs - item.endedAtEpochMs
+                else -> 0L
+            }
+        }?.takeIf { item ->
+            val distance = when {
+                eventEpochMs < item.startedAtEpochMs -> item.startedAtEpochMs - eventEpochMs
+                eventEpochMs > item.endedAtEpochMs -> eventEpochMs - item.endedAtEpochMs
+                else -> 0L
+            }
+            distance <= RECORDING_EVENT_MATCH_GRACE_MS
+        }
+    }
+
+    private fun playbackCacheFile(fileName: String): File {
+        return File(appContext.cacheDir, "zcam/playback/$fileName")
+    }
+
+    private fun cachedPlaybackUrlFor(item: com.zcam.ui.RecordingItemUi): String? {
+        val file = playbackCacheFile(item.fileName)
+        if (!file.exists() || !file.isFile) return null
+        if (item.sizeBytes > 0L && file.length() != item.sizeBytes) {
+            file.delete()
+            return null
+        }
+        return Uri.fromFile(file).toString()
+    }
+
+    private fun createRecordingDownloadDestination(item: com.zcam.ui.RecordingItemUi): RecordingDownloadDestination? {
+        val displayName = buildRecordingDownloadDisplayName(item.startedAtEpochMs)
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            createMediaStoreRecordingDownload(displayName)
+        } else {
+            createLocalRecordingDownload(displayName)
+        }
+    }
+
+    private fun createMediaStoreRecordingDownload(displayName: String): RecordingDownloadDestination? {
+        val resolver = appContext.contentResolver
+        val uniqueName = nextAvailableMediaStoreRecordingName(displayName)
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, uniqueName)
+            put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, RECORDINGS_DOWNLOAD_RELATIVE_PATH)
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return null
+        return MediaStoreRecordingDownloadDestination(
+            resolver = resolver,
+            uri = uri,
+            displayName = uniqueName
+        )
+    }
+
+    private fun nextAvailableMediaStoreRecordingName(displayName: String): String {
+        val resolver = appContext.contentResolver
+        val stem = displayName.removeSuffix(".mp4")
+        var candidate = displayName
+        var suffix = 2
+        while (true) {
+            val exists = resolver.query(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                arrayOf(MediaStore.MediaColumns._ID),
+                "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND ${MediaStore.MediaColumns.RELATIVE_PATH} = ?",
+                arrayOf(candidate, RECORDINGS_DOWNLOAD_RELATIVE_PATH),
+                null
+            )?.use { cursor -> cursor.moveToFirst() } ?: false
+            if (!exists) return candidate
+            candidate = "${stem}_$suffix.mp4"
+            suffix += 1
+        }
+    }
+
+    private fun createLocalRecordingDownload(displayName: String): RecordingDownloadDestination? {
+        val baseDir = appContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+            ?: File(appContext.filesDir, "downloads")
+        val outputDir = File(baseDir, "ZCam").apply { mkdirs() }
+        val stem = displayName.removeSuffix(".mp4")
+        var candidate = File(outputDir, displayName)
+        var suffix = 2
+        while (candidate.exists()) {
+            candidate = File(outputDir, "${stem}_$suffix.mp4")
+            suffix += 1
+        }
+        return LocalFileRecordingDownloadDestination(candidate)
+    }
+
+    private fun buildRecordingDownloadDisplayName(startedAtEpochMs: Long): String {
+        val stamp = java.time.Instant.ofEpochMilli(startedAtEpochMs)
+            .atZone(ZoneId.systemDefault())
+            .format(RECORDING_DOWNLOAD_FILE_FORMATTER)
+        return "ZCam_${stamp}.mp4"
+    }
+
+    private fun copyLocalFileWithProgress(
+        source: File,
+        destination: java.io.OutputStream,
+        onProgress: (copiedBytes: Long, totalBytes: Long?) -> Unit
+    ) {
+        source.inputStream().use { input ->
+            val totalBytes = source.length().takeIf { it > 0L }
+            val buffer = ByteArray(64 * 1024)
+            var copiedBytes = 0L
+            while (true) {
+                val read = input.read(buffer)
+                if (read <= 0) break
+                destination.write(buffer, 0, read)
+                copiedBytes += read
+                onProgress(copiedBytes, totalBytes)
+            }
+            destination.flush()
+        }
+    }
+
+    private fun pairingFailureMessage(
+        result: ClientCallResult.Failure,
+        prefix: String
+    ): String {
+        val payload = result.responseBody?.let { body ->
+            runCatching { JSONObject(body) }.getOrNull()
+        }
+        val explicitMessage = payload?.optString("message").orEmpty().ifBlank { null }
+        if (explicitMessage != null) {
+            return explicitMessage
+        }
+        if (result.reason == "pairing_locked") {
+            val retryAfterSeconds = payload
+                ?.takeIf { it.has("retryAfterSeconds") && !it.isNull("retryAfterSeconds") }
+                ?.optInt("retryAfterSeconds")
+                ?.takeIf { it > 0 }
+                ?: DEFAULT_PAIRING_COOLDOWN_SECONDS
+            return "Pairing locked. Try again in $retryAfterSeconds seconds."
+        }
+        return "$prefix: ${result.reason}"
     }
 
     private fun updateSettingsDraft(transform: SettingsUiState.() -> SettingsUiState) {
@@ -1217,6 +1838,8 @@ class ZCamMainViewModel @Inject constructor(
     }
 
     override fun onCleared() {
+        playbackLoadJob?.cancel()
+        recordingDownloadJob?.cancel()
         viewModelScope.launch(dispatchers.io) {
             localAudioTransport.stopAll()
         }
@@ -1560,16 +2183,70 @@ class ZCamMainViewModel @Inject constructor(
         val tone: StatusTone
     )
 
+    private sealed interface RecordingDownloadDestination {
+        val displayName: String
+        fun openOutputStream(): java.io.OutputStream?
+        fun commit()
+        fun abort()
+    }
+
+    private class MediaStoreRecordingDownloadDestination(
+        private val resolver: android.content.ContentResolver,
+        private val uri: Uri,
+        override val displayName: String
+    ) : RecordingDownloadDestination {
+        override fun openOutputStream(): java.io.OutputStream? {
+            return resolver.openOutputStream(uri, "w")
+        }
+
+        override fun commit() {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.IS_PENDING, 0)
+                }
+                resolver.update(uri, values, null, null)
+            }
+        }
+
+        override fun abort() {
+            resolver.delete(uri, null, null)
+        }
+    }
+
+    private class LocalFileRecordingDownloadDestination(
+        private val file: File
+    ) : RecordingDownloadDestination {
+        override val displayName: String
+            get() = file.name
+
+        override fun openOutputStream(): java.io.OutputStream? {
+            file.parentFile?.mkdirs()
+            return file.outputStream()
+        }
+
+        override fun commit() = Unit
+
+        override fun abort() {
+            file.delete()
+        }
+    }
+
     private companion object {
         const val CLIENT_STATUS_REFRESH_MS = 2_000L
         const val CLIENT_SESSION_SYNC_DEBOUNCE_MS = 250L
         const val THERMAL_REFRESH_MS = 2_500L
         const val POWER_REFRESH_MS = 10_000L
         const val PREVIEW_SNAPSHOT_REFRESH_MS = 1_500L
+        const val PREVIEW_STALE_FRAME_MS = 5_000L
         const val VOLUME_DEBOUNCE_MS = 180L
         const val PAIRING_CODE_DIGITS = 6
         const val DEFAULT_RECORDINGS_LOOKBACK_MS = 12 * 60 * 60 * 1000L
+        const val DEFAULT_PAIRING_COOLDOWN_SECONDS = 30
+        const val RECORDING_EVENT_MATCH_GRACE_MS = 2_000L
+        const val RECORDINGS_DOWNLOAD_RELATIVE_PATH = "Download/ZCam/"
         val RECORDINGS_DATE_TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+        val RECORDING_DOWNLOAD_FILE_FORMATTER: DateTimeFormatter =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss", Locale.US)
         const val INVALID_TIME_INPUT = Long.MIN_VALUE
     }
 }

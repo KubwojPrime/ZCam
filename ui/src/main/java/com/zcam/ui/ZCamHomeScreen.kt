@@ -1017,6 +1017,7 @@ private fun PreviewCard(state: ZCamUiState) {
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold
             )
+            StatusChip(label = state.previewStateLabel, tone = state.previewStateTone)
             LivePreviewSurface(
                 previewStreamUrl = state.previewStreamUrl,
                 previewLabel = state.previewLabel.ifBlank {
@@ -1144,6 +1145,7 @@ private fun PushToTalkControls(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
     ) {
         Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            StatusChip(label = state.audioRuntimeLabel, tone = state.audioRuntimeTone)
             ActiveActionButton(
                 text = if (state.pttPressed) "Push-to-talk ON" else "Push-to-talk OFF",
                 active = state.pttPressed,

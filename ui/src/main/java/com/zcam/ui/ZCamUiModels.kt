@@ -40,14 +40,19 @@ data class RecordingItemUi(
     val startedAtEpochMs: Long,
     val endedAtEpochMs: Long,
     val durationMs: Long,
-    val sizeBytes: Long
+    val sizeBytes: Long,
+    val container: String,
+    val codec: String
 )
 
 data class RecordingEventUi(
     val epochMs: Long,
     val confidencePercent: Int,
     val source: String,
-    val recordingFileName: String?
+    val recordingFileName: String?,
+    val recordingStartedAtEpochMs: Long?,
+    val recordingEndedAtEpochMs: Long?,
+    val recordingOffsetMs: Long?
 )
 
 data class RecordingsUiState(
@@ -55,11 +60,22 @@ data class RecordingsUiState(
     val toInput: String = "",
     val loading: Boolean = false,
     val resultMessage: String = "",
+    val resultTone: StatusTone = StatusTone.NEUTRAL,
     val items: List<RecordingItemUi> = emptyList(),
     val events: List<RecordingEventUi> = emptyList(),
     val selectedFileName: String = "",
     val selectedPlaybackUrl: String = "",
-    val selectedPlaybackOffsetMs: Long = 0L
+    val selectedPlaybackOffsetMs: Long = 0L,
+    val selectedPlaybackSourceLabel: String = "",
+    val playbackLoading: Boolean = false,
+    val playbackLoadingMessage: String = "",
+    val playbackDownloadedBytes: Long = 0L,
+    val playbackTotalBytes: Long? = null,
+    val activeDownloadFileName: String = "",
+    val downloadLoading: Boolean = false,
+    val downloadMessage: String = "",
+    val downloadDownloadedBytes: Long = 0L,
+    val downloadTotalBytes: Long? = null
 )
 
 data class TrustedDeviceUi(
@@ -127,6 +143,8 @@ data class ZCamUiState(
     val previewFrameJpeg: ByteArray? = null,
     val previewStreamUrl: String = "",
     val previewLabel: String = "No frame",
+    val previewStateLabel: String = "Preview idle",
+    val previewStateTone: StatusTone = StatusTone.NEUTRAL,
     val serverBatteryPercent: Int? = null,
     val serverCharging: Boolean? = null,
     val serverBatteryLabel: String = "Battery unavailable",
@@ -150,9 +168,14 @@ data class ZCamUiState(
     val clientPort: String = "8080",
     val clientReachable: Boolean = false,
     val clientStatusLabel: String = "Client disconnected",
+    val audioRuntimeLabel: String = "Audio idle",
+    val audioRuntimeTone: StatusTone = StatusTone.NEUTRAL,
     val clientTorchEnabled: Boolean = false,
     val clientNightModeEnabled: Boolean = false,
     val clientLowLightBoostSupported: Boolean = false,
+    val clientZoomLinear: Float = 0f,
+    val clientZoomRatio: Float = 1f,
+    val clientMaxZoomRatio: Float = 1f,
     val serverLanHost: String = "",
     val pairing: PairingUiState = PairingUiState(
         deviceId = "android-client",
@@ -179,6 +202,8 @@ sealed interface ZCamUiAction {
 
     data class SetTorchEnabled(val enabled: Boolean) : ZCamUiAction
     data class SetNightModeEnabled(val enabled: Boolean) : ZCamUiAction
+    data class AdjustClientZoom(val deltaLinear: Float) : ZCamUiAction
+    data object ResetClientZoom : ZCamUiAction
     data class PushToTalkChanged(val pressed: Boolean) : ZCamUiAction
     data object ToggleLiveListen : ZCamUiAction
     data class PlayQuickSound(val clipId: String, val aversive: Boolean) : ZCamUiAction
@@ -190,6 +215,7 @@ sealed interface ZCamUiAction {
         val fileName: String,
         val seekToEpochMs: Long? = null
     ) : ZCamUiAction
+    data class DownloadRecording(val fileName: String) : ZCamUiAction
 
     data object RequestPairingQr : ZCamUiAction
     data class PairingPayloadChanged(val value: String) : ZCamUiAction

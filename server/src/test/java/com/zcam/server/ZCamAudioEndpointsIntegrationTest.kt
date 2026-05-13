@@ -41,6 +41,7 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -251,6 +252,41 @@ class ZCamAudioEndpointsIntegrationTest {
     }
 
     @Test
+    fun live_audio_websocket_remains_open_past_legacy_idle_timeout() {
+        postJson(
+            path = "/api/audio/live",
+            body = """{"mode":"live","enabled":true}"""
+        ).use {
+            assertEquals(200, it.code)
+        }
+
+        val opened = CountDownLatch(1)
+        val closed = CountDownLatch(1)
+        val socket = client.newWebSocket(
+            Request.Builder()
+                .url("ws://127.0.0.1:$port/ws/audio?role=live")
+                .build(),
+            object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    opened.countDown()
+                }
+
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                    closed.countDown()
+                }
+
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    closed.countDown()
+                }
+            }
+        )
+
+        assertTrue(opened.await(5, TimeUnit.SECONDS))
+        assertFalse(closed.await(6, TimeUnit.SECONDS))
+        socket.close(1000, "done")
+    }
+
+    @Test
     fun torch_endpoint_updates_camera_controls_state() {
         val response = postJson(
             path = "/api/torch",
@@ -262,6 +298,21 @@ class ZCamAudioEndpointsIntegrationTest {
             assertEquals(200, it.code)
             assertTrue(payload.contains("\"status\":\"ok\""))
             assertTrue(payload.contains("\"torchEnabled\":true"))
+        }
+    }
+
+    @Test
+    fun zoom_endpoint_updates_camera_controls_state() {
+        val response = postJson(
+            path = "/api/zoom",
+            body = """{"linearZoom":0.5}"""
+        )
+
+        response.use {
+            val payload = it.body?.string().orEmpty()
+            assertEquals(200, it.code)
+            assertTrue(payload.contains("\"status\":\"ok\""))
+            assertTrue(payload.contains("\"zoomLinear\":0.5"))
         }
     }
 
@@ -319,6 +370,10 @@ class ZCamAudioEndpointsIntegrationTest {
             torchEnabled = false,
             nightModeEnabled = false,
             lowLightBoostSupported = true,
+            zoomLinear = 0f,
+            zoomRatio = 1f,
+            minZoomRatio = 1f,
+            maxZoomRatio = 4f,
             lastError = null
         )
         var nextNightModeFailure: CameraControlCommandResult.Failure? = null
@@ -337,6 +392,16 @@ class ZCamAudioEndpointsIntegrationTest {
             }
             snapshot = snapshot.copy(nightModeEnabled = enabled, lastError = null)
             return CameraControlCommandResult.Success(snapshot, "night mode updated")
+        }
+
+        override suspend fun setZoomLinear(linearZoom: Float): CameraControlCommandResult {
+            val clampedZoom = linearZoom.coerceIn(0f, 1f)
+            snapshot = snapshot.copy(
+                zoomLinear = clampedZoom,
+                zoomRatio = 1f + ((snapshot.maxZoomRatio - 1f) * clampedZoom),
+                lastError = null
+            )
+            return CameraControlCommandResult.Success(snapshot, "zoom updated")
         }
 
         override fun controlsSnapshot(): CameraControlsSnapshot = snapshot

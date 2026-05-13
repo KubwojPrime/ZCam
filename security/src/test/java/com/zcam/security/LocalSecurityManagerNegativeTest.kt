@@ -94,6 +94,56 @@ class LocalSecurityManagerNegativeTest {
     }
 
     @Test
+    fun repeated_failed_pairing_codes_trigger_server_cooldown_without_blocking_authenticated_clients() = runTest {
+        val manager = buildManager()
+
+        val started = manager.requestPairing(
+            deviceId = "browser-lock-test",
+            displayName = "Browser",
+            clientType = PairingClientType.WEB_BROWSER
+        )
+        assertTrue(started is PairingRequestStartResult.Success)
+        started as PairingRequestStartResult.Success
+
+        repeat(2) {
+            val failure = manager.completePairingRequest(
+                requestId = started.requestId,
+                verificationCode = "000000"
+            )
+            assertTrue(failure is PairingResult.Failure)
+            failure as PairingResult.Failure
+            assertEquals(401, failure.statusCode)
+            assertEquals("invalid_pairing_code", failure.reason)
+        }
+
+        val locked = manager.completePairingRequest(
+            requestId = started.requestId,
+            verificationCode = "000000"
+        )
+        assertTrue(locked is PairingResult.Failure)
+        locked as PairingResult.Failure
+        assertEquals(429, locked.statusCode)
+        assertEquals("pairing_locked", locked.reason)
+        assertTrue((locked.retryAfterSeconds ?: 0) >= 1)
+
+        val requestDuringCooldown = manager.requestPairing(
+            deviceId = "browser-locked-2",
+            displayName = "Browser 2",
+            clientType = PairingClientType.WEB_BROWSER
+        )
+        assertTrue(requestDuringCooldown is PairingRequestStartResult.Failure)
+        requestDuringCooldown as PairingRequestStartResult.Failure
+        assertEquals(429, requestDuringCooldown.statusCode)
+        assertEquals("pairing_locked", requestDuringCooldown.reason)
+
+        val auth = manager.authorizeRequest(
+            tokenCandidate = RuntimeSettingsDefaults.value.security.apiToken,
+            deviceId = null
+        )
+        assertTrue(auth.allowed)
+    }
+
+    @Test
     fun rotates_and_revokes_tokens_locally() = runTest {
         val manager = buildManager()
         val bootstrapToken = RuntimeSettingsDefaults.value.security.apiToken

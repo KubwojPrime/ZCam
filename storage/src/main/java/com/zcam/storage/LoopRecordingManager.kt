@@ -36,5 +36,8 @@ data class RecordingEventSummary(
     val epochMs: Long,
     val confidencePercent: Int,
     val source: String,
-    val recordingFileName: String?
+    val recordingFileName: String?,
+    val recordingStartedAtEpochMs: Long? = null,
+    val recordingEndedAtEpochMs: Long? = null,
+    val recordingOffsetMs: Long? = null
 )

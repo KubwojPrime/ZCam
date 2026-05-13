@@ -12,6 +12,10 @@ data class CameraControlsSnapshot(
     val torchEnabled: Boolean,
     val nightModeEnabled: Boolean,
     val lowLightBoostSupported: Boolean,
+    val zoomLinear: Float = 0f,
+    val zoomRatio: Float = 1f,
+    val minZoomRatio: Float = 1f,
+    val maxZoomRatio: Float = 1f,
     val lastError: String? = null
 )
 
@@ -31,5 +35,6 @@ sealed interface CameraControlCommandResult {
 interface CameraControlManager {
     suspend fun setTorch(enabled: Boolean): CameraControlCommandResult
     suspend fun setNightMode(enabled: Boolean): CameraControlCommandResult
+    suspend fun setZoomLinear(linearZoom: Float): CameraControlCommandResult
     fun controlsSnapshot(): CameraControlsSnapshot
 }

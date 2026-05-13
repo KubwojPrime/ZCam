@@ -2,6 +2,7 @@ package com.zcam.ui
 
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.Build
 import android.view.ViewGroup
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -23,6 +24,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -31,7 +33,9 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
@@ -44,6 +48,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.graphics.Color as ComposeColor
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
@@ -53,6 +58,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import java.text.DateFormat
 import java.util.Date
+import java.util.Locale
 import kotlinx.coroutines.delay
 import kotlin.math.max
 
@@ -255,6 +261,43 @@ internal fun ClientCameraControlsSection(
                     destructive = true
                 )
             }
+            val zoomRatio = state.clientZoomRatio.coerceAtLeast(1f)
+            val zoomSupported = state.clientMaxZoomRatio > 1.01f || state.clientZoomLinear > 0f
+            Text(
+                text = if (zoomSupported) {
+                    "Zoom ${String.format(Locale.US, "%.1f", zoomRatio)}x"
+                } else {
+                    "Zoom fixed at ${String.format(Locale.US, "%.1f", zoomRatio)}x"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = FontWeight.Medium
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                ActiveActionButton(
+                    text = "Zoom -",
+                    active = false,
+                    onClick = { onAction(ZCamUiAction.AdjustClientZoom(deltaLinear = -0.12f)) },
+                    modifier = Modifier.weight(1f),
+                    enabled = zoomSupported && state.clientZoomLinear > 0f
+                )
+                ActiveActionButton(
+                    text = "Reset",
+                    active = state.clientZoomLinear <= 0.01f,
+                    onClick = { onAction(ZCamUiAction.ResetClientZoom) },
+                    modifier = Modifier.weight(1f),
+                    enabled = zoomSupported
+                )
+                ActiveActionButton(
+                    text = "Zoom +",
+                    active = false,
+                    onClick = { onAction(ZCamUiAction.AdjustClientZoom(deltaLinear = 0.12f)) },
+                    modifier = Modifier.weight(1f),
+                    enabled = zoomSupported && state.clientZoomLinear < 0.99f
+                )
+            }
             Text(
                 text = if (state.clientLowLightBoostSupported) {
                     "Low-light boost available on the server camera."
@@ -337,29 +380,52 @@ internal fun RecordingsStudioScreen(
                 if (state.recordings.resultMessage.isNotBlank()) {
                     Text(
                         text = state.recordings.resultMessage,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = resultToneColor(state.recordings.resultTone)
+                    )
+                }
+                if (state.recordings.downloadMessage.isNotBlank()) {
+                    Text(
+                        text = state.recordings.downloadMessage,
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
             }
         }
 
-        RecordingPlayerCard(state = state)
+        RecordingPlayerCard(state = state, onAction = onAction)
         RecordingTimelineCard(state = state, onAction = onAction)
         RecordingSegmentsList(state = state, onAction = onAction)
     }
 }
 
 @Composable
-private fun RecordingPlayerCard(state: ZCamUiState) {
+private fun RecordingPlayerCard(
+    state: ZCamUiState,
+    onAction: (ZCamUiAction) -> Unit
+) {
     val selectedUrl = state.recordings.selectedPlaybackUrl
     val selectedOffsetMs = state.recordings.selectedPlaybackOffsetMs
     var videoViewRef by remember { mutableStateOf<VideoView?>(null) }
+    var mediaPlayerRef by remember { mutableStateOf<android.media.MediaPlayer?>(null) }
     var durationMs by remember(selectedUrl) { mutableLongStateOf(0L) }
     var positionMs by remember(selectedUrl) { mutableLongStateOf(selectedOffsetMs) }
     var scrubPositionMs by remember(selectedUrl) { mutableLongStateOf(selectedOffsetMs) }
     var scrubbing by remember { mutableStateOf(false) }
     var initialSeekMs by remember(selectedUrl, selectedOffsetMs) { mutableLongStateOf(selectedOffsetMs) }
+    var isPlaying by remember(selectedUrl) { mutableStateOf(false) }
+    var playbackSpeed by remember(selectedUrl) { mutableStateOf(1f) }
     val selectedItem = state.recordings.items.firstOrNull { it.fileName == state.recordings.selectedFileName }
+    val selectedEvents = state.recordings.events
+        .filter { it.recordingFileName == selectedItem?.fileName }
+        .sortedBy(RecordingEventUi::epochMs)
+    val effectiveDurationMs = max(durationMs, selectedItem?.durationMs ?: 0L)
+    val loadingTotalBytes = state.recordings.playbackTotalBytes
+    val loadingFraction = if (loadingTotalBytes != null && loadingTotalBytes > 0L) {
+        (state.recordings.playbackDownloadedBytes.toFloat() / loadingTotalBytes.toFloat()).coerceIn(0f, 1f)
+    } else {
+        null
+    }
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -382,7 +448,38 @@ private fun RecordingPlayerCard(state: ZCamUiState) {
                         .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(12.dp)),
                     contentAlignment = Alignment.Center
                 ) {
-                    Text("Select a recording from the timeline below.")
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        if (state.recordings.playbackLoading) {
+                            if (loadingFraction != null) {
+                                LinearProgressIndicator(
+                                    progress = loadingFraction,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 20.dp)
+                                )
+                                Text(
+                                    text = "${(loadingFraction * 100f).toInt()}% loaded",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            } else {
+                                LinearProgressIndicator(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 20.dp)
+                                )
+                            }
+                            Text(
+                                text = state.recordings.playbackLoadingMessage.ifBlank { "Loading video from server..." },
+                                style = MaterialTheme.typography.bodySmall,
+                                textAlign = TextAlign.Center
+                            )
+                        } else {
+                            Text("Select a recording from the list below.")
+                        }
+                    }
                 }
             } else {
                 AndroidView(
@@ -396,6 +493,7 @@ private fun RecordingPlayerCard(state: ZCamUiState) {
                                 ViewGroup.LayoutParams.MATCH_PARENT
                             )
                             setOnPreparedListener { mediaPlayer ->
+                                mediaPlayerRef = mediaPlayer
                                 durationMs = mediaPlayer.duration.toLong().coerceAtLeast(0L)
                                 if (initialSeekMs > 0L) {
                                     seekTo(initialSeekMs.coerceAtMost(durationMs).toInt())
@@ -403,9 +501,12 @@ private fun RecordingPlayerCard(state: ZCamUiState) {
                                     scrubPositionMs = positionMs
                                     initialSeekMs = 0L
                                 }
+                                applyPlaybackSpeed(mediaPlayer, playbackSpeed)
                                 start()
+                                isPlaying = true
                             }
                             setOnCompletionListener {
+                                isPlaying = false
                                 positionMs = durationMs
                                 scrubPositionMs = durationMs
                             }
@@ -423,6 +524,7 @@ private fun RecordingPlayerCard(state: ZCamUiState) {
                             view.stopPlayback()
                             view.setVideoURI(Uri.parse(selectedUrl))
                             view.requestFocus()
+                            isPlaying = false
                         }
                     }
                 )
@@ -434,40 +536,193 @@ private fun RecordingPlayerCard(state: ZCamUiState) {
                             positionMs = currentPosition
                             scrubPositionMs = currentPosition
                         }
+                        isPlaying = videoViewRef?.isPlaying == true
                         delay(250L)
                     }
                 }
 
-                val sliderMax = max(durationMs, 1L).toFloat()
+                if (state.recordings.playbackLoading) {
+                    if (loadingFraction != null) {
+                        LinearProgressIndicator(
+                            progress = loadingFraction,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Text(
+                            text = "${(loadingFraction * 100f).toInt()}% loaded",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    } else {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    }
+                    Text(
+                        text = state.recordings.playbackLoadingMessage.ifBlank { "Loading video from server..." },
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+
+                val sliderMax = max(effectiveDurationMs, 1L).toFloat()
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    ActiveActionButton(
+                        text = if (isPlaying) "Playing" else "Play",
+                        active = isPlaying,
+                        onClick = {
+                            videoViewRef?.start()
+                            isPlaying = true
+                        },
+                        modifier = Modifier.weight(1f),
+                        enabled = selectedUrl.isNotBlank()
+                    )
+                    ActiveActionButton(
+                        text = if (isPlaying) "Pause" else "Paused",
+                        active = !isPlaying,
+                        onClick = {
+                            videoViewRef?.pause()
+                            isPlaying = false
+                        },
+                        modifier = Modifier.weight(1f),
+                        enabled = selectedUrl.isNotBlank()
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    listOf(0.5f, 1f, 1.5f, 2f).forEach { speed ->
+                        ActiveActionButton(
+                            text = "${speed}x",
+                            active = playbackSpeed == speed,
+                            onClick = {
+                                playbackSpeed = speed
+                                mediaPlayerRef?.let { mediaPlayer -> applyPlaybackSpeed(mediaPlayer, speed) }
+                            },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+
+                if (selectedEvents.isNotEmpty() && effectiveDurationMs > 0L && selectedItem != null) {
+                    RecordingEventMarkerStrip(
+                        selectedItem = selectedItem,
+                        events = selectedEvents,
+                        onAction = onAction
+                    )
+                }
                 Slider(
-                    value = (if (scrubbing) scrubPositionMs else positionMs).coerceAtMost(durationMs).toFloat(),
+                    value = (if (scrubbing) scrubPositionMs else positionMs).coerceAtMost(effectiveDurationMs).toFloat(),
                     onValueChange = { value ->
                         scrubbing = true
                         scrubPositionMs = value.toLong()
                     },
                     onValueChangeFinished = {
-                        val target = scrubPositionMs.coerceAtMost(durationMs)
+                        val target = scrubPositionMs.coerceAtMost(effectiveDurationMs)
                         videoViewRef?.seekTo(target.toInt())
                         positionMs = target
                         scrubbing = false
                     },
                     valueRange = 0f..sliderMax
                 )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(formatDuration(positionMs), style = MaterialTheme.typography.bodySmall)
+                    Text(formatDuration(effectiveDurationMs), style = MaterialTheme.typography.bodySmall)
+                }
             }
 
             if (selectedItem != null) {
                 Text(
                     text = selectedItem.fileName,
-                    style = MaterialTheme.typography.bodyMedium,
+                    style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.SemiBold
                 )
-                Text(
-                    text = "Start ${formatDateTime(selectedItem.startedAtEpochMs)}  End ${formatDateTime(selectedItem.endedAtEpochMs)}",
-                    style = MaterialTheme.typography.bodySmall
+                RecordingMetadataRow("Date / time", formatDateTime(selectedItem.startedAtEpochMs))
+                RecordingMetadataRow("Duration", formatDuration(selectedItem.durationMs))
+                RecordingMetadataRow("File size", formatSize(selectedItem.sizeBytes))
+                RecordingMetadataRow(
+                    "Server source",
+                    state.recordings.selectedPlaybackSourceLabel.ifBlank { "LAN server" }
                 )
+                RecordingMetadataRow(
+                    "Format",
+                    "${selectedItem.container} / ${selectedItem.codec}"
+                )
+                if (state.recordings.playbackLoadingMessage.isNotBlank() && !state.recordings.playbackLoading) {
+                    Text(
+                        text = state.recordings.playbackLoadingMessage,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
             }
         }
     }
+}
+
+@Composable
+private fun RecordingMetadataRow(
+    label: String,
+    value: String
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodySmall,
+            fontWeight = FontWeight.Medium
+        )
+    }
+}
+
+@Composable
+private fun RecordingEventMarkerStrip(
+    selectedItem: RecordingItemUi,
+    events: List<RecordingEventUi>,
+    onAction: (ZCamUiAction) -> Unit
+) {
+    val durationMs = selectedItem.durationMs.coerceAtLeast(1L).toFloat()
+    BoxWithConstraints(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(28.dp)
+    ) {
+        val barWidth = maxWidth
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(8.dp)
+                .align(Alignment.Center)
+                .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(8.dp))
+        )
+        events.forEach { event ->
+            val offsetMs = event.recordingOffsetMs ?: return@forEach
+            val markerFraction = (offsetMs / durationMs).coerceIn(0f, 1f)
+            Box(
+                modifier = Modifier
+                    .width(6.dp)
+                    .height(20.dp)
+                    .background(MaterialTheme.colorScheme.error, RoundedCornerShape(6.dp))
+                    .align(Alignment.CenterStart)
+                    .offset(x = barWidth * markerFraction)
+                    .clickable {
+                        onAction(ZCamUiAction.PlayRecording(selectedItem.fileName, event.epochMs))
+                    }
+            )
+        }
+    }
+    Text(
+        text = "Event markers stay pinned to this clip timeline. Tap a marker to jump to the event.",
+        style = MaterialTheme.typography.bodySmall
+    )
 }
 
 @Composable
@@ -602,6 +857,18 @@ private fun RecordingSegmentsList(
                 return@Column
             }
             state.recordings.items.forEach { item ->
+                val downloadActive = state.recordings.downloadLoading &&
+                    state.recordings.activeDownloadFileName == item.fileName
+                val downloadFraction = if (downloadActive) {
+                    val totalBytes = state.recordings.downloadTotalBytes
+                    if (totalBytes != null && totalBytes > 0L) {
+                        (state.recordings.downloadDownloadedBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f)
+                    } else {
+                        null
+                    }
+                } else {
+                    null
+                }
                 Card(
                     modifier = Modifier.fillMaxWidth(),
                     colors = CardDefaults.cardColors(
@@ -615,19 +882,57 @@ private fun RecordingSegmentsList(
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { onAction(ZCamUiAction.PlayRecording(item.fileName)) }
                             .padding(10.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Text(item.fileName, fontWeight = FontWeight.SemiBold)
                         Text(
-                            text = "Start ${formatDateTime(item.startedAtEpochMs)}",
+                            text = "Date ${formatDateTime(item.startedAtEpochMs)}",
                             style = MaterialTheme.typography.bodySmall
                         )
                         Text(
-                            text = "Duration ${item.durationMs / 1000}s  Size ${item.sizeBytes / (1024 * 1024)} MB",
+                            text = "Duration ${formatDuration(item.durationMs)}  Size ${formatSize(item.sizeBytes)}",
                             style = MaterialTheme.typography.bodySmall
                         )
+                        Text(
+                            text = "Format ${item.container} / ${item.codec}",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        if (downloadActive) {
+                            if (downloadFraction != null) {
+                                LinearProgressIndicator(
+                                    progress = downloadFraction,
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            } else {
+                                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                            }
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            OutlinedButton(
+                                onClick = { onAction(ZCamUiAction.PlayRecording(item.fileName)) },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("Play")
+                            }
+                            Button(
+                                onClick = { onAction(ZCamUiAction.DownloadRecording(item.fileName)) },
+                                modifier = Modifier.weight(1f),
+                                enabled = !state.recordings.downloadLoading || downloadActive
+                            ) {
+                                Text(
+                                    if (downloadActive) {
+                                        downloadFraction?.let { fraction -> "Download ${(fraction * 100f).toInt()}%" }
+                                            ?: "Downloading..."
+                                    } else {
+                                        "Download"
+                                    }
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -638,4 +943,49 @@ private fun RecordingSegmentsList(
 private fun formatDateTime(epochMs: Long): String {
     return DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
         .format(Date(epochMs))
+}
+
+private fun formatDuration(durationMs: Long): String {
+    val totalSeconds = (durationMs / 1_000L).coerceAtLeast(0L)
+    val hours = totalSeconds / 3_600L
+    val minutes = (totalSeconds % 3_600L) / 60L
+    val seconds = totalSeconds % 60L
+    return if (hours > 0L) {
+        String.format("%d:%02d:%02d", hours, minutes, seconds)
+    } else {
+        String.format("%02d:%02d", minutes, seconds)
+    }
+}
+
+private fun formatSize(sizeBytes: Long): String {
+    val safeBytes = sizeBytes.coerceAtLeast(0L).toDouble()
+    val kib = 1024.0
+    val mib = kib * 1024.0
+    val gib = mib * 1024.0
+    return when {
+        safeBytes >= gib -> String.format("%.2f GB", safeBytes / gib)
+        safeBytes >= mib -> String.format("%.1f MB", safeBytes / mib)
+        safeBytes >= kib -> String.format("%.1f KB", safeBytes / kib)
+        else -> "${safeBytes.toLong()} B"
+    }
+}
+
+@Composable
+private fun resultToneColor(tone: StatusTone): ComposeColor {
+    return when (tone) {
+        StatusTone.NEUTRAL -> MaterialTheme.colorScheme.onSurfaceVariant
+        StatusTone.HEALTHY -> ComposeColor(0xFF1F7A3D)
+        StatusTone.WARNING -> MaterialTheme.colorScheme.onSecondaryContainer
+        StatusTone.ERROR -> MaterialTheme.colorScheme.error
+    }
+}
+
+private fun applyPlaybackSpeed(
+    mediaPlayer: android.media.MediaPlayer,
+    speed: Float
+) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+    runCatching {
+        mediaPlayer.playbackParams = mediaPlayer.playbackParams.setSpeed(speed)
+    }
 }

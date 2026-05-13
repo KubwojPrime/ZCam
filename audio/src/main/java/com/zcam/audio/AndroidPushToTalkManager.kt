@@ -352,15 +352,31 @@ class AndroidPushToTalkManager @Inject constructor(
 
     override suspend fun submitPushToTalkAudio(streamId: String, pcmFrame: ByteArray): Boolean =
         withContext(dispatchers.io) {
-            val queue = stateMutex.withLock {
+            var queue = stateMutex.withLock {
                 if (!engineStarted || !transmitting || activePushToTalkStreamId != streamId) {
                     return@withLock null
+                }
+                if (pushToTalkPlaybackQueue == null) {
+                    ensurePushToTalkPlaybackLocked()
                 }
                 pushToTalkPlaybackQueue
             } ?: return@withContext false
 
             if (pcmFrame.isEmpty()) return@withContext true
-            queue.trySend(pcmFrame.copyOf()).isSuccess
+            val payload = pcmFrame.copyOf()
+            if (queue.trySend(payload).isSuccess) {
+                return@withContext true
+            }
+
+            queue = stateMutex.withLock {
+                if (!engineStarted || !transmitting || activePushToTalkStreamId != streamId) {
+                    return@withLock null
+                }
+                ensurePushToTalkPlaybackLocked()
+                pushToTalkPlaybackQueue
+            } ?: return@withContext false
+
+            queue.trySend(payload).isSuccess
         }
 
     override suspend fun closePushToTalkStream(streamId: String) = withContext(dispatchers.io) {
@@ -453,6 +469,7 @@ class AndroidPushToTalkManager @Inject constructor(
     private suspend fun captureLiveAudioLoop(generation: Long) {
         val record = createAudioRecord() ?: return
         val frameBuffer = ByteArray(transportConfig.frameBytes)
+        var shouldRestart = false
         try {
             record.startRecording()
             while (coroutineContext.isActive) {
@@ -464,10 +481,7 @@ class AndroidPushToTalkManager @Inject constructor(
                 val read = record.read(frameBuffer, 0, frameBuffer.size, AudioRecord.READ_BLOCKING)
                 if (read <= 0) {
                     if (read < 0) {
-                        logger.w(
-                            LogEventId.COMPONENT_FAILED,
-                            "Live audio capture read failed code=$read"
-                        )
+                        throw IllegalStateException("live audio capture read failed code=$read")
                     }
                     delay(10L)
                     continue
@@ -499,6 +513,12 @@ class AndroidPushToTalkManager @Inject constructor(
             stateMutex.withLock {
                 if (liveCaptureGeneration == generation) {
                     liveCaptureJob = null
+                    shouldRestart = engineStarted && liveListening && liveSubscribers.isNotEmpty()
+                }
+            }
+            if (shouldRestart) {
+                stateMutex.withLock {
+                    ensureLiveCaptureLocked()
                 }
             }
         }
@@ -530,6 +550,7 @@ class AndroidPushToTalkManager @Inject constructor(
 
     private suspend fun playbackPushToTalkLoop(queue: Channel<ByteArray>, generation: Long) {
         val track = createAudioTrack() ?: return
+        var shouldRestart = false
         try {
             track.play()
             for (frame in queue) {
@@ -540,7 +561,9 @@ class AndroidPushToTalkManager @Inject constructor(
                         pushToTalkPlaybackGeneration == generation
                 }
                 if (!canWrite) break
-                writeFully(track, frame)
+                if (!writeFully(track, frame)) {
+                    throw IllegalStateException("push-to-talk audio track write failed")
+                }
             }
         } catch (error: Exception) {
             logger.w(
@@ -556,6 +579,12 @@ class AndroidPushToTalkManager @Inject constructor(
                 if (pushToTalkPlaybackGeneration == generation) {
                     pushToTalkPlaybackQueue = null
                     pushToTalkPlaybackJob = null
+                    shouldRestart = engineStarted && transmitting && !activePushToTalkStreamId.isNullOrBlank()
+                }
+            }
+            if (shouldRestart) {
+                stateMutex.withLock {
+                    ensurePushToTalkPlaybackLocked()
                 }
             }
         }
@@ -629,13 +658,14 @@ class AndroidPushToTalkManager @Inject constructor(
         }
     }
 
-    private fun writeFully(track: AudioTrack, frame: ByteArray) {
+    private fun writeFully(track: AudioTrack, frame: ByteArray): Boolean {
         var offset = 0
         while (offset < frame.size) {
             val written = track.write(frame, offset, frame.size - offset, AudioTrack.WRITE_BLOCKING)
-            if (written <= 0) break
+            if (written <= 0) return false
             offset += written
         }
+        return true
     }
 
     private companion object {

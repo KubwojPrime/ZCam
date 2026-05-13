@@ -37,6 +37,8 @@ class LocalSecurityManager @Inject constructor(
     private var sanityChecked: Boolean = false
     private val pendingRequestsById = LinkedHashMap<String, PendingPairingRequest>()
     private val pairingSessions = LinkedHashMap<String, PairingSession>()
+    private var failedPairingSecretAttempts: Int = 0
+    private var pairingCooldownUntilEpochMs: Long = 0L
 
     override suspend fun validateToken(candidate: String): Boolean {
         if (candidate.isBlank()) return false
@@ -161,6 +163,14 @@ class LocalSecurityManager @Inject constructor(
         val now = System.currentTimeMillis()
         return pairingMutex.withLock {
             purgeExpiredPairingState(now)
+            activePairingCooldownLocked(now)?.let { cooldown ->
+                return@withLock PairingRequestStartResult.Failure(
+                    statusCode = cooldown.statusCode,
+                    reason = cooldown.reason,
+                    retryAfterSeconds = cooldown.retryAfterSeconds,
+                    message = cooldown.message
+                )
+            }
 
             val requestId = randomId(REQUEST_ID_BYTES)
             val request = PendingPairingRequest(
@@ -209,12 +219,29 @@ class LocalSecurityManager @Inject constructor(
         val now = System.currentTimeMillis()
         val completion = pairingMutex.withLock {
             purgeExpiredPairingState(now)
+            activePairingCooldownLocked(now)?.let { cooldown ->
+                return@withLock PendingPairingCompletion.Failure(
+                    PairingResult.Failure(
+                        statusCode = cooldown.statusCode,
+                        reason = cooldown.reason,
+                        retryAfterSeconds = cooldown.retryAfterSeconds,
+                        message = cooldown.message
+                    )
+                )
+            }
             val pending = pendingRequestsById[normalizedRequestId]
                 ?: return@withLock PendingPairingCompletion.NotFound
             if (pending.verificationCode != normalizedCode) {
-                return@withLock PendingPairingCompletion.InvalidCode
+                return@withLock PendingPairingCompletion.Failure(
+                    registerFailedPairingAttemptLocked(
+                        now = now,
+                        invalidReason = "invalid_pairing_code",
+                        invalidMessage = "Invalid pairing code."
+                    ).toPairingFailure()
+                )
             }
             pendingRequestsById.remove(normalizedRequestId)
+            clearPairingFailureStateLocked()
             publishPendingPairingRequestsLocked()
             PendingPairingCompletion.Ready(pending)
         }
@@ -223,8 +250,8 @@ class LocalSecurityManager @Inject constructor(
             PendingPairingCompletion.NotFound -> {
                 return PairingResult.Failure(STATUS_NOT_FOUND, "pairing_request_not_found")
             }
-            PendingPairingCompletion.InvalidCode -> {
-                return PairingResult.Failure(STATUS_UNAUTHORIZED, "invalid_pairing_code")
+            is PendingPairingCompletion.Failure -> {
+                return completion.failure
             }
             is PendingPairingCompletion.Ready -> completion.request
         }
@@ -311,33 +338,57 @@ class LocalSecurityManager @Inject constructor(
         if (normalizedName.isBlank()) {
             return PairingResult.Failure(STATUS_BAD_REQUEST, "invalid_display_name")
         }
-        if (!validatePin(pin)) {
-            return PairingResult.Failure(STATUS_UNAUTHORIZED, "invalid_pin")
-        }
 
         val now = System.currentTimeMillis()
         val challengeStatus = pairingMutex.withLock {
             purgeExpiredPairingState(now)
+            activePairingCooldownLocked(now)?.let { cooldown ->
+                return@withLock PairingChallengeStatus.Failure(
+                    PairingResult.Failure(
+                        statusCode = cooldown.statusCode,
+                        reason = cooldown.reason,
+                        retryAfterSeconds = cooldown.retryAfterSeconds,
+                        message = cooldown.message
+                    )
+                )
+            }
+            val currentPin = runtimeSettingsRepository.settings.first().security.pinCode
+            if (currentPin != pin) {
+                return@withLock PairingChallengeStatus.Failure(
+                    registerFailedPairingAttemptLocked(
+                        now = now,
+                        invalidReason = "invalid_pin",
+                        invalidMessage = "Invalid pairing PIN."
+                    ).toPairingFailure()
+                )
+            }
             val session = pairingSessions[sessionId]
                 ?: return@withLock PairingChallengeStatus.NOT_FOUND
             if (session.consumed) {
                 return@withLock PairingChallengeStatus.REPLAY
             }
             if (session.pairingCode != pairingCode) {
-                return@withLock PairingChallengeStatus.INVALID_CODE
+                return@withLock PairingChallengeStatus.Failure(
+                    registerFailedPairingAttemptLocked(
+                        now = now,
+                        invalidReason = "invalid_pairing_code",
+                        invalidMessage = "Invalid pairing code."
+                    ).toPairingFailure()
+                )
             }
             session.copy(consumed = true).also { updated ->
                 pairingSessions[sessionId] = updated
             }
+            clearPairingFailureStateLocked()
             PairingChallengeStatus.OK
         }
 
         when (challengeStatus) {
+            is PairingChallengeStatus.Failure -> {
+                return challengeStatus.failure
+            }
             PairingChallengeStatus.NOT_FOUND -> {
                 return PairingResult.Failure(STATUS_NOT_FOUND, "pairing_session_not_found")
-            }
-            PairingChallengeStatus.INVALID_CODE -> {
-                return PairingResult.Failure(STATUS_UNAUTHORIZED, "invalid_pairing_code")
             }
             PairingChallengeStatus.REPLAY -> {
                 logger.w(LogEventId.SECURITY_PAIRING_REPLAY_BLOCKED, "Pairing replay blocked sid=$sessionId")
@@ -584,6 +635,55 @@ class LocalSecurityManager @Inject constructor(
         }
     }
 
+    private fun activePairingCooldownLocked(now: Long): PairingFailureInfo? {
+        if (pairingCooldownUntilEpochMs <= now) {
+            pairingCooldownUntilEpochMs = 0L
+            return null
+        }
+        val remainingMs = (pairingCooldownUntilEpochMs - now).coerceAtLeast(0L)
+        val retryAfterSeconds = ((remainingMs + 999L) / 1_000L).toInt().coerceAtLeast(1)
+        return PairingFailureInfo(
+            statusCode = STATUS_TOO_MANY_REQUESTS,
+            reason = "pairing_locked",
+            retryAfterSeconds = retryAfterSeconds,
+            message = "Pairing locked. Try again in $retryAfterSeconds seconds."
+        )
+    }
+
+    private fun registerFailedPairingAttemptLocked(
+        now: Long,
+        invalidReason: String,
+        invalidMessage: String
+    ): PairingFailureInfo {
+        failedPairingSecretAttempts = (failedPairingSecretAttempts + 1).coerceAtLeast(1)
+        if (failedPairingSecretAttempts >= PAIRING_FAILURE_LIMIT) {
+            failedPairingSecretAttempts = 0
+            pairingCooldownUntilEpochMs = now + PAIRING_COOLDOWN_MS
+            logger.w(
+                LogEventId.SECURITY_AUTH_REJECTED,
+                "Pairing locked for ${PAIRING_COOLDOWN_MS / 1_000L}s after repeated failures"
+            )
+            return activePairingCooldownLocked(now)
+                ?: PairingFailureInfo(
+                    statusCode = STATUS_TOO_MANY_REQUESTS,
+                    reason = "pairing_locked",
+                    retryAfterSeconds = (PAIRING_COOLDOWN_MS / 1_000L).toInt(),
+                    message = "Pairing locked. Try again in ${PAIRING_COOLDOWN_MS / 1_000L} seconds."
+                )
+        }
+        return PairingFailureInfo(
+            statusCode = STATUS_UNAUTHORIZED,
+            reason = invalidReason,
+            retryAfterSeconds = null,
+            message = invalidMessage
+        )
+    }
+
+    private fun clearPairingFailureStateLocked() {
+        failedPairingSecretAttempts = 0
+        pairingCooldownUntilEpochMs = 0L
+    }
+
     private fun publishPendingPairingRequestsLocked() {
         pendingPairingRequestsState.value = pendingRequestsById.values
             .sortedByDescending(PendingPairingRequest::createdAtEpochMs)
@@ -611,17 +711,33 @@ class LocalSecurityManager @Inject constructor(
         val tokenValue: String
     )
 
-    private enum class PairingChallengeStatus {
-        OK,
-        NOT_FOUND,
-        INVALID_CODE,
-        REPLAY
+    private sealed interface PairingChallengeStatus {
+        data object OK : PairingChallengeStatus
+        data object NOT_FOUND : PairingChallengeStatus
+        data object REPLAY : PairingChallengeStatus
+        data class Failure(val failure: PairingResult.Failure) : PairingChallengeStatus
     }
 
     private sealed interface PendingPairingCompletion {
         data object NotFound : PendingPairingCompletion
-        data object InvalidCode : PendingPairingCompletion
+        data class Failure(val failure: PairingResult.Failure) : PendingPairingCompletion
         data class Ready(val request: PendingPairingRequest) : PendingPairingCompletion
+    }
+
+    private data class PairingFailureInfo(
+        val statusCode: Int,
+        val reason: String,
+        val retryAfterSeconds: Int?,
+        val message: String?
+    ) {
+        fun toPairingFailure(): PairingResult.Failure {
+            return PairingResult.Failure(
+                statusCode = statusCode,
+                reason = reason,
+                retryAfterSeconds = retryAfterSeconds,
+                message = message
+            )
+        }
     }
 
     private companion object {
@@ -636,8 +752,11 @@ class LocalSecurityManager @Inject constructor(
         const val STATUS_FORBIDDEN = 403
         const val STATUS_NOT_FOUND = 404
         const val STATUS_CONFLICT = 409
+        const val STATUS_TOO_MANY_REQUESTS = 429
 
         const val PAIRING_TTL_MS = 120_000L
+        const val PAIRING_FAILURE_LIMIT = 3
+        const val PAIRING_COOLDOWN_MS = 30_000L
         const val PAIRING_CODE_DIGITS = 6
         const val REQUEST_ID_BYTES = 9
         const val SESSION_ID_BYTES = 9

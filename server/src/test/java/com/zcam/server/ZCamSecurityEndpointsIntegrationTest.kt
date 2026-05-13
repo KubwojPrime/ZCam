@@ -206,6 +206,55 @@ class ZCamSecurityEndpointsIntegrationTest {
         }
     }
 
+    @Test
+    fun pairing_code_failures_trigger_cooldown_on_public_pairing_endpoints_only() {
+        val requestResponseBody = postJson(
+            "/api/security/pair/request",
+            """{"deviceId":"browser-lock","displayName":"Browser","clientType":"web_browser"}"""
+        ).use {
+            assertEquals(200, it.code)
+            it.body?.string().orEmpty()
+        }
+        val requestId = extractJsonString(requestResponseBody, "requestId")
+
+        repeat(2) {
+            postJson(
+                "/api/security/pair/complete",
+                """{"requestId":"$requestId","verificationCode":"000000"}"""
+            ).use {
+                assertEquals(401, it.code)
+                assertTrue(it.body?.string().orEmpty().contains("invalid_pairing_code"))
+            }
+        }
+
+        val lockedBody = postJson(
+            "/api/security/pair/complete",
+            """{"requestId":"$requestId","verificationCode":"000000"}"""
+        ).use {
+            assertEquals(429, it.code)
+            it.body?.string().orEmpty()
+        }
+        assertTrue(lockedBody.contains("pairing_locked"))
+        assertTrue(lockedBody.contains("retryAfterSeconds"))
+
+        postJson(
+            "/api/security/pair/request",
+            """{"deviceId":"browser-lock-2","displayName":"Browser 2","clientType":"web_browser"}"""
+        ).use {
+            assertEquals(429, it.code)
+            assertTrue(it.body?.string().orEmpty().contains("pairing_locked"))
+        }
+
+        val statusRequest = Request.Builder()
+            .url("http://127.0.0.1:$port/api/status")
+            .get()
+            .header("X-ZCam-Token", RuntimeSettingsDefaults.value.security.apiToken)
+            .build()
+        client.newCall(statusRequest).execute().use {
+            assertEquals(200, it.code)
+        }
+    }
+
     private fun postJson(path: String, body: String) = client.newCall(
         Request.Builder()
             .url("http://127.0.0.1:$port$path")
@@ -245,6 +294,10 @@ class ZCamSecurityEndpointsIntegrationTest {
             torchEnabled = false,
             nightModeEnabled = false,
             lowLightBoostSupported = true,
+            zoomLinear = 0f,
+            zoomRatio = 1f,
+            minZoomRatio = 1f,
+            maxZoomRatio = 4f,
             lastError = null
         )
 
@@ -255,6 +308,16 @@ class ZCamSecurityEndpointsIntegrationTest {
 
         override suspend fun setNightMode(enabled: Boolean): CameraControlCommandResult {
             snapshot = snapshot.copy(nightModeEnabled = enabled, lastError = null)
+            return CameraControlCommandResult.Success(snapshot, "ok")
+        }
+
+        override suspend fun setZoomLinear(linearZoom: Float): CameraControlCommandResult {
+            val clampedZoom = linearZoom.coerceIn(0f, 1f)
+            snapshot = snapshot.copy(
+                zoomLinear = clampedZoom,
+                zoomRatio = 1f + ((snapshot.maxZoomRatio - 1f) * clampedZoom),
+                lastError = null
+            )
             return CameraControlCommandResult.Success(snapshot, "ok")
         }
 

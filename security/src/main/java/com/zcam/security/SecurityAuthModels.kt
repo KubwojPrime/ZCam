@@ -25,7 +25,9 @@ sealed interface PairingRequestStartResult {
 
     data class Failure(
         val statusCode: Int,
-        val reason: String
+        val reason: String,
+        val retryAfterSeconds: Int? = null,
+        val message: String? = null
     ) : PairingRequestStartResult
 }
 
@@ -64,7 +66,9 @@ sealed interface PairingResult {
 
     data class Failure(
         val statusCode: Int,
-        val reason: String
+        val reason: String,
+        val retryAfterSeconds: Int? = null,
+        val message: String? = null
     ) : PairingResult
 }
 

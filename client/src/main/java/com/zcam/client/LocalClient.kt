@@ -1,5 +1,7 @@
 package com.zcam.client
 
+import java.io.OutputStream
+
 data class ClientTarget(
     val host: String,
     val port: Int,
@@ -17,6 +19,10 @@ data class ClientServerStatus(
     val torchEnabled: Boolean,
     val nightModeEnabled: Boolean,
     val lowLightBoostSupported: Boolean,
+    val zoomLinear: Float,
+    val zoomRatio: Float,
+    val minZoomRatio: Float,
+    val maxZoomRatio: Float,
     val audioTransmitting: Boolean,
     val audioLiveListening: Boolean,
     val audioPlayingBack: Boolean,
@@ -61,7 +67,10 @@ data class ClientRecordingEvent(
     val epochMs: Long,
     val confidencePercent: Int,
     val source: String,
-    val recordingFileName: String?
+    val recordingFileName: String?,
+    val recordingStartedAtEpochMs: Long?,
+    val recordingEndedAtEpochMs: Long?,
+    val recordingOffsetMs: Long?
 )
 
 sealed interface ClientCallResult<out T> {
@@ -83,6 +92,7 @@ interface LocalClient {
     suspend fun setLiveListen(target: ClientTarget, enabled: Boolean): ClientCallResult<Unit>
     suspend fun setTorch(target: ClientTarget, enabled: Boolean): ClientCallResult<Unit>
     suspend fun setNightMode(target: ClientTarget, enabled: Boolean): ClientCallResult<Unit>
+    suspend fun setZoomLinear(target: ClientTarget, linearZoom: Float): ClientCallResult<Unit>
     suspend fun playQuickSound(
         target: ClientTarget,
         clipId: String,
@@ -128,4 +138,11 @@ interface LocalClient {
     ): ClientCallResult<List<ClientRecordingEvent>>
 
     fun buildRecordingPlaybackUrl(target: ClientTarget, fileName: String): String
+
+    suspend fun downloadRecording(
+        target: ClientTarget,
+        fileName: String,
+        destination: OutputStream,
+        onProgress: (downloadedBytes: Long, totalBytes: Long?) -> Unit = { _, _ -> }
+    ): ClientCallResult<Unit>
 }

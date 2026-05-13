@@ -7,6 +7,8 @@ import android.graphics.YuvImage
 import android.os.Environment
 import android.os.SystemClock
 import android.util.Size
+import android.view.OrientationEventListener
+import android.view.Surface
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.CameraControl
 import androidx.camera.core.ImageAnalysis
@@ -84,6 +86,22 @@ class CameraRuntimeImpl @Inject constructor(
     private val nightModeEnabled = AtomicBoolean(false)
     private val lowLightBoostSupported = AtomicBoolean(false)
     private val lastControlError = AtomicReference<String?>(null)
+    private val desiredZoomLinear = AtomicReference(0f)
+    private val zoomLinear = AtomicReference(0f)
+    private val zoomRatio = AtomicReference(1f)
+    private val minZoomRatio = AtomicReference(1f)
+    private val maxZoomRatio = AtomicReference(1f)
+    private val recordingTargetRotation = AtomicInteger(Surface.ROTATION_90)
+    private val deviceOrientationDegrees = AtomicInteger(OrientationEventListener.ORIENTATION_UNKNOWN)
+    private val orientationListener by lazy {
+        object : OrientationEventListener(appContext) {
+            override fun onOrientationChanged(orientation: Int) {
+                if (orientation != OrientationEventListener.ORIENTATION_UNKNOWN) {
+                    deviceOrientationDegrees.set(orientation)
+                }
+            }
+        }
+    }
 
     @Volatile
     private var cameraProvider: ProcessCameraProvider? = null
@@ -120,6 +138,7 @@ class CameraRuntimeImpl @Inject constructor(
             nightModeEnabled.set(false)
             lowLightBoostSupported.set(false)
             lastControlError.set(null)
+            enableOrientationTracking()
 
             val provider = awaitCameraProvider()
             val encoder = Nv21JpegEncoder()
@@ -129,6 +148,11 @@ class CameraRuntimeImpl @Inject constructor(
                 height = config.resolution.height,
                 fps = normalizedFps
             )
+            val targetRotation = determineStableTargetRotation(
+                width = config.resolution.width,
+                height = config.resolution.height
+            )
+            recordingTargetRotation.set(targetRotation)
 
             runOnMainExecutor {
                 lifecycleOwner.moveToStarted()
@@ -136,6 +160,7 @@ class CameraRuntimeImpl @Inject constructor(
 
                 val preview = Preview.Builder()
                     .setTargetResolution(Size(config.resolution.width, config.resolution.height))
+                    .setTargetRotation(targetRotation)
                     .build()
                     .also { useCase ->
                         useCase.setSurfaceProvider { request -> request.willNotProvideSurface() }
@@ -155,7 +180,9 @@ class CameraRuntimeImpl @Inject constructor(
                         )
                     )
                     .build()
-                val videoCapture = VideoCapture.withOutput(recorder)
+                val videoCapture = VideoCapture.withOutput(recorder).also { useCase ->
+                    useCase.targetRotation = targetRotation
+                }
 
                 analysis.setAnalyzer(cameraExecutor) { image ->
                     analyzeFrame(image, encoder, minFrameIntervalMs)
@@ -192,6 +219,16 @@ class CameraRuntimeImpl @Inject constructor(
             }
 
             cameraProvider = provider
+            boundCamera?.let { camera ->
+                runCatching {
+                    syncZoomStateFromCamera(camera)
+                    applyZoomToCamera(camera, desiredZoomLinear.get())
+                }.onFailure { error ->
+                    lastControlError.set(error.message ?: "zoom init failed")
+                    logger.w("Camera zoom init failed: ${error.message}")
+                    syncZoomStateFromCamera(camera)
+                }
+            }
             running.set(true)
             logger.i("Camera runtime started (${config.resolution.width}x${config.resolution.height}@$normalizedFps)")
         }
@@ -224,6 +261,7 @@ class CameraRuntimeImpl @Inject constructor(
                 boundCamera = null
                 cameraProvider = null
             }
+            disableOrientationTracking()
             analysisEnabled.set(false)
             torchEnabled.set(false)
             nightModeEnabled.set(false)
@@ -246,6 +284,10 @@ class CameraRuntimeImpl @Inject constructor(
             torchEnabled = torchEnabled.get(),
             nightModeEnabled = nightModeEnabled.get(),
             lowLightBoostSupported = lowLightBoostSupported.get(),
+            zoomLinear = zoomLinear.get().coerceIn(0f, 1f),
+            zoomRatio = zoomRatio.get().coerceAtLeast(1f),
+            minZoomRatio = minZoomRatio.get().coerceAtLeast(1f),
+            maxZoomRatio = maxZoomRatio.get().coerceAtLeast(minZoomRatio.get().coerceAtLeast(1f)),
             lastError = lastControlError.get()
         )
     }
@@ -319,6 +361,28 @@ class CameraRuntimeImpl @Inject constructor(
         }
     }
 
+    override suspend fun setZoomLinear(linearZoom: Float): CameraControlCommandResult = withContext(dispatchers.io) {
+        val camera = boundCamera
+        if (!running.get() || camera == null) {
+            return@withContext failureResult(
+                code = CameraControlErrorCode.ENGINE_NOT_READY,
+                message = "camera runtime is not active"
+            )
+        }
+
+        val clampedZoom = linearZoom.coerceIn(0f, 1f)
+        runCatching {
+            applyZoomToCamera(camera, clampedZoom)
+            lastControlError.set(null)
+            CameraControlCommandResult.Success(
+                snapshot = controlsSnapshot(),
+                message = if (clampedZoom <= 0f) "zoom reset" else "zoom updated"
+            )
+        }.getOrElse { error ->
+            mapCameraControlFailure(error, fallbackCode = CameraControlErrorCode.INTERNAL_ERROR)
+        }
+    }
+
     override fun latestFrame(): ByteArray = latest.get()
 
     override fun snapshot(): FramePipelineStatus = FramePipelineStatus(
@@ -338,6 +402,7 @@ class CameraRuntimeImpl @Inject constructor(
 
             val videoCapture = videoCaptureUseCase ?: error("VideoCapture is not bound.")
             outputFile.parentFile?.mkdirs()
+            videoCapture.targetRotation = recordingTargetRotation.get()
 
             val finalizeDeferred = CompletableDeferred<VideoSegmentResult>()
             activeRecordingFinalize = finalizeDeferred
@@ -475,6 +540,91 @@ class CameraRuntimeImpl @Inject constructor(
             code = code,
             message = error.message ?: "camera control failure"
         )
+    }
+
+    private suspend fun applyZoomToCamera(
+        camera: androidx.camera.core.Camera,
+        linearZoom: Float
+    ) {
+        val clampedZoom = linearZoom.coerceIn(0f, 1f)
+        desiredZoomLinear.set(clampedZoom)
+        awaitFuture(camera.cameraControl.setLinearZoom(clampedZoom))
+        syncZoomStateFromCamera(camera, fallbackLinear = clampedZoom)
+    }
+
+    private fun syncZoomStateFromCamera(
+        camera: androidx.camera.core.Camera,
+        fallbackLinear: Float = desiredZoomLinear.get()
+    ) {
+        val zoomState = camera.cameraInfo.zoomState.value
+        zoomLinear.set(zoomState?.linearZoom?.coerceIn(0f, 1f) ?: fallbackLinear.coerceIn(0f, 1f))
+        zoomRatio.set(zoomState?.zoomRatio?.coerceAtLeast(1f) ?: 1f)
+        minZoomRatio.set(zoomState?.minZoomRatio?.coerceAtLeast(1f) ?: 1f)
+        maxZoomRatio.set(zoomState?.maxZoomRatio?.coerceAtLeast(minZoomRatio.get()) ?: minZoomRatio.get())
+    }
+
+    private fun enableOrientationTracking() {
+        runCatching {
+            if (orientationListener.canDetectOrientation()) {
+                orientationListener.enable()
+            }
+        }
+    }
+
+    private fun disableOrientationTracking() {
+        runCatching { orientationListener.disable() }
+    }
+
+    private fun determineStableTargetRotation(
+        width: Int,
+        height: Int
+    ): Int {
+        val orientationDegrees = deviceOrientationDegrees.get()
+        val prefersLandscape = width >= height
+        return if (prefersLandscape) {
+            nearestRotation(
+                orientationDegrees = orientationDegrees,
+                candidates = intArrayOf(Surface.ROTATION_90, Surface.ROTATION_270),
+                fallback = Surface.ROTATION_90
+            )
+        } else {
+            nearestRotation(
+                orientationDegrees = orientationDegrees,
+                candidates = intArrayOf(Surface.ROTATION_0, Surface.ROTATION_180),
+                fallback = Surface.ROTATION_0
+            )
+        }
+    }
+
+    private fun nearestRotation(
+        orientationDegrees: Int,
+        candidates: IntArray,
+        fallback: Int
+    ): Int {
+        if (orientationDegrees !in 0..359) return fallback
+        return candidates.minByOrNull { candidate ->
+            angularDistanceDegrees(
+                orientationDegrees = orientationDegrees,
+                candidateDegrees = rotationToDegrees(candidate)
+            )
+        } ?: fallback
+    }
+
+    private fun angularDistanceDegrees(
+        orientationDegrees: Int,
+        candidateDegrees: Int
+    ): Int {
+        val rawDistance = kotlin.math.abs(orientationDegrees - candidateDegrees)
+        return minOf(rawDistance, 360 - rawDistance)
+    }
+
+    private fun rotationToDegrees(rotation: Int): Int {
+        return when (rotation) {
+            Surface.ROTATION_90 -> 90
+            Surface.ROTATION_180 -> 180
+            Surface.ROTATION_270 -> 270
+            else -> 0
+        }
     }
 
     private suspend fun <T> awaitFuture(future: ListenableFuture<T>): T {

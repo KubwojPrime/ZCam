@@ -2,6 +2,8 @@ package com.zcam.client
 
 import com.zcam.core.dispatchers.DispatcherProvider
 import com.zcam.core.logging.ZCamLogger
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -10,6 +12,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.json.JSONObject
 import org.json.JSONArray
+import java.io.OutputStream
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import javax.inject.Inject
@@ -51,6 +54,10 @@ class OkHttpLocalClient @Inject constructor(
                 torchEnabled = cameraControls?.optBoolean("torchEnabled") ?: false,
                 nightModeEnabled = cameraControls?.optBoolean("nightModeEnabled") ?: false,
                 lowLightBoostSupported = cameraControls?.optBoolean("lowLightBoostSupported") ?: false,
+                zoomLinear = cameraControls?.optDouble("zoomLinear")?.toFloat() ?: 0f,
+                zoomRatio = cameraControls?.optDouble("zoomRatio")?.toFloat() ?: 1f,
+                minZoomRatio = cameraControls?.optDouble("minZoomRatio")?.toFloat() ?: 1f,
+                maxZoomRatio = cameraControls?.optDouble("maxZoomRatio")?.toFloat() ?: 1f,
                 audioTransmitting = audio?.optBoolean("transmitting") ?: false,
                 audioLiveListening = audio?.optBoolean("liveListening") ?: false,
                 audioPlayingBack = audio?.optBoolean("playingBack") ?: false,
@@ -131,6 +138,13 @@ class OkHttpLocalClient @Inject constructor(
             .put("enabled", enabled)
             .toString()
         return executeAction(target, "/api/nightmode", payload)
+    }
+
+    override suspend fun setZoomLinear(target: ClientTarget, linearZoom: Float): ClientCallResult<Unit> {
+        val payload = JSONObject()
+            .put("linearZoom", linearZoom.coerceIn(0f, 1f).toDouble())
+            .toString()
+        return executeAction(target, "/api/zoom", payload)
     }
 
     override suspend fun playQuickSound(
@@ -361,7 +375,10 @@ class OkHttpLocalClient @Inject constructor(
                                     epochMs = item.optLong("epochMs"),
                                     confidencePercent = item.optInt("confidencePercent"),
                                     source = item.optString("source"),
-                                    recordingFileName = item.optString("recordingFileName").ifBlank { null }
+                                    recordingFileName = item.optString("recordingFileName").ifBlank { null },
+                                    recordingStartedAtEpochMs = item.optNullableLong("recordingStartedAtEpochMs"),
+                                    recordingEndedAtEpochMs = item.optNullableLong("recordingEndedAtEpochMs"),
+                                    recordingOffsetMs = item.optNullableLong("recordingOffsetMs")
                                 )
                             )
                         }
@@ -391,6 +408,58 @@ class OkHttpLocalClient @Inject constructor(
             }
         }.joinToString("&")
         return if (query.isBlank()) base else "$base?$query"
+    }
+
+    override suspend fun downloadRecording(
+        target: ClientTarget,
+        fileName: String,
+        destination: OutputStream,
+        onProgress: (downloadedBytes: Long, totalBytes: Long?) -> Unit
+    ): ClientCallResult<Unit> = withContext(dispatchers.io) {
+        val request = recordingDownloadRequest(target, fileName)
+        runCatching {
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    val bodyString = response.body?.string().orEmpty()
+                    return@use ClientCallResult.Failure(
+                        code = response.code,
+                        reason = extractErrorReason(bodyString) ?: "http_${response.code}",
+                        responseBody = bodyString
+                    )
+                }
+
+                val totalBytes = response.body?.contentLength()?.takeIf { it >= 0L }
+                val source = response.body?.byteStream()
+                    ?: return@use ClientCallResult.Failure(
+                        code = response.code,
+                        reason = "empty_body"
+                    )
+
+                source.use { input ->
+                    destination.use { output ->
+                        val buffer = ByteArray(DOWNLOAD_BUFFER_BYTES)
+                        var downloadedBytes = 0L
+                        while (true) {
+                            currentCoroutineContext().ensureActive()
+                            val read = input.read(buffer)
+                            if (read <= 0) break
+                            output.write(buffer, 0, read)
+                            downloadedBytes += read
+                            onProgress(downloadedBytes, totalBytes)
+                        }
+                        output.flush()
+                    }
+                }
+                ClientCallResult.Success(Unit)
+            }
+        }.getOrElse { error ->
+            logger.w("Recording download failed: ${error.message}")
+            ClientCallResult.Failure(
+                code = null,
+                reason = "io_error",
+                responseBody = error.message
+            )
+        }
     }
 
     private suspend fun executeAction(
@@ -473,6 +542,16 @@ class OkHttpLocalClient @Inject constructor(
         return builder
     }
 
+    private fun recordingDownloadRequest(
+        target: ClientTarget,
+        fileName: String
+    ): Request {
+        val encodedName = URLEncoder.encode(fileName, StandardCharsets.UTF_8.name())
+        return requestBuilder(target, "/api/recordings/$encodedName")
+            .get()
+            .build()
+    }
+
     private fun extractErrorReason(body: String): String? {
         if (body.isBlank()) return null
         return runCatching {
@@ -489,6 +568,10 @@ class OkHttpLocalClient @Inject constructor(
         return if (has(name) && !isNull(name)) optBoolean(name) else null
     }
 
+    private fun JSONObject.optNullableLong(name: String): Long? {
+        return if (has(name) && !isNull(name)) optLong(name) else null
+    }
+
     private enum class HttpMethod {
         GET,
         POST
@@ -496,5 +579,6 @@ class OkHttpLocalClient @Inject constructor(
 
     private companion object {
         val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
+        const val DOWNLOAD_BUFFER_BYTES = 64 * 1024
     }
 }

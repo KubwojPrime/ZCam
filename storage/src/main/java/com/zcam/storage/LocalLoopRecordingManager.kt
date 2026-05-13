@@ -168,14 +168,18 @@ class LocalLoopRecordingManager @Inject constructor(
             }
         }
         return@withContext events.map { event ->
-            val recordingFileName = catalog.segments.firstOrNull { segment ->
-                event.epochMs in segment.startedAtEpochMs..segment.endedAtEpochMs
-            }?.fileName
+            val matchedSegment = matchSegmentForEvent(catalog.segments, event.epochMs)
             RecordingEventSummary(
                 epochMs = event.epochMs,
                 confidencePercent = event.confidencePercent,
                 source = event.source,
-                recordingFileName = recordingFileName
+                recordingFileName = matchedSegment?.fileName,
+                recordingStartedAtEpochMs = matchedSegment?.startedAtEpochMs,
+                recordingEndedAtEpochMs = matchedSegment?.endedAtEpochMs,
+                recordingOffsetMs = matchedSegment?.let { segment ->
+                    (event.epochMs - segment.startedAtEpochMs)
+                        .coerceIn(0L, (segment.endedAtEpochMs - segment.startedAtEpochMs).coerceAtLeast(0L))
+                }
             )
         }
     }
@@ -379,6 +383,31 @@ class LocalLoopRecordingManager @Inject constructor(
     }
     private fun indexFile(recordingDir: File): File = File(recordingDir, "recording_index_v1.tsv")
 
+    private fun matchSegmentForEvent(
+        segments: List<RecordingSegmentEntry>,
+        eventEpochMs: Long
+    ): RecordingSegmentEntry? {
+        val directMatch = segments.firstOrNull { segment ->
+            eventEpochMs in segment.startedAtEpochMs..segment.endedAtEpochMs
+        }
+        if (directMatch != null) return directMatch
+
+        return segments.minByOrNull { segment ->
+            when {
+                eventEpochMs < segment.startedAtEpochMs -> segment.startedAtEpochMs - eventEpochMs
+                eventEpochMs > segment.endedAtEpochMs -> eventEpochMs - segment.endedAtEpochMs
+                else -> 0L
+            }
+        }?.takeIf { segment ->
+            val distance = when {
+                eventEpochMs < segment.startedAtEpochMs -> segment.startedAtEpochMs - eventEpochMs
+                eventEpochMs > segment.endedAtEpochMs -> eventEpochMs - segment.endedAtEpochMs
+                else -> 0L
+            }
+            distance <= EVENT_SEGMENT_GRACE_MS
+        }
+    }
+
     private class StorageHeadroomException(message: String) : IllegalStateException(message)
 
     private companion object {
@@ -386,6 +415,7 @@ class LocalLoopRecordingManager @Inject constructor(
         const val BASE_OUT_OF_SPACE_BACKOFF_MS = 1_500L
         const val MAX_RECORDINGS_QUERY_LIMIT = 500
         const val MAX_RECORDING_EVENTS_QUERY_LIMIT = 1_000
+        const val EVENT_SEGMENT_GRACE_MS = 2_000L
         val RECORDING_FILE_NAME_REGEX = Regex("^[A-Za-z0-9._-]{1,128}\\.mp4$")
     }
 }

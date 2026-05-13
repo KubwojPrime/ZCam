@@ -103,7 +103,7 @@ class ZCamHttpServer @Inject constructor(
             }
         }
 
-        httpServer.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
+        httpServer.start(HTTP_SOCKET_READ_TIMEOUT_MS, false)
         startedAtEpochMs.set(System.currentTimeMillis())
         server = httpServer
         logger.i(LogEventId.COMPONENT_HEALTHY, "HTTP server started on port $activePort")
@@ -293,6 +293,7 @@ class ZCamHttpServer @Inject constructor(
             "/snapshot.jpg" -> buildSnapshotResponse()
             "/api/torch" -> handleTorchEndpoint(session)
             "/api/nightmode" -> handleNightModeEndpoint(session)
+            "/api/zoom" -> handleZoomEndpoint(session)
             "/api/audio/live" -> handleAudioLiveEndpoint(session)
             "/api/audio/play" -> handleAudioPlayEndpoint(session)
             "/api/volume" -> handleVolumeEndpoint(session)
@@ -340,13 +341,12 @@ class ZCamHttpServer @Inject constructor(
                 }
                 NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, JSON_UTF8, body)
             }
-            is PairingRequestStartResult.Failure -> {
-                NanoHTTPD.newFixedLengthResponse(
-                    toStatus(result.statusCode),
-                    JSON_UTF8,
-                    "{\"status\":\"error\",\"reason\":${jsonString(result.reason)}}"
-                )
-            }
+            is PairingRequestStartResult.Failure -> pairingFailureResponse(
+                statusCode = result.statusCode,
+                reason = result.reason,
+                retryAfterSeconds = result.retryAfterSeconds,
+                message = result.message
+            )
         }
     }
 
@@ -369,13 +369,7 @@ class ZCamHttpServer @Inject constructor(
             )
         }) {
             is PairingResult.Success -> pairingSuccessResponse(result)
-            is PairingResult.Failure -> {
-                NanoHTTPD.newFixedLengthResponse(
-                    toStatus(result.statusCode),
-                    JSON_UTF8,
-                    "{\"status\":\"error\",\"reason\":${jsonString(result.reason)}}"
-                )
-            }
+            is PairingResult.Failure -> pairingFailureResponse(result)
         }
     }
 
@@ -431,13 +425,7 @@ class ZCamHttpServer @Inject constructor(
             )
         }) {
             is PairingResult.Success -> pairingSuccessResponse(result)
-            is PairingResult.Failure -> {
-                NanoHTTPD.newFixedLengthResponse(
-                    toStatus(result.statusCode),
-                    JSON_UTF8,
-                    "{\"status\":\"error\",\"reason\":${jsonString(result.reason)}}"
-                )
-            }
+            is PairingResult.Failure -> pairingFailureResponse(result)
         }
     }
 
@@ -451,6 +439,38 @@ class ZCamHttpServer @Inject constructor(
             append('}')
         }
         return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, JSON_UTF8, body)
+    }
+
+    private fun pairingFailureResponse(result: PairingResult.Failure): NanoHTTPD.Response {
+        return pairingFailureResponse(
+            statusCode = result.statusCode,
+            reason = result.reason,
+            retryAfterSeconds = result.retryAfterSeconds,
+            message = result.message
+        )
+    }
+
+    private fun pairingFailureResponse(
+        statusCode: Int,
+        reason: String,
+        retryAfterSeconds: Int?,
+        message: String?
+    ): NanoHTTPD.Response {
+        val body = buildString {
+            append('{')
+            append("\"status\":\"error\",")
+            append("\"reason\":").append(jsonString(reason))
+            message?.takeIf { it.isNotBlank() }?.let {
+                append(",\"message\":").append(jsonString(it))
+            }
+            retryAfterSeconds?.takeIf { it > 0 }?.let {
+                append(",\"retryAfterSeconds\":").append(it)
+            }
+            append('}')
+        }
+        return NanoHTTPD.newFixedLengthResponse(toStatus(statusCode), JSON_UTF8, body).apply {
+            retryAfterSeconds?.takeIf { it > 0 }?.let { addHeader("Retry-After", it.toString()) }
+        }
     }
 
     private fun handleTokenRotateEndpoint(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
@@ -541,6 +561,25 @@ class ZCamHttpServer @Inject constructor(
             ?: return badRequest("missing enabled/action. expected enabled=true|false or action=start|stop")
 
         val result = runBlocking { cameraControlManager.setNightMode(enabled) }
+        return cameraControlResponse(result)
+    }
+
+    private fun handleZoomEndpoint(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
+        if (session.method != NanoHTTPD.Method.POST) {
+            return methodNotAllowed("POST")
+        }
+
+        val payload = parsePostPayload(session) ?: return badRequest("request body is required")
+        val linearZoom = valueOf(payload, "linearZoom", "zoomLinear", "zoom")
+            ?.toFloatOrNull()
+            ?.takeIf { it.isFinite() }
+            ?: when (valueOf(payload, "action")?.trim()?.lowercase()) {
+                "reset", "min", "wide", "widest" -> 0f
+                else -> null
+            }
+            ?: return badRequest("missing linearZoom. expected linearZoom=0.0..1.0 or action=reset")
+
+        val result = runBlocking { cameraControlManager.setZoomLinear(linearZoom) }
         return cameraControlResponse(result)
     }
 
@@ -1001,6 +1040,12 @@ class ZCamHttpServer @Inject constructor(
     }
 
     private fun buildAudioSocketConnectionId(session: NanoHTTPD.IHTTPSession): String {
+        val explicitStreamId = firstQueryValue(session, "streamId")
+            ?: firstQueryValue(session, "sid")
+        explicitStreamId
+            ?.trim()
+            ?.takeIf { AUDIO_STREAM_ID_REGEX.matches(it) }
+            ?.let { return it }
         val deviceId = extractDeviceId(session)?.ifBlank { null } ?: "anonymous"
         val remoteIp = session.remoteIpAddress.ifBlank { "unknown" }
         return "audio-$deviceId-$remoteIp-${System.nanoTime()}"
@@ -1046,12 +1091,15 @@ class ZCamHttpServer @Inject constructor(
     }
 
     private fun recordingEventJson(event: RecordingEventSummary): String {
-        return buildString(capacity = 128) {
+        return buildString(capacity = 176) {
             append('{')
             append("\"epochMs\":").append(event.epochMs).append(',')
             append("\"confidencePercent\":").append(event.confidencePercent).append(',')
             append("\"source\":").append(jsonString(event.source)).append(',')
-            append("\"recordingFileName\":").append(jsonString(event.recordingFileName))
+            append("\"recordingFileName\":").append(jsonString(event.recordingFileName)).append(',')
+            append("\"recordingStartedAtEpochMs\":").append(event.recordingStartedAtEpochMs?.toString() ?: "null").append(',')
+            append("\"recordingEndedAtEpochMs\":").append(event.recordingEndedAtEpochMs?.toString() ?: "null").append(',')
+            append("\"recordingOffsetMs\":").append(event.recordingOffsetMs?.toString() ?: "null")
             append('}')
         }
     }
@@ -1320,12 +1368,16 @@ class ZCamHttpServer @Inject constructor(
     }
 
     private fun cameraControlStateJson(state: com.zcam.camera.CameraControlsSnapshot): String {
-        return buildString(capacity = 192) {
+        return buildString(capacity = 288) {
             append('{')
             append("\"running\":").append(state.running).append(',')
             append("\"torchEnabled\":").append(state.torchEnabled).append(',')
             append("\"nightModeEnabled\":").append(state.nightModeEnabled).append(',')
             append("\"lowLightBoostSupported\":").append(state.lowLightBoostSupported).append(',')
+            append("\"zoomLinear\":").append(state.zoomLinear).append(',')
+            append("\"zoomRatio\":").append(state.zoomRatio).append(',')
+            append("\"minZoomRatio\":").append(state.minZoomRatio).append(',')
+            append("\"maxZoomRatio\":").append(state.maxZoomRatio).append(',')
             append("\"lastError\":").append(jsonString(state.lastError))
             append('}')
         }
@@ -1409,6 +1461,7 @@ class ZCamHttpServer @Inject constructor(
                 .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
                 .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
                 .grid3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; }
+                .metaGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; }
                 .title { font-size: 18px; font-weight: 700; margin: 0 0 8px 0; }
                 .sub { color: var(--muted); font-size: 13px; margin: 0 0 10px 0; }
                 label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 4px; }
@@ -1416,6 +1469,7 @@ class ZCamHttpServer @Inject constructor(
                 input[type=range] { padding: 0; }
                 button { cursor: pointer; }
                 button.primary { background: var(--accent); border-color: var(--accent); color: white; font-weight: 600; }
+                button.compact { padding: 7px 9px; font-size: 13px; }
                 button.ok { border-color: #1f7a3f; }
                 button.warn { border-color: #8a5e00; }
                 button.err { border-color: #8a2424; }
@@ -1424,12 +1478,34 @@ class ZCamHttpServer @Inject constructor(
                 pre { margin: 0; background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; max-height: 260px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 12px; }
                 .chip { display: inline-block; border-radius: 999px; border: 1px solid var(--border); padding: 3px 8px; font-size: 12px; color: var(--muted); }
                 .stack { display: grid; gap: 8px; }
+                .controlRow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+                .controlRow > button { flex: 1 1 120px; }
                 .list { display: grid; gap: 6px; max-height: 320px; overflow: auto; }
                 .recordingItem { width: 100%; text-align: left; }
+                .recordingRow { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 6px; align-items: center; background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 8px; }
+                .recordingRow button { white-space: nowrap; }
+                .recordingLabelButton { width: 100%; text-align: left; }
+                .metaCell { background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 8px; min-height: 54px; }
+                .metaLabel { color: var(--muted); font-size: 11px; margin-bottom: 4px; }
+                .metaValue { font-size: 13px; word-break: break-word; }
+                .timelineShell { display: grid; gap: 6px; }
+                .timelineBar { position: relative; width: 100%; height: 30px; border-radius: 10px; border: 1px solid var(--border); background: var(--card2); overflow: hidden; }
+                .timelineTrack { position: absolute; left: 8px; right: 8px; top: 11px; height: 8px; border-radius: 999px; background: #0b0d12; }
+                .timelineMarker { position: absolute; top: 4px; width: 8px; height: 22px; transform: translateX(-50%); border-radius: 999px; border: none; background: var(--err); padding: 0; }
+                .timelinePlayhead { position: absolute; top: 2px; width: 2px; height: 26px; transform: translateX(-50%); background: var(--accent); }
+                .progressWrap { display: grid; gap: 4px; }
+                progress { width: 100%; height: 8px; }
+                .speedRow button { flex: 1 1 64px; }
+                .hidden { display: none !important; }
                 .okText { color: var(--ok); }
                 .warnText { color: var(--warn); }
                 .errText { color: var(--err); }
                 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+                @media (max-width: 720px) {
+                  .wrap { padding: 10px; }
+                  .recordingRow { grid-template-columns: 1fr 1fr; }
+                  .recordingRow .recordingLabelButton { grid-column: 1 / -1; }
+                }
               </style>
             </head>
             <body>
@@ -1491,19 +1567,26 @@ class ZCamHttpServer @Inject constructor(
                     <div class="row" style="margin-bottom:8px;">
                       <button id="reloadPreviewBtn" type="button">Reload preview</button>
                       <a id="snapshotLink" class="chip" href="/snapshot.jpg" target="_blank">Open snapshot</a>
+                      <span class="chip mono" id="previewState">preview: idle</span>
                     </div>
                     <img id="videoPreview" src="/video" alt="ZCam stream" />
                   </div>
 
                   <div class="card">
                     <h2 class="title">Camera Controls</h2>
-                    <div class="row">
+                    <div class="controlRow">
                       <button class="ok" type="button" onclick="setTorch(true)">Torch ON</button>
                       <button type="button" onclick="setTorch(false)">Torch OFF</button>
                     </div>
-                    <div class="row" style="margin-top:8px;">
+                    <div class="controlRow" style="margin-top:8px;">
                       <button class="ok" type="button" onclick="setNightMode(true)">Night mode ON</button>
                       <button type="button" onclick="setNightMode(false)">Night mode OFF</button>
+                    </div>
+                    <div class="controlRow" style="margin-top:8px;">
+                      <button type="button" class="compact" onclick="adjustZoom(-0.12)">Zoom -</button>
+                      <button type="button" class="compact" onclick="resetZoom()">Reset</button>
+                      <button type="button" class="compact" onclick="adjustZoom(0.12)">Zoom +</button>
+                      <span class="chip mono" id="zoomState">zoom: 1.0x</span>
                     </div>
                     <p class="sub" style="margin-top:10px;">Night mode maps to CameraX low-light boost; may require FPS <= 30.</p>
                   </div>
@@ -1512,15 +1595,16 @@ class ZCamHttpServer @Inject constructor(
                 <div class="grid2">
                   <div class="card">
                     <h2 class="title">Audio Live</h2>
-                    <div class="row">
+                    <div class="controlRow">
                       <button class="ok" type="button" onclick="setAudioLive('ptt', true)">PTT ON</button>
                       <button type="button" onclick="setAudioLive('ptt', false)">PTT OFF</button>
                     </div>
-                    <div class="row" style="margin-top:8px;">
+                    <div class="controlRow" style="margin-top:8px;">
                       <button class="ok" type="button" onclick="setAudioLive('live', true)">Live listen ON</button>
                       <button type="button" onclick="setAudioLive('live', false)">Live listen OFF</button>
                     </div>
                     <div class="row" style="margin-top:8px;">
+                      <span class="chip mono" id="audioRuntimeState">audio runtime: idle</span>
                       <span class="chip mono" id="audioSocketState">audio socket: idle</span>
                     </div>
                   </div>
@@ -1566,7 +1650,27 @@ class ZCamHttpServer @Inject constructor(
                       <div class="row">
                         <span class="chip mono" id="recordingsState">recordings: idle</span>
                         <span class="chip mono" id="recordingSelection">selected: none</span>
+                        <span class="chip mono" id="recordingPlaybackState">playback: idle</span>
                       </div>
+                      <div id="recordingLoadPanel" class="progressWrap hidden">
+                        <progress id="recordingLoadProgress" max="1"></progress>
+                        <div id="recordingLoadLabel" class="sub">Loading video from server...</div>
+                      </div>
+                      <div class="controlRow speedRow">
+                        <button id="speed05Btn" type="button" class="compact">0.5x</button>
+                        <button id="speed10Btn" type="button" class="compact primary">1x</button>
+                        <button id="speed15Btn" type="button" class="compact">1.5x</button>
+                        <button id="speed20Btn" type="button" class="compact">2x</button>
+                        <button id="downloadSelectedRecordingBtn" type="button" class="compact">Download</button>
+                      </div>
+                      <div id="recordingDownloadPanel" class="progressWrap hidden">
+                        <progress id="recordingDownloadProgress" max="1"></progress>
+                        <div id="recordingDownloadLabel" class="sub">Preparing download...</div>
+                      </div>
+                      <div id="recordingMeta" class="metaGrid"></div>
+                      <div id="recordingTimeline" class="timelineShell"></div>
+                      <div class="sub" id="recordingTimelineHint">Select a recording to show clip-local event markers.</div>
+                      <div class="sub" id="recordingErrorLabel"></div>
                     </div>
                     <div class="stack">
                       <div>
@@ -1604,9 +1708,12 @@ class ZCamHttpServer @Inject constructor(
                 const statusJson = document.getElementById('statusJson');
                 const apiLog = document.getElementById('apiLog');
                 const videoPreview = document.getElementById('videoPreview');
+                const previewState = document.getElementById('previewState');
                 const snapshotLink = document.getElementById('snapshotLink');
                 const volumeRange = document.getElementById('volumeRange');
                 const volumeLabel = document.getElementById('volumeLabel');
+                const zoomState = document.getElementById('zoomState');
+                const audioRuntimeState = document.getElementById('audioRuntimeState');
                 const audioSocketState = document.getElementById('audioSocketState');
                 const recordingsFromInput = document.getElementById('recordingsFromInput');
                 const recordingsToInput = document.getElementById('recordingsToInput');
@@ -1617,12 +1724,32 @@ class ZCamHttpServer @Inject constructor(
                 const recordingsList = document.getElementById('recordingsList');
                 const recordingsEvents = document.getElementById('recordingsEvents');
                 const recordingPlayer = document.getElementById('recordingPlayer');
+                const recordingPlaybackState = document.getElementById('recordingPlaybackState');
+                const recordingLoadPanel = document.getElementById('recordingLoadPanel');
+                const recordingLoadProgress = document.getElementById('recordingLoadProgress');
+                const recordingLoadLabel = document.getElementById('recordingLoadLabel');
+                const downloadSelectedRecordingBtn = document.getElementById('downloadSelectedRecordingBtn');
+                const recordingDownloadPanel = document.getElementById('recordingDownloadPanel');
+                const recordingDownloadProgress = document.getElementById('recordingDownloadProgress');
+                const recordingDownloadLabel = document.getElementById('recordingDownloadLabel');
+                const recordingMeta = document.getElementById('recordingMeta');
+                const recordingTimeline = document.getElementById('recordingTimeline');
+                const recordingTimelineHint = document.getElementById('recordingTimelineHint');
+                const recordingErrorLabel = document.getElementById('recordingErrorLabel');
+                const speed05Btn = document.getElementById('speed05Btn');
+                const speed10Btn = document.getElementById('speed10Btn');
+                const speed15Btn = document.getElementById('speed15Btn');
+                const speed20Btn = document.getElementById('speed20Btn');
                 const STORAGE = {
                   token: 'zcam.panel.token',
                   deviceId: 'zcam.panel.deviceId',
                   browserName: 'zcam.panel.browserName',
                   pendingRequestId: 'zcam.panel.pendingRequestId',
-                  pendingExpiresAt: 'zcam.panel.pendingExpiresAt'
+                  pendingExpiresAt: 'zcam.panel.pendingExpiresAt',
+                  liveResume: 'zcam.panel.audio.live.resume',
+                  pttResume: 'zcam.panel.audio.ptt.resume',
+                  liveStreamId: 'zcam.panel.audio.live.streamId',
+                  pttStreamId: 'zcam.panel.audio.ptt.streamId'
                 };
                 const DEFAULT_AUDIO_CONFIG = {
                   sampleRateHz: 16000,
@@ -1647,6 +1774,12 @@ class ZCamHttpServer @Inject constructor(
                 let recordingEventsCache = [];
                 let selectedRecordingName = '';
                 let pendingSeekSeconds = null;
+                let selectedPlaybackRate = 1;
+                let liveSocketOpening = false;
+                let pttSocketOpening = false;
+                let lastStatusPayload = null;
+                let recordingTimelinePlayhead = null;
+                let previewReloadTimer = null;
 
                 function readAuth() {
                   return {
@@ -1734,6 +1867,260 @@ class ZCamHttpServer @Inject constructor(
                   }
                 }
 
+                function updatePreviewState(label, toneClass) {
+                  previewState.textContent = label;
+                  previewState.className = 'chip mono ' + (toneClass || '');
+                }
+
+                function updateZoomState(cameraControls) {
+                  const ratio = Number(cameraControls?.zoomRatio ?? cameraControls?.minZoomRatio ?? 1);
+                  const linear = Number(cameraControls?.zoomLinear ?? 0);
+                  const supported = Number(cameraControls?.maxZoomRatio ?? 1) > 1.01 || linear > 0.001;
+                  zoomState.textContent = 'zoom: ' + ratio.toFixed(1) + 'x' + (supported ? '' : ' fixed');
+                  zoomState.className = 'chip mono ' + (supported ? 'okText' : 'warnText');
+                  zoomState.dataset.linear = String(Math.max(0, Math.min(1, linear)));
+                }
+
+                function updateAudioRuntimeState(audio) {
+                  let label = 'audio runtime: idle';
+                  let toneClass = '';
+                  if (!audio || audio.engineStarted === false) {
+                    label = 'audio runtime: stopped';
+                    toneClass = 'warnText';
+                  } else if (audio.transmitting && audio.liveListening) {
+                    label = 'audio runtime: live + ptt';
+                    toneClass = 'okText';
+                  } else if (audio.transmitting) {
+                    label = 'audio runtime: push-to-talk active';
+                    toneClass = 'okText';
+                  } else if (audio.liveListening) {
+                    label = 'audio runtime: live listen active';
+                    toneClass = 'okText';
+                  } else if (audio.playingBack) {
+                    label = 'audio runtime: playback active';
+                    toneClass = 'okText';
+                  }
+                  audioRuntimeState.textContent = label;
+                  audioRuntimeState.className = 'chip mono ' + toneClass;
+                }
+
+                function updateRecordingPlaybackState(label, toneClass) {
+                  recordingPlaybackState.textContent = label;
+                  recordingPlaybackState.className = 'chip mono ' + (toneClass || '');
+                }
+
+                function setPanelProgress(panel, progress, labelNode, options) {
+                  const loading = options?.loading === true;
+                  if (!loading) {
+                    panel.classList.add('hidden');
+                    labelNode.textContent = options?.label || '';
+                    progress.removeAttribute('value');
+                    return;
+                  }
+                  panel.classList.remove('hidden');
+                  labelNode.textContent = options?.label || 'Working...';
+                  if (Number.isFinite(options?.fraction)) {
+                    progress.max = 1;
+                    progress.value = Math.max(0, Math.min(1, Number(options.fraction)));
+                  } else {
+                    progress.removeAttribute('value');
+                  }
+                }
+
+                function setRecordingLoadState(loading, label, fraction) {
+                  setPanelProgress(recordingLoadPanel, recordingLoadProgress, recordingLoadLabel, {
+                    loading,
+                    label,
+                    fraction
+                  });
+                }
+
+                function setRecordingDownloadState(loading, label, fraction) {
+                  setPanelProgress(recordingDownloadPanel, recordingDownloadProgress, recordingDownloadLabel, {
+                    loading,
+                    label,
+                    fraction
+                  });
+                }
+
+                function setRecordingError(message, toneClass) {
+                  recordingErrorLabel.textContent = message || '';
+                  recordingErrorLabel.className = 'sub ' + (toneClass || '');
+                }
+
+                function formatDurationSeconds(totalSeconds) {
+                  const wholeSeconds = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+                  const hours = Math.floor(wholeSeconds / 3600);
+                  const minutes = Math.floor((wholeSeconds % 3600) / 60);
+                  const seconds = wholeSeconds % 60;
+                  return hours > 0
+                    ? String(hours).padStart(2, '0') + ':' + String(minutes).padStart(2, '0') + ':' + String(seconds).padStart(2, '0')
+                    : String(minutes).padStart(2, '0') + ':' + String(seconds).padStart(2, '0');
+                }
+
+                function formatSizeBytes(sizeBytes) {
+                  const bytes = Number(sizeBytes || 0);
+                  if (bytes <= 0) return '0 B';
+                  if (bytes >= 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+                  if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+                  if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+                  return bytes + ' B';
+                }
+
+                function selectedRecordingItem() {
+                  return recordingsCache.find((item) => item.fileName === selectedRecordingName) || null;
+                }
+
+                function eventOffsetMsForRecording(eventItem, recordingItem) {
+                  if (!eventItem || !recordingItem) return null;
+                  const durationMs = Math.max(1, Number(recordingItem.durationMs || (recordingItem.endedAtEpochMs - recordingItem.startedAtEpochMs) || 1));
+                  const rawOffset = Number.isFinite(Number(eventItem.recordingOffsetMs))
+                    ? Number(eventItem.recordingOffsetMs)
+                    : (Number(eventItem.epochMs) - Number(recordingItem.startedAtEpochMs));
+                  if (!Number.isFinite(rawOffset)) return null;
+                  return Math.max(0, Math.min(durationMs, rawOffset));
+                }
+
+                function selectedRecordingEvents() {
+                  const item = selectedRecordingItem();
+                  if (!item) return [];
+                  return recordingEventsCache
+                    .filter((eventItem) => {
+                      if (eventItem.recordingFileName) {
+                        return eventItem.recordingFileName === item.fileName;
+                      }
+                      return Number(eventItem.epochMs) >= Number(item.startedAtEpochMs) &&
+                        Number(eventItem.epochMs) <= Number(item.endedAtEpochMs);
+                    })
+                    .map((eventItem) => ({
+                      ...eventItem,
+                      resolvedOffsetMs: eventOffsetMsForRecording(eventItem, item)
+                    }))
+                    .filter((eventItem) => Number.isFinite(eventItem.resolvedOffsetMs))
+                    .sort((left, right) => Number(left.resolvedOffsetMs) - Number(right.resolvedOffsetMs));
+                }
+
+                function renderRecordingMeta(item) {
+                  recordingMeta.innerHTML = '';
+                  if (!item) {
+                    return;
+                  }
+                  [
+                    ['Date / time', new Date(item.startedAtEpochMs).toLocaleString()],
+                    ['Duration', formatDurationSeconds((item.durationMs || 0) / 1000)],
+                    ['File size', formatSizeBytes(item.sizeBytes)],
+                    ['Server source', location.host],
+                    ['Format', (item.container || 'mp4') + ' / ' + (item.codec || 'unknown')]
+                  ].forEach(([label, value]) => {
+                    const cell = document.createElement('div');
+                    cell.className = 'metaCell';
+                    const labelNode = document.createElement('div');
+                    labelNode.className = 'metaLabel';
+                    labelNode.textContent = label;
+                    const valueNode = document.createElement('div');
+                    valueNode.className = 'metaValue';
+                    valueNode.textContent = value;
+                    cell.appendChild(labelNode);
+                    cell.appendChild(valueNode);
+                    recordingMeta.appendChild(cell);
+                  });
+                }
+
+                function updateTimelinePlayhead() {
+                  if (!recordingTimelinePlayhead) return;
+                  const duration = Number(recordingPlayer.duration);
+                  const currentTime = Number(recordingPlayer.currentTime || 0);
+                  if (!Number.isFinite(duration) || duration <= 0) {
+                    recordingTimelinePlayhead.style.left = '0%';
+                    return;
+                  }
+                  recordingTimelinePlayhead.style.left = (Math.max(0, Math.min(1, currentTime / duration)) * 100).toFixed(2) + '%';
+                }
+
+                function renderRecordingTimeline() {
+                  const item = selectedRecordingItem();
+                  const events = selectedRecordingEvents();
+                  recordingTimeline.innerHTML = '';
+                  recordingTimelinePlayhead = null;
+                  if (!item) {
+                    recordingTimelineHint.textContent = 'Select a recording to show clip-local event markers.';
+                    return;
+                  }
+
+                  const durationMs = Math.max(1, Number(item.durationMs || (item.endedAtEpochMs - item.startedAtEpochMs) || 1));
+                  const bar = document.createElement('div');
+                  bar.className = 'timelineBar';
+                  const track = document.createElement('div');
+                  track.className = 'timelineTrack';
+                  bar.appendChild(track);
+
+                  const playhead = document.createElement('div');
+                  playhead.className = 'timelinePlayhead';
+                  playhead.style.left = '0%';
+                  bar.appendChild(playhead);
+                  recordingTimelinePlayhead = playhead;
+
+                  events.forEach((eventItem) => {
+                    const marker = document.createElement('button');
+                    marker.type = 'button';
+                    marker.className = 'timelineMarker';
+                    marker.style.left = ((Number(eventItem.resolvedOffsetMs) / durationMs) * 100).toFixed(2) + '%';
+                    marker.title = new Date(eventItem.epochMs).toLocaleString() + ' | ' + eventItem.confidencePercent + '% | ' + eventItem.source;
+                    marker.addEventListener('click', () => jumpToRecordingEvent(eventItem));
+                    bar.appendChild(marker);
+                  });
+
+                  const labels = document.createElement('div');
+                  labels.className = 'row';
+                  labels.innerHTML = '<span class="sub">' + new Date(item.startedAtEpochMs).toLocaleTimeString() + '</span>' +
+                    '<span class="sub">' + formatDurationSeconds(durationMs / 1000) + '</span>' +
+                    '<span class="sub">' + new Date(item.endedAtEpochMs).toLocaleTimeString() + '</span>';
+
+                  recordingTimeline.appendChild(bar);
+                  recordingTimeline.appendChild(labels);
+                  recordingTimelineHint.textContent = events.length > 0
+                    ? 'Clip event markers stay aligned to this recording timeline.'
+                    : 'No event markers for this recording.';
+                  updateTimelinePlayhead();
+                }
+
+                function updateSpeedButtons() {
+                  [
+                    [speed05Btn, 0.5],
+                    [speed10Btn, 1],
+                    [speed15Btn, 1.5],
+                    [speed20Btn, 2]
+                  ].forEach(([button, speed]) => {
+                    button.className = selectedPlaybackRate === speed
+                      ? 'compact primary'
+                      : 'compact';
+                  });
+                }
+
+                function setPlaybackSpeed(speed) {
+                  selectedPlaybackRate = speed;
+                  recordingPlayer.playbackRate = speed;
+                  updateSpeedButtons();
+                }
+
+                function activeAudioStreamId(role) {
+                  const storageKey = role === 'live' ? STORAGE.liveStreamId : STORAGE.pttStreamId;
+                  const existing = sessionStorage.getItem(storageKey);
+                  if (existing) return existing;
+                  const created = role + '-' + Math.random().toString(36).slice(2, 12);
+                  sessionStorage.setItem(storageKey, created);
+                  return created;
+                }
+
+                function schedulePreviewReload(reason) {
+                  if (previewReloadTimer) return;
+                  previewReloadTimer = window.setTimeout(() => {
+                    previewReloadTimer = null;
+                    appendLog('preview reload: ' + reason);
+                    applyPreviewSources();
+                  }, 1200);
+                }
+
                 function authHeaders() {
                   const auth = readAuth();
                   const headers = { 'Accept': 'application/json' };
@@ -1761,6 +2148,7 @@ class ZCamHttpServer @Inject constructor(
                   const auth = readAuth();
                   const query = new URLSearchParams();
                   query.set('role', role);
+                  query.set('streamId', activeAudioStreamId(role));
                   if (auth.token) query.set('token', auth.token);
                   if (auth.deviceId) query.set('deviceId', auth.deviceId);
                   const protocol = location.protocol === 'https:' ? 'wss://' : 'ws://';
@@ -1842,6 +2230,7 @@ class ZCamHttpServer @Inject constructor(
                 }
 
                 function stopBrowserLiveListenAudio() {
+                  liveSocketOpening = false;
                   if (liveSocket) {
                     try { liveSocket.close(1000, 'live_stopped'); } catch (_) {}
                   }
@@ -1851,15 +2240,21 @@ class ZCamHttpServer @Inject constructor(
                 }
 
                 async function startBrowserLiveListenAudio() {
+                  if (liveSocketOpening) {
+                    return { ok: false, reason: 'live_socket_already_opening' };
+                  }
                   if (!(await ensureLiveAudioContext())) {
                     return { ok: false, reason: 'browser_audio_output_unavailable' };
                   }
                   stopBrowserLiveListenAudio();
+                  liveSocketOpening = true;
+                  updateAudioSocketState('audio socket: live reconnecting', 'warnText');
                   return await new Promise((resolve) => {
                     const socket = new WebSocket(audioSocketUrl('live'));
                     socket.binaryType = 'arraybuffer';
                     let settled = false;
                     socket.onopen = () => {
+                      liveSocketOpening = false;
                       liveSocket = socket;
                       updateAudioSocketState('audio socket: live listen', 'okText');
                       if (!settled) {
@@ -1879,6 +2274,7 @@ class ZCamHttpServer @Inject constructor(
                       playLiveAudioFrame(event.data);
                     };
                     socket.onerror = () => {
+                      liveSocketOpening = false;
                       updateAudioSocketState('audio socket: live error', 'errText');
                       if (!settled) {
                         settled = true;
@@ -1886,15 +2282,22 @@ class ZCamHttpServer @Inject constructor(
                       }
                     };
                     socket.onclose = () => {
+                      liveSocketOpening = false;
                       if (liveSocket === socket) {
                         liveSocket = null;
-                        updateAudioSocketState('audio socket: idle', '');
+                        if (sessionStorage.getItem(STORAGE.liveResume) === '1') {
+                          updateAudioSocketState('audio socket: live reconnecting', 'warnText');
+                          window.setTimeout(() => refreshStatus(), 350);
+                        } else {
+                          updateAudioSocketState('audio socket: idle', '');
+                        }
                       }
                     };
                   });
                 }
 
                 function stopBrowserPushToTalkAudio() {
+                  pttSocketOpening = false;
                   if (pttProcessor) {
                     try { pttProcessor.disconnect(); } catch (_) {}
                     pttProcessor.onaudioprocess = null;
@@ -1924,6 +2327,9 @@ class ZCamHttpServer @Inject constructor(
                 }
 
                 async function startBrowserPushToTalkAudio() {
+                  if (pttSocketOpening) {
+                    return { ok: false, reason: 'ptt_socket_already_opening' };
+                  }
                   if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
                     return { ok: false, reason: 'browser_microphone_requires_https_or_localhost' };
                   }
@@ -1948,12 +2354,15 @@ class ZCamHttpServer @Inject constructor(
 
                   pttAudioContext = new AudioContextCtor();
                   await pttAudioContext.resume();
+                  pttSocketOpening = true;
+                  updateAudioSocketState('audio socket: ptt reconnecting', 'warnText');
 
                   return await new Promise((resolve) => {
                     const socket = new WebSocket(audioSocketUrl('ptt'));
                     let settled = false;
                     socket.binaryType = 'arraybuffer';
                     socket.onopen = () => {
+                      pttSocketOpening = false;
                       pttSocket = socket;
                       pttSourceNode = pttAudioContext.createMediaStreamSource(pttMediaStream);
                       pttProcessor = pttAudioContext.createScriptProcessor(2048, 1, 1);
@@ -1988,6 +2397,7 @@ class ZCamHttpServer @Inject constructor(
                       }
                     };
                     socket.onerror = () => {
+                      pttSocketOpening = false;
                       updateAudioSocketState('audio socket: ptt error', 'errText');
                       if (!settled) {
                         settled = true;
@@ -1995,8 +2405,13 @@ class ZCamHttpServer @Inject constructor(
                       }
                     };
                     socket.onclose = () => {
+                      pttSocketOpening = false;
                       if (pttSocket === socket) {
                         stopBrowserPushToTalkAudio();
+                        if (sessionStorage.getItem(STORAGE.pttResume) === '1') {
+                          updateAudioSocketState('audio socket: ptt reconnecting', 'warnText');
+                          window.setTimeout(() => refreshStatus(), 350);
+                        }
                       }
                     };
                   });
@@ -2050,10 +2465,17 @@ class ZCamHttpServer @Inject constructor(
                   const item = recordingsCache.find((entry) => entry.fileName === fileName);
                   if (!item) return;
                   selectedRecordingName = fileName;
+                  downloadSelectedRecordingBtn.disabled = false;
                   pendingSeekSeconds = Number.isFinite(seekSeconds) ? Math.max(0, seekSeconds) : null;
                   recordingSelection.textContent = 'selected: ' + fileName;
+                  renderRecordingMeta(item);
+                  renderRecordingTimeline();
+                  setRecordingError('', '');
+                  setRecordingLoadState(true, 'Loading video from server...', null);
+                  updateRecordingPlaybackState('playback: loading', 'warnText');
                   recordingPlayer.src = buildAuthorizedUrl('/api/recordings/' + encodeURIComponent(fileName), {});
-                  recordingsState.textContent = 'recordings: ' + recordingsCache.length + ' clip(s)';
+                  recordingPlayer.load();
+                  recordingsState.textContent = 'recordings: ' + recordingsCache.length + ' clip(s), ' + recordingEventsCache.length + ' event(s)';
                   renderRecordings();
                 }
 
@@ -2075,12 +2497,31 @@ class ZCamHttpServer @Inject constructor(
                     recordingsList.innerHTML = '<div class="sub">No recordings in the selected range.</div>';
                   } else {
                     recordingsCache.forEach((item) => {
-                      const button = document.createElement('button');
-                      button.type = 'button';
-                      button.className = 'recordingItem' + (selectedRecordingName === item.fileName ? ' primary' : '');
-                      button.textContent = formatRecordingLabel(item);
-                      button.addEventListener('click', () => selectRecording(item.fileName, null));
-                      recordingsList.appendChild(button);
+                      const row = document.createElement('div');
+                      row.className = 'recordingRow';
+
+                      const playButton = document.createElement('button');
+                      playButton.type = 'button';
+                      playButton.className = 'recordingLabelButton' + (selectedRecordingName === item.fileName ? ' primary' : '');
+                      playButton.textContent = formatRecordingLabel(item);
+                      playButton.addEventListener('click', () => selectRecording(item.fileName, null));
+
+                      const openButton = document.createElement('button');
+                      openButton.type = 'button';
+                      openButton.className = 'compact';
+                      openButton.textContent = 'Open';
+                      openButton.addEventListener('click', () => selectRecording(item.fileName, null));
+
+                      const downloadButton = document.createElement('button');
+                      downloadButton.type = 'button';
+                      downloadButton.className = 'compact';
+                      downloadButton.textContent = 'Download';
+                      downloadButton.addEventListener('click', () => downloadRecording(item.fileName));
+
+                      row.appendChild(playButton);
+                      row.appendChild(openButton);
+                      row.appendChild(downloadButton);
+                      recordingsList.appendChild(row);
                     });
                   }
 
@@ -2103,6 +2544,7 @@ class ZCamHttpServer @Inject constructor(
                   const fromEpochMs = parseLocalDateTimeInput(recordingsFromInput.value);
                   const toEpochMs = parseLocalDateTimeInput(recordingsToInput.value);
                   recordingsState.textContent = 'recordings: loading';
+                  setRecordingError('', '');
                   try {
                     const recordingsUrl = buildAuthorizedUrl('/api/recordings', {
                       fromEpochMs,
@@ -2124,17 +2566,102 @@ class ZCamHttpServer @Inject constructor(
                     recordingEventsCache = Array.isArray(eventsPayload.events) ? eventsPayload.events : [];
                     if (selectedRecordingName && !recordingsCache.some((item) => item.fileName === selectedRecordingName)) {
                       selectedRecordingName = '';
+                      downloadSelectedRecordingBtn.disabled = true;
                       recordingSelection.textContent = 'selected: none';
+                      renderRecordingMeta(null);
+                      recordingTimeline.innerHTML = '';
+                      recordingTimelineHint.textContent = 'Select a recording to show clip-local event markers.';
+                      updateRecordingPlaybackState('playback: idle', '');
+                      setRecordingLoadState(false, '', null);
+                      setRecordingError('', '');
                     }
                     recordingsState.textContent = 'recordings: ' + recordingsCache.length + ' clip(s), ' + recordingEventsCache.length + ' event(s)';
                     if (!selectedRecordingName && recordingsCache.length > 0) {
                       selectRecording(recordingsCache[0].fileName, null);
                     } else {
                       renderRecordings();
+                      renderRecordingTimeline();
                     }
                   } catch (error) {
                     recordingsState.textContent = 'recordings: load failed';
+                    setRecordingError('Recordings load failed. Check connection and authentication.', 'errText');
                     appendLog('recordings load failed: ' + error);
+                  }
+                }
+
+                function downloadFileNameForRecording(item) {
+                  const date = new Date(item.startedAtEpochMs || Date.now());
+                  const pad = (value) => String(value).padStart(2, '0');
+                  const extension = String(item.fileName || '').split('.').pop() || 'mp4';
+                  return 'ZCam_' +
+                    date.getFullYear() + '-' +
+                    pad(date.getMonth() + 1) + '-' +
+                    pad(date.getDate()) + '_' +
+                    pad(date.getHours()) + '-' +
+                    pad(date.getMinutes()) + '-' +
+                    pad(date.getSeconds()) + '.' + extension;
+                }
+
+                async function downloadRecording(fileName) {
+                  const item = recordingsCache.find((entry) => entry.fileName === fileName);
+                  if (!item) return;
+                  setRecordingDownloadState(true, 'Preparing browser download...', null);
+                  setRecordingError('', '');
+                  try {
+                    const response = await fetch(
+                      buildAuthorizedUrl('/api/recordings/' + encodeURIComponent(fileName), {}),
+                      { headers: authHeaders(), cache: 'no-store' }
+                    );
+                    if (!response.ok) {
+                      throw new Error('HTTP ' + response.status);
+                    }
+                    const totalBytes = Number(response.headers.get('Content-Length') || item.sizeBytes || 0);
+                    if (!response.body || !response.body.getReader) {
+                      const blobFallback = await response.blob();
+                      const objectUrl = URL.createObjectURL(blobFallback);
+                      const link = document.createElement('a');
+                      link.href = objectUrl;
+                      link.download = downloadFileNameForRecording(item);
+                      link.click();
+                      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+                      setRecordingDownloadState(false, 'Browser download started.', null);
+                      setRecordingError('Browser download started.', 'okText');
+                      return;
+                    }
+
+                    const reader = response.body.getReader();
+                    const chunks = [];
+                    let downloadedBytes = 0;
+                    while (true) {
+                      const step = await reader.read();
+                      if (step.done) break;
+                      if (step.value) {
+                        chunks.push(step.value);
+                        downloadedBytes += step.value.byteLength;
+                        const fraction = totalBytes > 0 ? downloadedBytes / totalBytes : null;
+                        setRecordingDownloadState(
+                          true,
+                          totalBytes > 0
+                            ? 'Downloading ' + Math.round(fraction * 100) + '%'
+                            : 'Downloading recording...',
+                          fraction
+                        );
+                      }
+                    }
+
+                    const blob = new Blob(chunks, { type: 'video/mp4' });
+                    const objectUrl = URL.createObjectURL(blob);
+                    const link = document.createElement('a');
+                    link.href = objectUrl;
+                    link.download = downloadFileNameForRecording(item);
+                    link.click();
+                    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+                    setRecordingDownloadState(false, 'Browser download started.', null);
+                    setRecordingError('Browser download started.', 'okText');
+                  } catch (error) {
+                    setRecordingDownloadState(false, 'Download failed.', null);
+                    setRecordingError('Download failed: ' + error, 'errText');
+                    appendLog('recording download failed: ' + error);
                   }
                 }
 
@@ -2227,11 +2754,14 @@ class ZCamHttpServer @Inject constructor(
                     const text = await response.text();
                     let data = {};
                     try { data = JSON.parse(text); } catch (_) { data = { raw: text }; }
+                    lastStatusPayload = data;
                     statusJson.textContent = JSON.stringify(data, null, 2);
                     const serverAlive = data?.server?.alive === true;
                     const streamClients = data?.server?.streamClients ?? '?';
                     const torch = data?.cameraControls?.torchEnabled;
                     const night = data?.cameraControls?.nightModeEnabled;
+                    const videoRunning = data?.video?.running === true;
+                    const lastFrameAgeMs = Number(data?.video?.lastFrameAgeMs ?? -1);
                     const batteryPercent = data?.power?.batteryPercent;
                     const charging = data?.power?.charging;
                     const batteryLabel = Number.isFinite(batteryPercent)
@@ -2242,12 +2772,81 @@ class ZCamHttpServer @Inject constructor(
                       volumeRange.value = String(audioVolume);
                       volumeLabel.textContent = audioVolume + '%';
                     }
+                    updateZoomState(data?.cameraControls);
+                    updateAudioRuntimeState(data?.audio);
+                    if (!serverAlive) {
+                      updatePreviewState('preview: offline', 'errText');
+                    } else if (!videoRunning) {
+                      updatePreviewState('preview: stopped', 'warnText');
+                    } else if (lastFrameAgeMs >= 0 && lastFrameAgeMs > 5000) {
+                      updatePreviewState('preview: reconnecting', 'warnText');
+                    } else {
+                      updatePreviewState('preview: live', 'okText');
+                    }
                     statusLine.textContent = 'status: http=' + response.status + ' alive=' + serverAlive + ' clients=' + streamClients + ' torch=' + torch + ' night=' + night + batteryLabel;
                     statusLine.className = 'chip mono ' + (response.ok ? 'okText' : 'errText');
+                    if (response.ok) {
+                      await syncBrowserRuntime(data);
+                    }
                   } catch (error) {
+                    lastStatusPayload = null;
                     statusJson.textContent = 'status error: ' + error;
                     statusLine.textContent = 'status: request failed';
                     statusLine.className = 'chip mono errText';
+                    updatePreviewState('preview: request failed', 'errText');
+                    updateRecordingPlaybackState('playback: waiting for server', 'warnText');
+                  }
+                }
+
+                async function setZoomLinear(linearZoom) {
+                  const normalized = Math.max(0, Math.min(1, Number(linearZoom || 0)));
+                  const { response, parsed } = await apiPost('/api/zoom', { linearZoom: normalized });
+                  if (response.ok && parsed?.cameraControls) {
+                    updateZoomState(parsed.cameraControls);
+                  }
+                  await refreshStatus();
+                }
+
+                async function adjustZoom(deltaLinear) {
+                  const currentLinear = Number(zoomState.dataset.linear || lastStatusPayload?.cameraControls?.zoomLinear || 0);
+                  await setZoomLinear(currentLinear + Number(deltaLinear || 0));
+                }
+
+                async function resetZoom() {
+                  await setZoomLinear(0);
+                }
+
+                async function syncBrowserRuntime(statusPayload) {
+                  const audio = statusPayload?.audio;
+                  const liveEnabled = audio?.liveListening === true;
+                  const pttEnabled = audio?.transmitting === true;
+                  const wantsLive = sessionStorage.getItem(STORAGE.liveResume) === '1';
+                  const wantsPtt = sessionStorage.getItem(STORAGE.pttResume) === '1';
+
+                  if (!liveEnabled) {
+                    sessionStorage.removeItem(STORAGE.liveResume);
+                    if (liveSocket) {
+                      stopBrowserLiveListenAudio();
+                    }
+                  } else if (wantsLive && !liveSocket && !liveSocketOpening) {
+                    const started = await startBrowserLiveListenAudio();
+                    if (!started.ok) {
+                      sessionStorage.removeItem(STORAGE.liveResume);
+                      appendLog('live listen reconnect failed: ' + started.reason + (started.detail ? ' | ' + started.detail : ''));
+                    }
+                  }
+
+                  if (!pttEnabled) {
+                    sessionStorage.removeItem(STORAGE.pttResume);
+                    if (pttSocket || pttSocketOpening || pttMediaStream) {
+                      stopBrowserPushToTalkAudio();
+                    }
+                  } else if (wantsPtt && !pttSocket && !pttSocketOpening) {
+                    const started = await startBrowserPushToTalkAudio();
+                    if (!started.ok) {
+                      sessionStorage.removeItem(STORAGE.pttResume);
+                      appendLog('push-to-talk reconnect failed: ' + started.reason + (started.detail ? ' | ' + started.detail : ''));
+                    }
                   }
                 }
 
@@ -2283,8 +2882,12 @@ class ZCamHttpServer @Inject constructor(
                         appendLog('live listen unavailable: ' + started.reason);
                         stopBrowserLiveListenAudio();
                         await apiPost('/api/audio/live', { mode, enabled: false });
+                        sessionStorage.removeItem(STORAGE.liveResume);
+                      } else {
+                        sessionStorage.setItem(STORAGE.liveResume, '1');
                       }
                     } else {
+                      sessionStorage.removeItem(STORAGE.liveResume);
                       stopBrowserLiveListenAudio();
                     }
                   } else if (mode === 'ptt') {
@@ -2294,8 +2897,12 @@ class ZCamHttpServer @Inject constructor(
                         appendLog('push-to-talk unavailable: ' + started.reason + (started.detail ? ' | ' + started.detail : ''));
                         stopBrowserPushToTalkAudio();
                         await apiPost('/api/audio/live', { mode, enabled: false });
+                        sessionStorage.removeItem(STORAGE.pttResume);
+                      } else {
+                        sessionStorage.setItem(STORAGE.pttResume, '1');
                       }
                     } else {
+                      sessionStorage.removeItem(STORAGE.pttResume);
                       stopBrowserPushToTalkAudio();
                     }
                   }
@@ -2329,6 +2936,8 @@ class ZCamHttpServer @Inject constructor(
                 document.getElementById('clearAuthBtn').addEventListener('click', () => {
                   stopBrowserLiveListenAudio();
                   stopBrowserPushToTalkAudio();
+                  sessionStorage.removeItem(STORAGE.liveResume);
+                  sessionStorage.removeItem(STORAGE.pttResume);
                   tokenInput.value = '';
                   localStorage.removeItem(STORAGE.token);
                   clearPendingPairing(true);
@@ -2339,8 +2948,16 @@ class ZCamHttpServer @Inject constructor(
                   recordingsCache = [];
                   recordingEventsCache = [];
                   selectedRecordingName = '';
+                  downloadSelectedRecordingBtn.disabled = true;
                   recordingPlayer.removeAttribute('src');
                   recordingPlayer.load();
+                  renderRecordingMeta(null);
+                  recordingTimeline.innerHTML = '';
+                  recordingTimelineHint.textContent = 'Select a recording to show clip-local event markers.';
+                  updateRecordingPlaybackState('playback: idle', '');
+                  setRecordingLoadState(false, '', null);
+                  setRecordingDownloadState(false, '', null);
+                  setRecordingError('', '');
                   renderRecordings();
                 });
 
@@ -2353,6 +2970,7 @@ class ZCamHttpServer @Inject constructor(
                 });
 
                 document.getElementById('reloadPreviewBtn').addEventListener('click', () => {
+                  updatePreviewState('preview: reloading', 'warnText');
                   applyPreviewSources();
                 });
 
@@ -2373,13 +2991,78 @@ class ZCamHttpServer @Inject constructor(
                   pairingCodeInput.value = pairingCodeInput.value.replace(/[^0-9]/g, '').slice(0, 6);
                 });
 
+                speed05Btn.addEventListener('click', () => setPlaybackSpeed(0.5));
+                speed10Btn.addEventListener('click', () => setPlaybackSpeed(1));
+                speed15Btn.addEventListener('click', () => setPlaybackSpeed(1.5));
+                speed20Btn.addEventListener('click', () => setPlaybackSpeed(2));
+                downloadSelectedRecordingBtn.addEventListener('click', () => {
+                  if (selectedRecordingName) {
+                    downloadRecording(selectedRecordingName);
+                  }
+                });
+
+                videoPreview.addEventListener('load', () => {
+                  if (lastStatusPayload?.video?.running === true) {
+                    updatePreviewState('preview: live', 'okText');
+                  }
+                });
+                videoPreview.addEventListener('error', () => {
+                  updatePreviewState('preview: reconnecting', 'warnText');
+                  schedulePreviewReload('image_error');
+                });
+
+                recordingPlayer.addEventListener('loadstart', () => {
+                  setRecordingLoadState(true, 'Loading video from server...', null);
+                  updateRecordingPlaybackState('playback: loading', 'warnText');
+                  setRecordingError('', '');
+                });
                 recordingPlayer.addEventListener('loadedmetadata', () => {
+                  setPlaybackSpeed(selectedPlaybackRate);
                   if (pendingSeekSeconds !== null) {
                     try {
                       recordingPlayer.currentTime = pendingSeekSeconds;
                     } catch (_) {}
                     pendingSeekSeconds = null;
                   }
+                  renderRecordingTimeline();
+                  updateTimelinePlayhead();
+                });
+                recordingPlayer.addEventListener('canplay', () => {
+                  setRecordingLoadState(false, '', null);
+                  updateRecordingPlaybackState('playback: ready', 'okText');
+                });
+                recordingPlayer.addEventListener('playing', () => {
+                  setRecordingLoadState(false, '', null);
+                  updateRecordingPlaybackState('playback: playing', 'okText');
+                });
+                recordingPlayer.addEventListener('pause', () => {
+                  if (recordingPlayer.readyState > 0 && !recordingPlayer.ended) {
+                    updateRecordingPlaybackState('playback: paused', 'warnText');
+                  }
+                });
+                recordingPlayer.addEventListener('waiting', () => {
+                  setRecordingLoadState(true, 'Buffering video from server...', null);
+                  updateRecordingPlaybackState('playback: buffering', 'warnText');
+                });
+                recordingPlayer.addEventListener('stalled', () => {
+                  setRecordingLoadState(true, 'Video stalled. Waiting for server...', null);
+                  updateRecordingPlaybackState('playback: stalled', 'warnText');
+                });
+                recordingPlayer.addEventListener('ended', () => {
+                  updateRecordingPlaybackState('playback: ended', '');
+                  updateTimelinePlayhead();
+                });
+                recordingPlayer.addEventListener('ratechange', () => {
+                  selectedPlaybackRate = Number(recordingPlayer.playbackRate || 1);
+                  updateSpeedButtons();
+                });
+                recordingPlayer.addEventListener('timeupdate', () => {
+                  updateTimelinePlayhead();
+                });
+                recordingPlayer.addEventListener('error', () => {
+                  setRecordingLoadState(false, '', null);
+                  updateRecordingPlaybackState('playback: failed', 'errText');
+                  setRecordingError('Video playback failed. Reload the clip or check the server connection.', 'errText');
                 });
 
                 window.addEventListener('beforeunload', () => {
@@ -2395,11 +3078,19 @@ class ZCamHttpServer @Inject constructor(
                 updateAuthState();
                 updatePairingState();
                 applyPreviewSources();
+                updateZoomState(null);
+                updatePreviewState('preview: loading', 'warnText');
+                updateAudioRuntimeState(null);
+                updateRecordingPlaybackState('playback: idle', '');
+                downloadSelectedRecordingBtn.disabled = true;
+                setPlaybackSpeed(1);
                 refreshStatus();
                 loadRecordings();
                 setInterval(refreshStatus, 3000);
                 window.setTorch = setTorch;
                 window.setNightMode = setNightMode;
+                window.adjustZoom = adjustZoom;
+                window.resetZoom = resetZoom;
                 window.setAudioLive = setAudioLive;
                 window.playSound = playSound;
                 window.setVolumeNow = setVolumeNow;
@@ -2434,6 +3125,8 @@ class ZCamHttpServer @Inject constructor(
         const val DEFAULT_RECORDINGS_LIST_LIMIT = 120
         const val MAX_RECORDINGS_LIST_LIMIT = 500
         const val AUDIO_SOCKET_QUEUE_CAPACITY = 48
+        const val HTTP_SOCKET_READ_TIMEOUT_MS = 0
+        val AUDIO_STREAM_ID_REGEX = Regex("^[A-Za-z0-9._:-]{1,96}$")
 
         val JSON_PAIR_REGEX =
             Regex("\"([^\"]+)\"\\s*:\\s*(\"(?:\\\\.|[^\"])*\"|true|false|null|-?\\d+(?:\\.\\d+)?)")
