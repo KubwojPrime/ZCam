@@ -9,6 +9,8 @@ import android.os.SystemClock
 import android.util.Size
 import android.view.OrientationEventListener
 import android.view.Surface
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.CameraControl
 import androidx.camera.core.ImageAnalysis
@@ -28,6 +30,8 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
 import com.google.common.util.concurrent.ListenableFuture
 import com.zcam.core.dispatchers.DispatcherProvider
+import com.zcam.core.domain.config.PreviewTransport
+import com.zcam.core.domain.config.RearCameraLens
 import com.zcam.core.domain.config.StreamConfig
 import com.zcam.core.domain.recording.RecordingEvent
 import com.zcam.core.domain.recording.RecordingEventStore
@@ -63,7 +67,7 @@ class CameraRuntimeImpl @Inject constructor(
     private val dispatchers: DispatcherProvider,
     private val recordingEventStore: RecordingEventStore,
     private val logger: ZCamLogger
-) : CameraRuntime, MjpegFrameSource, FramePipelineStatusSource, VideoRecordingPipeline {
+) : CameraRuntime, MjpegFrameSource, FramePipelineStatusSource, VideoRecordingPipeline, PreviewStreamSource {
 
     private val latest = AtomicReference(PLACEHOLDER_JPEG)
     private val running = AtomicBoolean(false)
@@ -91,6 +95,11 @@ class CameraRuntimeImpl @Inject constructor(
     private val zoomRatio = AtomicReference(1f)
     private val minZoomRatio = AtomicReference(1f)
     private val maxZoomRatio = AtomicReference(1f)
+    private val selectedRearLens = AtomicReference(RearCameraLens.MAIN)
+    private val activeRearLens = AtomicReference(RearCameraLens.MAIN)
+    private val ultraWideAvailable = AtomicBoolean(false)
+    private val previewTransport = AtomicReference(PreviewTransport.H264)
+    private val previewEncoder = H264PreviewEncoderController(logger)
     private val recordingTargetRotation = AtomicInteger(Surface.ROTATION_90)
     private val deviceOrientationDegrees = AtomicInteger(OrientationEventListener.ORIENTATION_UNKNOWN)
     private val orientationListener by lazy {
@@ -127,9 +136,10 @@ class CameraRuntimeImpl @Inject constructor(
             if (running.get()) return
 
             val normalizedFps = config.fps.coerceAtLeast(1)
-            targetWidth.set(config.resolution.width)
-            targetHeight.set(config.resolution.height)
-            targetFps.set(normalizedFps)
+            val normalizedPreviewFps = config.preview.fps.coerceAtLeast(1)
+            targetWidth.set(config.preview.resolution.width)
+            targetHeight.set(config.preview.resolution.height)
+            targetFps.set(normalizedPreviewFps)
             producedFrames.set(0L)
             droppedFrames.set(0L)
             lastFrameEpochMs.set(0L)
@@ -137,12 +147,15 @@ class CameraRuntimeImpl @Inject constructor(
             torchEnabled.set(false)
             nightModeEnabled.set(false)
             lowLightBoostSupported.set(false)
+            selectedRearLens.set(config.rearLens)
+            previewTransport.set(config.preview.transport)
             lastControlError.set(null)
             enableOrientationTracking()
 
             val provider = awaitCameraProvider()
+            val rearLensCatalog = RearCameraLensDetector.detectCatalog(provider)
             val encoder = Nv21JpegEncoder()
-            val minFrameIntervalMs = (1000L / normalizedFps).coerceAtLeast(1L)
+            val minFrameIntervalMs = (1000L / normalizedPreviewFps).coerceAtLeast(1L)
             val targetRecordingBitrate = recommendedRecordingBitrate(
                 width = config.resolution.width,
                 height = config.resolution.height,
@@ -152,14 +165,21 @@ class CameraRuntimeImpl @Inject constructor(
                 width = config.resolution.width,
                 height = config.resolution.height
             )
+            val selectedLensBinding = resolveLensBinding(
+                selectedLens = config.rearLens,
+                catalog = rearLensCatalog
+            )
             recordingTargetRotation.set(targetRotation)
+            ultraWideAvailable.set(rearLensCatalog.ultraWideAvailable)
+            activeRearLens.set(selectedLensBinding.activeLens)
+            lastControlError.set(selectedLensBinding.fallbackMessage)
 
             runOnMainExecutor {
                 lifecycleOwner.moveToStarted()
                 provider.unbindAll()
 
                 val preview = Preview.Builder()
-                    .setTargetResolution(Size(config.resolution.width, config.resolution.height))
+                    .setTargetResolution(Size(config.preview.resolution.width, config.preview.resolution.height))
                     .setTargetRotation(targetRotation)
                     .build()
                     .also { useCase ->
@@ -168,7 +188,7 @@ class CameraRuntimeImpl @Inject constructor(
 
                 val analysis = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .setTargetResolution(Size(config.resolution.width, config.resolution.height))
+                    .setTargetResolution(Size(config.preview.resolution.width, config.preview.resolution.height))
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_NV21)
                     .build()
                 val recorder = Recorder.Builder()
@@ -191,7 +211,7 @@ class CameraRuntimeImpl @Inject constructor(
                 val camera = runCatching {
                     provider.bindToLifecycle(
                         lifecycleOwner,
-                        CameraSelector.DEFAULT_BACK_CAMERA,
+                        selectedLensBinding.selector,
                         preview,
                         analysis,
                         videoCapture
@@ -203,7 +223,7 @@ class CameraRuntimeImpl @Inject constructor(
                     analysisEnabled.set(false)
                     provider.bindToLifecycle(
                         lifecycleOwner,
-                        CameraSelector.DEFAULT_BACK_CAMERA,
+                        selectedLensBinding.selector,
                         preview,
                         videoCapture
                     )
@@ -219,6 +239,15 @@ class CameraRuntimeImpl @Inject constructor(
             }
 
             cameraProvider = provider
+            if (config.preview.transport == PreviewTransport.H264) {
+                val encoderStarted = previewEncoder.start(config.preview)
+                if (!encoderStarted) {
+                    lastControlError.set("H.264 preview unavailable; use MJPEG fallback")
+                    logger.w("H.264 preview unavailable, MJPEG fallback remains available")
+                }
+            } else {
+                previewEncoder.stop()
+            }
             boundCamera?.let { camera ->
                 runCatching {
                     syncZoomStateFromCamera(camera)
@@ -230,7 +259,9 @@ class CameraRuntimeImpl @Inject constructor(
                 }
             }
             running.set(true)
-            logger.i("Camera runtime started (${config.resolution.width}x${config.resolution.height}@$normalizedFps)")
+            logger.i(
+                "Camera runtime started (record ${config.resolution.width}x${config.resolution.height}@$normalizedFps, preview ${config.preview.transport.wireName} ${config.preview.resolution.width}x${config.preview.resolution.height}@${config.preview.fps})"
+            )
         }
     }
 
@@ -262,6 +293,7 @@ class CameraRuntimeImpl @Inject constructor(
                 cameraProvider = null
             }
             disableOrientationTracking()
+            previewEncoder.stop()
             analysisEnabled.set(false)
             torchEnabled.set(false)
             nightModeEnabled.set(false)
@@ -288,6 +320,9 @@ class CameraRuntimeImpl @Inject constructor(
             zoomRatio = zoomRatio.get().coerceAtLeast(1f),
             minZoomRatio = minZoomRatio.get().coerceAtLeast(1f),
             maxZoomRatio = maxZoomRatio.get().coerceAtLeast(minZoomRatio.get().coerceAtLeast(1f)),
+            selectedRearLens = selectedRearLens.get(),
+            activeRearLens = activeRearLens.get(),
+            ultraWideAvailable = ultraWideAvailable.get(),
             lastError = lastControlError.get()
         )
     }
@@ -384,6 +419,22 @@ class CameraRuntimeImpl @Inject constructor(
     }
 
     override fun latestFrame(): ByteArray = latest.get()
+
+    override suspend fun registerH264PreviewSubscriber(
+        subscriberId: String,
+        onConfig: (H264PreviewStreamConfig) -> Unit,
+        onAccessUnit: (H264PreviewAccessUnit) -> Unit
+    ): Boolean = withContext(dispatchers.io) {
+        previewEncoder.registerSubscriber(subscriberId, onConfig, onAccessUnit)
+    }
+
+    override suspend fun unregisterH264PreviewSubscriber(subscriberId: String) = withContext(dispatchers.io) {
+        previewEncoder.unregisterSubscriber(subscriberId)
+    }
+
+    override fun previewStreamingDiagnostics(): PreviewStreamingDiagnostics {
+        return previewEncoder.diagnostics()
+    }
 
     override fun snapshot(): FramePipelineStatus = FramePipelineStatus(
         running = running.get(),
@@ -563,6 +614,43 @@ class CameraRuntimeImpl @Inject constructor(
         maxZoomRatio.set(zoomState?.maxZoomRatio?.coerceAtLeast(minZoomRatio.get()) ?: minZoomRatio.get())
     }
 
+    private fun resolveLensBinding(
+        selectedLens: RearCameraLens,
+        catalog: RearCameraLensCatalog
+    ): LensBinding {
+        val resolvedCameraId = when (selectedLens) {
+            RearCameraLens.MAIN -> catalog.mainCameraId
+            RearCameraLens.ULTRA_WIDE -> catalog.ultraWideCameraId ?: catalog.mainCameraId
+        }
+        val activeLens = when {
+            selectedLens == RearCameraLens.ULTRA_WIDE && catalog.ultraWideAvailable -> RearCameraLens.ULTRA_WIDE
+            else -> RearCameraLens.MAIN
+        }
+        val selector = resolvedCameraId?.let(::selectorForCameraId) ?: CameraSelector.DEFAULT_BACK_CAMERA
+        val fallbackMessage = if (selectedLens == RearCameraLens.ULTRA_WIDE && !catalog.ultraWideAvailable) {
+            "ultra-wide camera not detected; using main camera"
+        } else {
+            null
+        }
+        return LensBinding(
+            selector = selector,
+            activeLens = activeLens,
+            fallbackMessage = fallbackMessage
+        )
+    }
+
+    private fun selectorForCameraId(cameraId: String): CameraSelector {
+        return CameraSelector.Builder()
+            .addCameraFilter { cameraInfos ->
+                cameraInfos.filter { cameraInfo -> cameraIdFor(cameraInfo) == cameraId }
+            }
+            .build()
+    }
+
+    private fun cameraIdFor(cameraInfo: CameraInfo): String? {
+        return runCatching { Camera2CameraInfo.from(cameraInfo).cameraId }.getOrNull()
+    }
+
     private fun enableOrientationTracking() {
         runCatching {
             if (orientationListener.canDetectOrientation()) {
@@ -671,8 +759,20 @@ class CameraRuntimeImpl @Inject constructor(
                 image = image,
                 eventEpochMs = System.currentTimeMillis()
             )
-            val jpeg = encoder.encode(image)
-            latest.set(jpeg)
+            val useH264Preview = previewTransport.get() == PreviewTransport.H264
+            val encodedPreview = encoder.encode(
+                image = image,
+                includeNv21 = useH264Preview
+            )
+            latest.set(encodedPreview.jpeg)
+            if (useH264Preview) {
+                previewEncoder.submitFrame(
+                    nv21 = encodedPreview.nv21 ?: return,
+                    width = image.width,
+                    height = image.height,
+                    presentationTimeUs = System.nanoTime() / 1_000L
+                )
+            }
             producedFrames.incrementAndGet()
             lastFrameEpochMs.set(System.currentTimeMillis())
             if (event != null) {
@@ -691,6 +791,12 @@ class CameraRuntimeImpl @Inject constructor(
     private val mainExecutor: Executor by lazy {
         ContextCompat.getMainExecutor(appContext)
     }
+
+    private data class LensBinding(
+        val selector: CameraSelector,
+        val activeLens: RearCameraLens,
+        val fallbackMessage: String?
+    )
 
     private class RuntimeLifecycleOwner : LifecycleOwner {
         private val registry = LifecycleRegistry(this).apply {
@@ -715,7 +821,10 @@ class CameraRuntimeImpl @Inject constructor(
 
         var lastProcessedAtMs: Long = 0L
 
-        fun encode(image: ImageProxy): ByteArray {
+        fun encode(
+            image: ImageProxy,
+            includeNv21: Boolean
+        ): EncodedPreviewFrame {
             val width = image.width
             val height = image.height
             val requiredSize = (width * height * 3) / 2
@@ -729,7 +838,10 @@ class CameraRuntimeImpl @Inject constructor(
             output.reset()
             val yuvImage = YuvImage(nv21Buffer, ImageFormat.NV21, width, height, null)
             yuvImage.compressToJpeg(Rect(0, 0, width, height), JPEG_QUALITY, output)
-            return output.toByteArray()
+            return EncodedPreviewFrame(
+                jpeg = output.toByteArray(),
+                nv21 = if (includeNv21) nv21Buffer.copyOf() else null
+            )
         }
 
         private fun copyYPlane(image: ImageProxy, destination: ByteArray, width: Int, height: Int) {
@@ -796,6 +908,11 @@ class CameraRuntimeImpl @Inject constructor(
             }
         }
     }
+
+    private data class EncodedPreviewFrame(
+        val jpeg: ByteArray,
+        val nv21: ByteArray?
+    )
 
     private class MotionEventDetector {
         private var previousSamples = IntArray(0)

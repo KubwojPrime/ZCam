@@ -6,7 +6,8 @@ object RuntimeSettingsDefaults {
         stream = StreamConfig(
             resolution = VideoResolution.HD_720P,
             fps = 15,
-            codec = VideoCodec.H264
+            codec = VideoCodec.H264,
+            preview = PreviewProfile.BALANCED.toConfig(PreviewTransport.H264)
         ),
         recording = LoopRecordingConfig(
             segmentMinutes = 5,

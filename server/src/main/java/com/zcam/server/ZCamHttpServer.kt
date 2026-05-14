@@ -11,7 +11,11 @@ import com.zcam.camera.CameraControlCommandResult
 import com.zcam.camera.CameraControlErrorCode
 import com.zcam.camera.CameraControlManager
 import com.zcam.camera.FramePipelineStatusSource
+import com.zcam.camera.H264PreviewAccessUnit
+import com.zcam.camera.H264PreviewStreamConfig
 import com.zcam.camera.MjpegFrameSource
+import com.zcam.camera.PreviewStreamSource
+import com.zcam.core.domain.config.PreviewTransport
 import com.zcam.core.device.PowerStatusProvider
 import com.zcam.core.device.PowerStatusSnapshot
 import com.zcam.core.dispatchers.DispatcherProvider
@@ -48,6 +52,7 @@ import java.net.NetworkInterface
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.time.Instant
+import java.util.Base64
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
@@ -85,7 +90,7 @@ class ZCamHttpServer @Inject constructor(
         val httpServer = object : NanoWSD(port) {
             override fun serve(session: IHTTPSession): Response {
                 return authorizeAndHandleSession(session) {
-                    if (isWebsocketRequested(session) && session.uri.orEmpty() != AUDIO_SOCKET_PATH) {
+                    if (isWebsocketRequested(session) && session.uri.orEmpty() !in setOf(AUDIO_SOCKET_PATH, PREVIEW_SOCKET_PATH)) {
                         return@authorizeAndHandleSession newFixedLengthResponse(
                             Response.Status.NOT_FOUND,
                             MIME_PLAINTEXT,
@@ -99,7 +104,11 @@ class ZCamHttpServer @Inject constructor(
             override fun serveHttp(session: IHTTPSession): Response = routeRequest(session)
 
             override fun openWebSocket(handshake: IHTTPSession): WebSocket {
-                return createAudioWebSocket(handshake)
+                return when (handshake.uri.orEmpty()) {
+                    AUDIO_SOCKET_PATH -> createAudioWebSocket(handshake)
+                    PREVIEW_SOCKET_PATH -> createPreviewWebSocket(handshake)
+                    else -> createRejectedWebSocket(handshake, "unsupported websocket")
+                }
             }
         }
 
@@ -173,6 +182,33 @@ class ZCamHttpServer @Inject constructor(
 
     private fun createAudioWebSocket(handshake: NanoHTTPD.IHTTPSession): NanoWSD.WebSocket {
         return AudioWebSocket(handshake)
+    }
+
+    private fun createPreviewWebSocket(handshake: NanoHTTPD.IHTTPSession): NanoWSD.WebSocket {
+        return PreviewWebSocket(handshake)
+    }
+
+    private fun createRejectedWebSocket(
+        handshake: NanoHTTPD.IHTTPSession,
+        reason: String
+    ): NanoWSD.WebSocket {
+        return object : NanoWSD.WebSocket(handshake) {
+            override fun onOpen() {
+                close(NanoWSD.WebSocketFrame.CloseCode.PolicyViolation, reason, false)
+            }
+
+            override fun onClose(
+                code: NanoWSD.WebSocketFrame.CloseCode,
+                reason: String,
+                initiatedByRemote: Boolean
+            ) = Unit
+
+            override fun onMessage(message: NanoWSD.WebSocketFrame) = Unit
+
+            override fun onPong(pong: NanoWSD.WebSocketFrame) = Unit
+
+            override fun onException(exception: IOException) = Unit
+        }
     }
 
     private inner class AudioWebSocket(
@@ -269,6 +305,91 @@ class ZCamHttpServer @Inject constructor(
                 send(audioSocketConfigJson(config, role))
             }.onFailure {
                 rejectSocket("audio config send failed")
+            }
+        }
+
+        private fun rejectSocket(reason: String) {
+            runCatching {
+                close(NanoWSD.WebSocketFrame.CloseCode.PolicyViolation, reason, false)
+            }
+        }
+    }
+
+    private inner class PreviewWebSocket(
+        handshake: NanoHTTPD.IHTTPSession
+    ) : NanoWSD.WebSocket(handshake) {
+
+        private val connectionId = buildPreviewSocketConnectionId(handshake)
+        private val outboundFrames = Channel<H264PreviewAccessUnit>(
+            capacity = PREVIEW_SOCKET_QUEUE_CAPACITY,
+            onBufferOverflow = BufferOverflow.DROP_OLDEST
+        )
+        private var outboundJob: Job? = null
+        private var waitingForKeyFrame = true
+
+        override fun onOpen() {
+            val source = previewSource()
+            if (source == null) {
+                rejectSocket("preview source unavailable")
+                return
+            }
+            val accepted = runBlocking {
+                source.registerH264PreviewSubscriber(
+                    subscriberId = connectionId,
+                    onConfig = { config -> sendPreviewConfig(config) },
+                    onAccessUnit = { accessUnit ->
+                        outboundFrames.trySend(accessUnit)
+                    }
+                )
+            }
+            if (!accepted) {
+                rejectSocket("preview transport unavailable")
+                return
+            }
+            outboundJob = websocketScope.launch {
+                for (frame in outboundFrames) {
+                    if (waitingForKeyFrame && !frame.isKeyFrame) {
+                        continue
+                    }
+                    waitingForKeyFrame = false
+                    val sent = runCatching { send(frame.data) }.isSuccess
+                    if (!sent) {
+                        rejectSocket("preview send failed")
+                        break
+                    }
+                }
+            }
+        }
+
+        override fun onClose(
+            code: NanoWSD.WebSocketFrame.CloseCode,
+            reason: String,
+            initiatedByRemote: Boolean
+        ) {
+            outboundFrames.close()
+            outboundJob?.cancel()
+            websocketScope.launch {
+                previewSource()?.unregisterH264PreviewSubscriber(connectionId)
+            }
+        }
+
+        override fun onMessage(message: NanoWSD.WebSocketFrame) = Unit
+
+        override fun onPong(pong: NanoWSD.WebSocketFrame) = Unit
+
+        override fun onException(exception: IOException) {
+            logger.w(
+                LogEventId.COMPONENT_FAILED,
+                "Preview websocket exception message=${exception.message}"
+            )
+        }
+
+        private fun sendPreviewConfig(config: H264PreviewStreamConfig) {
+            runCatching {
+                waitingForKeyFrame = true
+                send(previewSocketConfigJson(config))
+            }.onFailure {
+                rejectSocket("preview config send failed")
             }
         }
 
@@ -1069,6 +1190,39 @@ class ZCamHttpServer @Inject constructor(
         }
     }
 
+    private fun buildPreviewSocketConnectionId(session: NanoHTTPD.IHTTPSession): String {
+        val explicitStreamId = firstQueryValue(session, "streamId")
+            ?: firstQueryValue(session, "sid")
+        explicitStreamId
+            ?.trim()
+            ?.takeIf { AUDIO_STREAM_ID_REGEX.matches(it) }
+            ?.let { return "preview-$it" }
+        val deviceId = extractDeviceId(session)?.ifBlank { null } ?: "anonymous"
+        val remoteIp = session.remoteIpAddress.ifBlank { "unknown" }
+        return "preview-$deviceId-$remoteIp-${System.nanoTime()}"
+    }
+
+    private fun previewSocketConfigJson(config: H264PreviewStreamConfig): String {
+        return buildString(capacity = 512) {
+            append('{')
+            append("\"type\":\"config\",")
+            append("\"transport\":").append(jsonString(PreviewTransport.H264.wireName)).append(',')
+            append("\"codec\":").append(jsonString(config.codecMime)).append(',')
+            append("\"width\":").append(config.width).append(',')
+            append("\"height\":").append(config.height).append(',')
+            append("\"fps\":").append(config.fps).append(',')
+            append("\"bitrateKbps\":").append(config.bitrateKbps).append(',')
+            append("\"keyframeIntervalSec\":").append(config.keyframeIntervalSec).append(',')
+            append("\"csd0\":").append(jsonString(Base64.getEncoder().encodeToString(config.csd0))).append(',')
+            append("\"csd1\":").append(jsonString(Base64.getEncoder().encodeToString(config.csd1)))
+            append('}')
+        }
+    }
+
+    private fun previewSource(): PreviewStreamSource? {
+        return frameSource as? PreviewStreamSource
+    }
+
     private fun parseEpochParam(raw: String?): Long? {
         val value = raw?.trim().orEmpty()
         if (value.isEmpty()) return null
@@ -1284,6 +1438,7 @@ class ZCamHttpServer @Inject constructor(
         val uptimeMs = (now - startedAtEpochMs.get()).coerceAtLeast(0L)
         val frame = frameStatusSource.snapshot()
         val cameraControls = cameraControlManager.controlsSnapshot()
+        val previewDiagnostics = previewSource()?.previewStreamingDiagnostics()
         val lastFrameAgeMs = if (frame.lastFrameEpochMs > 0L) {
             (now - frame.lastFrameEpochMs).coerceAtLeast(0L)
         } else {
@@ -1299,7 +1454,7 @@ class ZCamHttpServer @Inject constructor(
             append("\"port\":").append(activePort).append(',')
             append("\"alive\":").append(server?.isAlive == true).append(',')
             append("\"uptimeMs\":").append(uptimeMs).append(',')
-            append("\"streamClients\":").append(activeStreamClients.get())
+            append("\"streamClients\":").append(activeStreamClients.get() + (previewDiagnostics?.subscriberCount ?: 0))
             append("},")
             append("\"video\":{")
             append("\"running\":").append(frame.running).append(',')
@@ -1309,7 +1464,8 @@ class ZCamHttpServer @Inject constructor(
             append("\"producedFrames\":").append(frame.producedFrames).append(',')
             append("\"droppedFrames\":").append(frame.droppedFrames).append(',')
             append("\"lastFrameEpochMs\":").append(frame.lastFrameEpochMs).append(',')
-            append("\"lastFrameAgeMs\":").append(lastFrameAgeMs)
+            append("\"lastFrameAgeMs\":").append(lastFrameAgeMs).append(',')
+            append("\"preview\":").append(previewDiagnosticsJson(previewDiagnostics))
             append("},")
             append("\"cameraControls\":").append(cameraControlStateJson(cameraControls)).append(',')
             append("\"audio\":").append(audioStateJson(audio)).append(',')
@@ -1378,7 +1534,40 @@ class ZCamHttpServer @Inject constructor(
             append("\"zoomRatio\":").append(state.zoomRatio).append(',')
             append("\"minZoomRatio\":").append(state.minZoomRatio).append(',')
             append("\"maxZoomRatio\":").append(state.maxZoomRatio).append(',')
+            append("\"selectedRearLens\":").append(jsonString(state.selectedRearLens.wireName)).append(',')
+            append("\"activeRearLens\":").append(jsonString(state.activeRearLens.wireName)).append(',')
+            append("\"ultraWideAvailable\":").append(state.ultraWideAvailable).append(',')
             append("\"lastError\":").append(jsonString(state.lastError))
+            append('}')
+        }
+    }
+
+    private fun previewDiagnosticsJson(diagnostics: com.zcam.camera.PreviewStreamingDiagnostics?): String {
+        val safeDiagnostics = diagnostics ?: com.zcam.camera.PreviewStreamingDiagnostics(
+            transport = PreviewTransport.MJPEG,
+            targetWidth = frameStatusSource.snapshot().targetWidth,
+            targetHeight = frameStatusSource.snapshot().targetHeight,
+            targetFps = frameStatusSource.snapshot().targetFps,
+            targetBitrateKbps = 0,
+            estimatedBitrateKbps = 0,
+            sentFps = 0,
+            subscriberCount = 0,
+            encoderRunning = false,
+            mjpegFallbackAvailable = true
+        )
+        return buildString(capacity = 320) {
+            append('{')
+            append("\"transport\":").append(jsonString(safeDiagnostics.transport.wireName)).append(',')
+            append("\"targetWidth\":").append(safeDiagnostics.targetWidth).append(',')
+            append("\"targetHeight\":").append(safeDiagnostics.targetHeight).append(',')
+            append("\"targetFps\":").append(safeDiagnostics.targetFps).append(',')
+            append("\"targetBitrateKbps\":").append(safeDiagnostics.targetBitrateKbps).append(',')
+            append("\"estimatedBitrateKbps\":").append(safeDiagnostics.estimatedBitrateKbps).append(',')
+            append("\"sentFps\":").append(safeDiagnostics.sentFps).append(',')
+            append("\"subscriberCount\":").append(safeDiagnostics.subscriberCount).append(',')
+            append("\"encoderRunning\":").append(safeDiagnostics.encoderRunning).append(',')
+            append("\"mjpegFallbackAvailable\":").append(safeDiagnostics.mjpegFallbackAvailable).append(',')
+            append("\"lastError\":").append(jsonString(safeDiagnostics.lastError))
             append('}')
         }
     }
@@ -1568,6 +1757,7 @@ class ZCamHttpServer @Inject constructor(
                       <button id="reloadPreviewBtn" type="button">Reload preview</button>
                       <a id="snapshotLink" class="chip" href="/snapshot.jpg" target="_blank">Open snapshot</a>
                       <span class="chip mono" id="previewState">preview: idle</span>
+                      <span class="chip mono" id="previewTransportState">transport: browser MJPEG fallback</span>
                     </div>
                     <img id="videoPreview" src="/video" alt="ZCam stream" />
                   </div>
@@ -1709,6 +1899,7 @@ class ZCamHttpServer @Inject constructor(
                 const apiLog = document.getElementById('apiLog');
                 const videoPreview = document.getElementById('videoPreview');
                 const previewState = document.getElementById('previewState');
+                const previewTransportState = document.getElementById('previewTransportState');
                 const snapshotLink = document.getElementById('snapshotLink');
                 const volumeRange = document.getElementById('volumeRange');
                 const volumeLabel = document.getElementById('volumeLabel');
@@ -2142,6 +2333,27 @@ class ZCamHttpServer @Inject constructor(
                   const query = authQuery();
                   videoPreview.src = '/video' + query;
                   snapshotLink.href = '/snapshot.jpg' + query;
+                  updatePreviewTransportState(lastStatusPayload?.video?.preview || null);
+                }
+
+                function updatePreviewTransportState(preview) {
+                  const transport = String(preview?.transport || 'mjpeg').toLowerCase();
+                  const width = Number(preview?.targetWidth || 0);
+                  const height = Number(preview?.targetHeight || 0);
+                  const fps = Number(preview?.targetFps || 0);
+                  const bitrateKbps = Number(preview?.targetBitrateKbps || 0);
+                  const resolution = width > 0 && height > 0 ? (' ' + width + 'x' + height) : '';
+                  const fpsLabel = fps > 0 ? (' ' + fps + ' FPS') : '';
+                  const bitrateLabel = bitrateKbps > 0 ? (' ' + bitrateKbps + ' kbps') : '';
+                  if (transport === 'h264') {
+                    previewTransportState.textContent =
+                      'transport: browser MJPEG fallback | server H.264' + resolution + fpsLabel + bitrateLabel;
+                    previewTransportState.className = 'chip mono warnText';
+                  } else {
+                    previewTransportState.textContent =
+                      'transport: MJPEG' + resolution + fpsLabel;
+                    previewTransportState.className = 'chip mono okText';
+                  }
                 }
 
                 function audioSocketUrl(role) {
@@ -2772,6 +2984,7 @@ class ZCamHttpServer @Inject constructor(
                       volumeRange.value = String(audioVolume);
                       volumeLabel.textContent = audioVolume + '%';
                     }
+                    updatePreviewTransportState(data?.video?.preview);
                     updateZoomState(data?.cameraControls);
                     updateAudioRuntimeState(data?.audio);
                     if (!serverAlive) {
@@ -3121,10 +3334,12 @@ class ZCamHttpServer @Inject constructor(
         const val DEFAULT_PORT = 8080
         const val BOUNDARY = "zcamframe"
         const val AUDIO_SOCKET_PATH = "/ws/audio"
+        const val PREVIEW_SOCKET_PATH = "/ws/preview"
         const val JSON_UTF8 = "application/json; charset=utf-8"
         const val DEFAULT_RECORDINGS_LIST_LIMIT = 120
         const val MAX_RECORDINGS_LIST_LIMIT = 500
         const val AUDIO_SOCKET_QUEUE_CAPACITY = 48
+        const val PREVIEW_SOCKET_QUEUE_CAPACITY = 12
         const val HTTP_SOCKET_READ_TIMEOUT_MS = 0
         val AUDIO_STREAM_ID_REGEX = Regex("^[A-Za-z0-9._:-]{1,96}$")
 

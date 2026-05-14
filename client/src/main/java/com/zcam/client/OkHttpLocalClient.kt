@@ -1,6 +1,8 @@
 package com.zcam.client
 
 import com.zcam.core.dispatchers.DispatcherProvider
+import com.zcam.core.domain.config.PreviewTransport
+import com.zcam.core.domain.config.RearCameraLens
 import com.zcam.core.logging.ZCamLogger
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -41,6 +43,7 @@ class OkHttpLocalClient @Inject constructor(
         ) { payload ->
             val server = payload.optJSONObject("server")
             val video = payload.optJSONObject("video")
+            val preview = video?.optJSONObject("preview")
             val cameraControls = payload.optJSONObject("cameraControls")
             val audio = payload.optJSONObject("audio")
             val power = payload.optJSONObject("power")
@@ -51,6 +54,21 @@ class OkHttpLocalClient @Inject constructor(
                 uptimeMs = server?.optLong("uptimeMs") ?: 0L,
                 videoRunning = video?.optBoolean("running") ?: false,
                 lastFrameAgeMs = video?.optLong("lastFrameAgeMs") ?: -1L,
+                previewTransport = if (preview != null) {
+                    PreviewTransport.fromWireName(preview.optString("transport"))
+                } else {
+                    PreviewTransport.MJPEG
+                },
+                previewTargetWidth = preview?.optInt("targetWidth") ?: (video?.optInt("targetWidth") ?: 0),
+                previewTargetHeight = preview?.optInt("targetHeight") ?: (video?.optInt("targetHeight") ?: 0),
+                previewTargetFps = preview?.optInt("targetFps") ?: (video?.optInt("targetFps") ?: 0),
+                previewTargetBitrateKbps = preview?.optInt("targetBitrateKbps") ?: 0,
+                previewEstimatedBitrateKbps = preview?.optInt("estimatedBitrateKbps") ?: 0,
+                previewSentFps = preview?.optInt("sentFps") ?: 0,
+                previewSubscriberCount = preview?.optInt("subscriberCount") ?: 0,
+                previewEncoderRunning = preview?.optBoolean("encoderRunning") ?: false,
+                previewMjpegFallbackAvailable = preview?.optBoolean("mjpegFallbackAvailable") ?: true,
+                previewEncoderError = preview?.optString("lastError").takeUnless { it.isNullOrBlank() },
                 torchEnabled = cameraControls?.optBoolean("torchEnabled") ?: false,
                 nightModeEnabled = cameraControls?.optBoolean("nightModeEnabled") ?: false,
                 lowLightBoostSupported = cameraControls?.optBoolean("lowLightBoostSupported") ?: false,
@@ -58,6 +76,9 @@ class OkHttpLocalClient @Inject constructor(
                 zoomRatio = cameraControls?.optDouble("zoomRatio")?.toFloat() ?: 1f,
                 minZoomRatio = cameraControls?.optDouble("minZoomRatio")?.toFloat() ?: 1f,
                 maxZoomRatio = cameraControls?.optDouble("maxZoomRatio")?.toFloat() ?: 1f,
+                selectedRearLens = RearCameraLens.fromWireName(cameraControls?.optString("selectedRearLens")),
+                activeRearLens = RearCameraLens.fromWireName(cameraControls?.optString("activeRearLens")),
+                ultraWideAvailable = cameraControls?.optBoolean("ultraWideAvailable") ?: false,
                 audioTransmitting = audio?.optBoolean("transmitting") ?: false,
                 audioLiveListening = audio?.optBoolean("liveListening") ?: false,
                 audioPlayingBack = audio?.optBoolean("playingBack") ?: false,
@@ -72,6 +93,17 @@ class OkHttpLocalClient @Inject constructor(
 
     override fun buildPreviewStreamUrl(target: ClientTarget): String {
         val base = "http://${target.host}:${target.port}/video"
+        val query = authQuery(target)
+        return if (query.isBlank()) base else "$base?$query"
+    }
+
+    override fun buildPreviewH264SocketUrl(target: ClientTarget): String {
+        val base = "ws://${target.host}:${target.port}/ws/preview"
+        val query = authQuery(target)
+        return if (query.isBlank()) base else "$base?$query"
+    }
+
+    private fun authQuery(target: ClientTarget): String {
         val query = buildList {
             target.token?.takeIf { it.isNotBlank() }?.let {
                 add("token=" + URLEncoder.encode(it, StandardCharsets.UTF_8.name()))
@@ -80,7 +112,7 @@ class OkHttpLocalClient @Inject constructor(
                 add("deviceId=" + URLEncoder.encode(it, StandardCharsets.UTF_8.name()))
             }
         }.joinToString("&")
-        return if (query.isBlank()) base else "$base?$query"
+        return query
     }
 
     override suspend fun fetchSnapshot(target: ClientTarget): ClientCallResult<ByteArray> = withContext(dispatchers.io) {

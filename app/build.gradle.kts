@@ -14,8 +14,8 @@ android {
         applicationId = "com.zcam"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.2.3"
+        versionCode = 6
+        versionName = "0.2.4"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -61,6 +61,7 @@ dependencies {
     implementation(project(":service"))
     implementation(project(":data"))
     implementation(project(":client"))
+    implementation(project(":camera"))
     implementation(project(":security"))
     implementation(project(":watchdog"))
 

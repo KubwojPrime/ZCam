@@ -12,6 +12,9 @@ import com.zcam.core.dispatchers.IoDispatcher
 import com.zcam.core.domain.config.FeatureFlag
 import com.zcam.core.domain.config.FeatureFlags
 import com.zcam.core.domain.config.LoopRecordingConfig
+import com.zcam.core.domain.config.PreviewStreamConfig
+import com.zcam.core.domain.config.PreviewTransport
+import com.zcam.core.domain.config.RearCameraLens
 import com.zcam.core.domain.config.RuntimeSettings
 import com.zcam.core.domain.config.RuntimeSettingsDefaults
 import com.zcam.core.domain.config.RuntimeSettingsValidator
@@ -124,7 +127,21 @@ class DataStoreRuntimeSettingsRepository @Inject constructor(
             fps = this[FPS] ?: defaults.stream.fps,
             codec = this[VIDEO_CODEC]
                 ?.let { raw -> VideoCodec.entries.firstOrNull { it.name == raw } }
-                ?: defaults.stream.codec
+                ?: defaults.stream.codec,
+            rearLens = this[REAR_LENS]
+                ?.let(RearCameraLens::fromWireName)
+                ?: defaults.stream.rearLens,
+            preview = PreviewStreamConfig(
+                transport = this[PREVIEW_TRANSPORT]
+                    ?.let(PreviewTransport::fromWireName)
+                    ?: defaults.stream.preview.transport,
+                resolution = VideoResolution(
+                    width = this[PREVIEW_WIDTH] ?: defaults.stream.preview.resolution.width,
+                    height = this[PREVIEW_HEIGHT] ?: defaults.stream.preview.resolution.height
+                ),
+                fps = this[PREVIEW_FPS] ?: defaults.stream.preview.fps,
+                bitrateKbps = this[PREVIEW_BITRATE_KBPS] ?: defaults.stream.preview.bitrateKbps
+            )
         )
 
         val recording = LoopRecordingConfig(
@@ -169,6 +186,12 @@ class DataStoreRuntimeSettingsRepository @Inject constructor(
         this[RESOLUTION_HEIGHT] = settings.stream.resolution.height
         this[FPS] = settings.stream.fps
         this[VIDEO_CODEC] = settings.stream.codec.name
+        this[REAR_LENS] = settings.stream.rearLens.wireName
+        this[PREVIEW_TRANSPORT] = settings.stream.preview.transport.wireName
+        this[PREVIEW_WIDTH] = settings.stream.preview.resolution.width
+        this[PREVIEW_HEIGHT] = settings.stream.preview.resolution.height
+        this[PREVIEW_FPS] = settings.stream.preview.fps
+        this[PREVIEW_BITRATE_KBPS] = settings.stream.preview.bitrateKbps
 
         this[SEGMENT_MINUTES] = settings.recording.segmentMinutes
         this[MAX_STORAGE_GB] = settings.recording.maxStorageGb
@@ -193,6 +216,12 @@ class DataStoreRuntimeSettingsRepository @Inject constructor(
         val RESOLUTION_HEIGHT = intPreferencesKey("stream_resolution_height")
         val FPS = intPreferencesKey("stream_fps")
         val VIDEO_CODEC = stringPreferencesKey("stream_codec")
+        val REAR_LENS = stringPreferencesKey("stream_rear_lens")
+        val PREVIEW_TRANSPORT = stringPreferencesKey("preview_transport")
+        val PREVIEW_WIDTH = intPreferencesKey("preview_width")
+        val PREVIEW_HEIGHT = intPreferencesKey("preview_height")
+        val PREVIEW_FPS = intPreferencesKey("preview_fps")
+        val PREVIEW_BITRATE_KBPS = intPreferencesKey("preview_bitrate_kbps")
 
         val SEGMENT_MINUTES = intPreferencesKey("recording_segment_minutes")
         val MAX_STORAGE_GB = intPreferencesKey("recording_max_storage_gb")

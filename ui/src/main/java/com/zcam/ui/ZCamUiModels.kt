@@ -1,6 +1,9 @@
 package com.zcam.ui
 
 import com.zcam.core.domain.config.FeatureFlag
+import com.zcam.core.domain.config.PreviewProfile
+import com.zcam.core.domain.config.PreviewTransport
+import com.zcam.core.domain.config.RearCameraLens
 
 enum class ZCamMode {
     SERVER,
@@ -99,6 +102,14 @@ data class SettingsUiState(
     val streamHeightInput: String = "720",
     val streamFpsInput: String = "15",
     val streamCodecLabel: String = "H264",
+    val rearLensSelection: RearCameraLens = RearCameraLens.MAIN,
+    val ultraWideLensAvailable: Boolean = false,
+    val previewTransportSelection: PreviewTransport = PreviewTransport.H264,
+    val previewProfileSelection: PreviewProfile? = PreviewProfile.BALANCED,
+    val previewWidthInput: String = "1280",
+    val previewHeightInput: String = "720",
+    val previewFpsInput: String = "15",
+    val previewBitrateKbpsInput: String = "1200",
     val segmentMinutesInput: String = "5",
     val maxStorageGbInput: String = "32",
     val minFreeStorageGbInput: String = "5",
@@ -142,9 +153,13 @@ data class ZCamUiState(
     val runtimeTone: StatusTone = StatusTone.NEUTRAL,
     val previewFrameJpeg: ByteArray? = null,
     val previewStreamUrl: String = "",
+    val previewMjpegFallbackUrl: String = "",
+    val previewTransport: PreviewTransport = PreviewTransport.H264,
     val previewLabel: String = "No frame",
     val previewStateLabel: String = "Preview idle",
     val previewStateTone: StatusTone = StatusTone.NEUTRAL,
+    val previewTransportLabel: String = "Preview transport: H.264",
+    val previewDiagnosticsLabel: String = "Preview profile: 720p 15 FPS 1200 kbps",
     val serverBatteryPercent: Int? = null,
     val serverCharging: Boolean? = null,
     val serverBatteryLabel: String = "Battery unavailable",
@@ -170,6 +185,9 @@ data class ZCamUiState(
     val clientStatusLabel: String = "Client disconnected",
     val audioRuntimeLabel: String = "Audio idle",
     val audioRuntimeTone: StatusTone = StatusTone.NEUTRAL,
+    val cameraLensLabel: String = "Lens: Main camera selected",
+    val cameraLensTone: StatusTone = StatusTone.NEUTRAL,
+    val ultraWideAvailable: Boolean = false,
     val clientTorchEnabled: Boolean = false,
     val clientNightModeEnabled: Boolean = false,
     val clientLowLightBoostSupported: Boolean = false,
@@ -231,6 +249,13 @@ sealed interface ZCamUiAction {
     data class SettingsStreamWidthChanged(val value: String) : ZCamUiAction
     data class SettingsStreamHeightChanged(val value: String) : ZCamUiAction
     data class SettingsStreamFpsChanged(val value: String) : ZCamUiAction
+    data class SettingsRearLensChanged(val value: RearCameraLens) : ZCamUiAction
+    data class SettingsPreviewTransportChanged(val value: PreviewTransport) : ZCamUiAction
+    data class SettingsPreviewProfileSelected(val value: PreviewProfile) : ZCamUiAction
+    data class SettingsPreviewWidthChanged(val value: String) : ZCamUiAction
+    data class SettingsPreviewHeightChanged(val value: String) : ZCamUiAction
+    data class SettingsPreviewFpsChanged(val value: String) : ZCamUiAction
+    data class SettingsPreviewBitrateChanged(val value: String) : ZCamUiAction
     data class SettingsSegmentMinutesChanged(val value: String) : ZCamUiAction
     data class SettingsMaxStorageGbChanged(val value: String) : ZCamUiAction
     data class SettingsMinFreeStorageGbChanged(val value: String) : ZCamUiAction

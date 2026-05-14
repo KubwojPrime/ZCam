@@ -5,6 +5,7 @@ import com.zcam.audio.AudioTransportConfig
 import com.zcam.camera.CameraRuntime
 import com.zcam.core.dispatchers.DispatcherProvider
 import com.zcam.core.domain.config.FeatureFlags
+import com.zcam.core.domain.config.RearCameraLens
 import com.zcam.core.domain.config.RuntimeSettings
 import com.zcam.core.domain.config.RuntimeSettingsDefaults
 import com.zcam.core.domain.config.TrustedDevice
@@ -23,6 +24,7 @@ import com.zcam.server.LocalHttpServer
 import com.zcam.service.ZCamRuntimeCoordinator
 import com.zcam.storage.LoopRecordingManager
 import com.zcam.storage.RecordingClipSummary
+import com.zcam.storage.RecordingEventSummary
 import com.zcam.watchdog.WatchdogManager
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -302,6 +304,78 @@ class ZCamRuntimeCoordinatorRecoveryTest {
 
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test
+    fun rear_lens_change_rebinds_camera_and_preserves_recording_runtime() = runTest(timeout = 20.seconds) {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val dispatchers = TestDispatcherProvider(dispatcher)
+
+        val camera = TrackingCameraRuntime()
+        val recording = TrackingLoopRecordingManager()
+        val runtimeSettings = FakeRuntimeSettingsRepository(
+            RuntimeSettingsDefaults.value.copy(
+                featureFlags = FeatureFlags(
+                    mjpegStreaming = true,
+                    loopRecording = true,
+                    audioPushToTalk = false,
+                    audioLive = false,
+                    audioPlayback = false,
+                    trustedDevices = true,
+                    watchdogRecovery = true
+                )
+            )
+        )
+        val coordinator = ZCamRuntimeCoordinator(
+            cameraRuntime = camera,
+            localHttpServer = FlakyServer(failuresBeforeSuccess = 0),
+            pushToTalkManager = NoopAudioManager(),
+            loopRecordingManager = recording,
+            watchdogManager = FakeWatchdogManager(),
+            runtimeEnvironmentMonitor = FakeRuntimeEnvironmentMonitor(),
+            runtimeSettingsRepository = runtimeSettings,
+            runtimeCrashRepository = FakeRuntimeCrashRepository(),
+            runtimeStateRepository = FakeRuntimeStateRepository(),
+            runtimeHealthRepository = InMemoryRuntimeHealthRepository(),
+            recoveryPolicy = RecoveryPolicy(baseDelayMs = 5, maxDelayMs = 40, maxAttemptsBeforeCooldown = 4, cooldownMs = 100),
+            retryBackoffScheduler = RecordingBackoffScheduler(),
+            dispatchers = dispatchers,
+            logger = NoopLogger()
+        )
+
+        coordinator.start()
+        try {
+            runCurrent()
+
+            runtimeSettings.updateSettings(
+                runtimeSettings.settings.value.copy(
+                    stream = runtimeSettings.settings.value.stream.copy(
+                        rearLens = RearCameraLens.ULTRA_WIDE
+                    )
+                )
+            )
+            advanceTimeBy(150)
+            runCurrent()
+
+            assertEquals(2, camera.startConfigs.size)
+            assertEquals(RearCameraLens.MAIN, camera.startConfigs.first().rearLens)
+            assertEquals(RearCameraLens.ULTRA_WIDE, camera.startConfigs.last().rearLens)
+            assertTrue(camera.stopCalls >= 1)
+            assertTrue(recording.stopCalls >= 1)
+            assertTrue(recording.startCalls >= 2)
+            assertEquals(
+                ComponentHealthStatus.HEALTHY,
+                coordinator.health.value.components.getValue(RuntimeComponent.CAMERA).status
+            )
+            assertEquals(
+                ComponentHealthStatus.HEALTHY,
+                coordinator.health.value.components.getValue(RuntimeComponent.STORAGE).status
+            )
+        } finally {
+            coordinator.stop(persistDesiredState = true)
+            advanceUntilIdle()
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
     fun remains_stable_over_24h_virtual_runtime() = runTest(timeout = 30.seconds) {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val dispatchers = TestDispatcherProvider(dispatcher)
@@ -534,6 +608,12 @@ class ZCamRuntimeCoordinatorRecoveryTest {
             limit: Int
         ): List<RecordingClipSummary> = emptyList()
 
+        override suspend fun queryRecordingEvents(
+            fromEpochMs: Long?,
+            toEpochMs: Long?,
+            limit: Int
+        ): List<RecordingEventSummary> = emptyList()
+
         override suspend fun resolveRecordingFile(fileName: String): java.io.File? = null
     }
 
@@ -672,6 +752,13 @@ class ZCamRuntimeCoordinatorRecoveryTest {
             )
         }
 
+        override suspend fun setZoomLinear(linearZoom: Float): com.zcam.camera.CameraControlCommandResult {
+            return com.zcam.camera.CameraControlCommandResult.Success(
+                snapshot = controlsSnapshot(),
+                message = "ok"
+            )
+        }
+
         override fun controlsSnapshot(): com.zcam.camera.CameraControlsSnapshot {
             return com.zcam.camera.CameraControlsSnapshot(
                 running = true,
@@ -685,6 +772,8 @@ class ZCamRuntimeCoordinatorRecoveryTest {
 
     private class TrackingCameraRuntime : CameraRuntime {
         val startConfigs = mutableListOf<com.zcam.core.domain.config.StreamConfig>()
+        var stopCalls: Int = 0
+            private set
         private var healthy = false
 
         override suspend fun start(config: com.zcam.core.domain.config.StreamConfig) {
@@ -693,6 +782,7 @@ class ZCamRuntimeCoordinatorRecoveryTest {
         }
 
         override suspend fun stop() {
+            stopCalls += 1
             healthy = false
         }
 
@@ -708,6 +798,13 @@ class ZCamRuntimeCoordinatorRecoveryTest {
         }
 
         override suspend fun setNightMode(enabled: Boolean): com.zcam.camera.CameraControlCommandResult {
+            return com.zcam.camera.CameraControlCommandResult.Success(
+                snapshot = controlsSnapshot(),
+                message = "ok"
+            )
+        }
+
+        override suspend fun setZoomLinear(linearZoom: Float): com.zcam.camera.CameraControlCommandResult {
             return com.zcam.camera.CameraControlCommandResult.Success(
                 snapshot = controlsSnapshot(),
                 message = "ok"
@@ -793,6 +890,12 @@ class ZCamRuntimeCoordinatorRecoveryTest {
             limit: Int
         ): List<RecordingClipSummary> = emptyList()
 
+        override suspend fun queryRecordingEvents(
+            fromEpochMs: Long?,
+            toEpochMs: Long?,
+            limit: Int
+        ): List<RecordingEventSummary> = emptyList()
+
         override suspend fun resolveRecordingFile(fileName: String): java.io.File? = null
     }
 
@@ -820,6 +923,12 @@ class ZCamRuntimeCoordinatorRecoveryTest {
             toEpochMs: Long?,
             limit: Int
         ): List<RecordingClipSummary> = emptyList()
+
+        override suspend fun queryRecordingEvents(
+            fromEpochMs: Long?,
+            toEpochMs: Long?,
+            limit: Int
+        ): List<RecordingEventSummary> = emptyList()
 
         override suspend fun resolveRecordingFile(fileName: String): java.io.File? = null
     }

@@ -1,5 +1,7 @@
 package com.zcam.camera
 
+import com.zcam.core.domain.config.RearCameraLens
+
 enum class CameraControlErrorCode {
     ENGINE_NOT_READY,
     UNSUPPORTED,
@@ -16,6 +18,9 @@ data class CameraControlsSnapshot(
     val zoomRatio: Float = 1f,
     val minZoomRatio: Float = 1f,
     val maxZoomRatio: Float = 1f,
+    val selectedRearLens: RearCameraLens = RearCameraLens.MAIN,
+    val activeRearLens: RearCameraLens = RearCameraLens.MAIN,
+    val ultraWideAvailable: Boolean = false,
     val lastError: String? = null
 )
 

@@ -10,6 +10,8 @@ import android.provider.MediaStore
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.zcam.camera.RearCameraLensCatalog
+import com.zcam.camera.RearCameraLensDetector
 import com.zcam.client.ClientCallResult
 import com.zcam.client.ClientTarget
 import com.zcam.client.LocalAudioTransport
@@ -18,6 +20,9 @@ import com.zcam.client.LocalClient
 import com.zcam.core.device.PowerStatusProvider
 import com.zcam.core.dispatchers.DispatcherProvider
 import com.zcam.core.domain.config.FeatureFlag
+import com.zcam.core.domain.config.PreviewProfile
+import com.zcam.core.domain.config.PreviewTransport
+import com.zcam.core.domain.config.RearCameraLens
 import com.zcam.core.domain.config.RuntimeSettings
 import com.zcam.core.domain.config.RuntimeSettingsDefaults
 import com.zcam.core.domain.config.TrustedDevice
@@ -88,6 +93,7 @@ class ZCamMainViewModel @Inject constructor(
     val state = _state.asStateFlow()
 
     private var settingsSnapshot: RuntimeSettings = RuntimeSettingsDefaults.value
+    private var localRearLensCatalog: RearCameraLensCatalog = RearCameraLensCatalog()
     private var volumeSyncJob: Job? = null
     private var clientSessionSyncJob: Job? = null
     private var playbackLoadJob: Job? = null
@@ -101,6 +107,7 @@ class ZCamMainViewModel @Inject constructor(
         observeDesiredState()
         monitorLocalPowerStatus()
         monitorThermalStatus()
+        refreshLocalRearLensCatalog()
         refreshPreviewTarget()
         refreshClientStatusLoop()
         refreshPreviewSnapshotLoop()
@@ -204,6 +211,51 @@ class ZCamMainViewModel @Inject constructor(
             is ZCamUiAction.SettingsStreamWidthChanged -> updateSettingsDraft { copy(streamWidthInput = action.value.filter(Char::isDigit).take(5)) }
             is ZCamUiAction.SettingsStreamHeightChanged -> updateSettingsDraft { copy(streamHeightInput = action.value.filter(Char::isDigit).take(5)) }
             is ZCamUiAction.SettingsStreamFpsChanged -> updateSettingsDraft { copy(streamFpsInput = action.value.filter(Char::isDigit).take(2)) }
+            is ZCamUiAction.SettingsRearLensChanged -> updateSettingsDraft { copy(rearLensSelection = action.value) }
+            is ZCamUiAction.SettingsPreviewTransportChanged -> updateSettingsDraft {
+                val appliedProfile = previewProfileSelection?.toConfig(action.value)
+                copy(
+                    previewTransportSelection = action.value,
+                    previewWidthInput = appliedProfile?.resolution?.width?.toString() ?: previewWidthInput,
+                    previewHeightInput = appliedProfile?.resolution?.height?.toString() ?: previewHeightInput,
+                    previewFpsInput = appliedProfile?.fps?.toString() ?: previewFpsInput,
+                    previewBitrateKbpsInput = appliedProfile?.bitrateKbps?.toString() ?: previewBitrateKbpsInput
+                )
+            }
+            is ZCamUiAction.SettingsPreviewProfileSelected -> updateSettingsDraft {
+                val preset = action.value.toConfig(previewTransportSelection)
+                copy(
+                    previewProfileSelection = action.value,
+                    previewWidthInput = preset.resolution.width.toString(),
+                    previewHeightInput = preset.resolution.height.toString(),
+                    previewFpsInput = preset.fps.toString(),
+                    previewBitrateKbpsInput = preset.bitrateKbps.toString()
+                )
+            }
+            is ZCamUiAction.SettingsPreviewWidthChanged -> updateSettingsDraft {
+                copy(
+                    previewWidthInput = action.value.filter(Char::isDigit).take(5),
+                    previewProfileSelection = null
+                )
+            }
+            is ZCamUiAction.SettingsPreviewHeightChanged -> updateSettingsDraft {
+                copy(
+                    previewHeightInput = action.value.filter(Char::isDigit).take(5),
+                    previewProfileSelection = null
+                )
+            }
+            is ZCamUiAction.SettingsPreviewFpsChanged -> updateSettingsDraft {
+                copy(
+                    previewFpsInput = action.value.filter(Char::isDigit).take(2),
+                    previewProfileSelection = null
+                )
+            }
+            is ZCamUiAction.SettingsPreviewBitrateChanged -> updateSettingsDraft {
+                copy(
+                    previewBitrateKbpsInput = action.value.filter(Char::isDigit).take(4),
+                    previewProfileSelection = null
+                )
+            }
             is ZCamUiAction.SettingsSegmentMinutesChanged -> updateSettingsDraft { copy(segmentMinutesInput = action.value.filter(Char::isDigit).take(2)) }
             is ZCamUiAction.SettingsMaxStorageGbChanged -> updateSettingsDraft { copy(maxStorageGbInput = action.value.filter(Char::isDigit).take(3)) }
             is ZCamUiAction.SettingsMinFreeStorageGbChanged -> updateSettingsDraft { copy(minFreeStorageGbInput = action.value.filter(Char::isDigit).take(3)) }
@@ -241,6 +293,8 @@ class ZCamMainViewModel @Inject constructor(
     private fun observeSettings() {
         viewModelScope.launch(dispatchers.io) {
             runtimeSettingsRepository.settings.collectLatest { settings ->
+                val detectedCatalog = detectLocalRearLensCatalog()
+                localRearLensCatalog = detectedCatalog
                 settingsSnapshot = settings
                 _state.update { state ->
                     val nextPort = settings.serverPort.toString()
@@ -250,7 +304,50 @@ class ZCamMainViewModel @Inject constructor(
                         } else {
                             state.clientPort
                         },
-                        settings = settings.toUiSettings(previous = state.settings)
+                        settings = settings.toUiSettings(
+                            previous = state.settings,
+                            ultraWideLensAvailable = detectedCatalog.ultraWideAvailable
+                        ),
+                        previewTransport = if (state.mode == ZCamMode.SERVER) {
+                            settings.stream.preview.transport
+                        } else {
+                            state.previewTransport
+                        },
+                        previewTransportLabel = if (state.mode == ZCamMode.SERVER) {
+                            previewTransportLabel(
+                                transport = settings.stream.preview.transport,
+                                usingFallback = false
+                            )
+                        } else {
+                            state.previewTransportLabel
+                        },
+                        previewDiagnosticsLabel = if (state.mode == ZCamMode.SERVER) {
+                            previewDiagnosticsLabel(
+                                width = settings.stream.preview.resolution.width,
+                                height = settings.stream.preview.resolution.height,
+                                targetFps = settings.stream.preview.fps,
+                                targetBitrateKbps = settings.stream.preview.bitrateKbps,
+                                estimatedBitrateKbps = 0,
+                                sentFps = 0
+                            )
+                        } else {
+                            state.previewDiagnosticsLabel
+                        },
+                        ultraWideAvailable = if (state.mode == ZCamMode.SERVER) {
+                            detectedCatalog.ultraWideAvailable
+                        } else {
+                            state.ultraWideAvailable
+                        },
+                        cameraLensLabel = if (state.mode == ZCamMode.SERVER && !state.runtimeOn) {
+                            "Lens: ${settings.stream.rearLens.label} selected"
+                        } else {
+                            state.cameraLensLabel
+                        },
+                        cameraLensTone = if (state.mode == ZCamMode.SERVER && !state.runtimeOn) {
+                            StatusTone.NEUTRAL
+                        } else {
+                            state.cameraLensTone
+                        }
                     )
                 }
                 refreshServerLanHost()
@@ -334,7 +431,7 @@ class ZCamMainViewModel @Inject constructor(
     private fun refreshPreviewTarget() {
         val current = state.value
         val target = currentTargetForCommands()
-        val streamUrl = when (current.mode) {
+        val mjpegUrl = when (current.mode) {
             ZCamMode.SERVER -> if (current.runtimeOn) {
                 localClient.buildPreviewStreamUrl(target)
             } else {
@@ -345,6 +442,22 @@ class ZCamMainViewModel @Inject constructor(
             } else {
                 ""
             }
+        }
+        val h264Url = when (current.mode) {
+            ZCamMode.SERVER -> if (current.runtimeOn) {
+                localClient.buildPreviewH264SocketUrl(target)
+            } else {
+                ""
+            }
+            ZCamMode.CLIENT -> if (current.clientHost.isNotBlank()) {
+                localClient.buildPreviewH264SocketUrl(target)
+            } else {
+                ""
+            }
+        }
+        val streamUrl = when (current.mode) {
+            ZCamMode.SERVER,
+            ZCamMode.CLIENT -> if (current.previewTransport == PreviewTransport.H264) h264Url else mjpegUrl
         }
         val previewLabel = when {
             streamUrl.isNotBlank() && current.previewStateTone == StatusTone.WARNING -> "Preview reconnecting..."
@@ -357,6 +470,7 @@ class ZCamMainViewModel @Inject constructor(
         _state.update {
             it.copy(
                 previewStreamUrl = streamUrl,
+                previewMjpegFallbackUrl = mjpegUrl,
                 previewLabel = previewLabel,
                 previewFrameJpeg = if (streamUrl.isBlank()) null else it.previewFrameJpeg
             )
@@ -431,7 +545,8 @@ class ZCamMainViewModel @Inject constructor(
 
     private fun refreshClientStatusNow() {
         viewModelScope.launch(dispatchers.io) {
-            val result = localClient.fetchStatus(currentTargetForCommands())
+            val target = currentTargetForCommands()
+            val result = localClient.fetchStatus(target)
             var shouldStopPushToTalk = false
             var shouldStopLiveListen = false
             var shouldRecoverLiveListen = false
@@ -461,6 +576,10 @@ class ZCamMainViewModel @Inject constructor(
                             status.lastFrameAgeMs >= PREVIEW_STALE_FRAME_MS -> "Preview reconnecting" to StatusTone.WARNING
                             else -> "Preview live" to StatusTone.HEALTHY
                         }
+                        val selectedPreviewTransport = when {
+                            status.previewTransport == PreviewTransport.H264 && status.previewEncoderRunning -> PreviewTransport.H264
+                            else -> PreviewTransport.MJPEG
+                        }
                         val audioUi = when {
                             !status.alive -> "Audio unavailable" to StatusTone.ERROR
                             shouldRecoverLiveListen -> "Live listen reconnecting" to StatusTone.WARNING
@@ -471,17 +590,56 @@ class ZCamMainViewModel @Inject constructor(
                             status.audioPlayingBack -> "Audio playback active" to StatusTone.HEALTHY
                             else -> "Audio idle" to StatusTone.NEUTRAL
                         }
+                        val lensUi = cameraLensUi(
+                            selectedLens = status.selectedRearLens,
+                            activeLens = status.activeRearLens,
+                            runtimeActive = status.videoRunning
+                        )
                         current.copy(
                             clientReachable = status.alive,
                             clientStatusLabel = if (status.alive) "Connected" else "Unavailable",
                             audioRuntimeLabel = audioUi.first,
                             audioRuntimeTone = audioUi.second,
+                            previewTransport = selectedPreviewTransport,
+                            previewTransportLabel = previewTransportLabel(
+                                transport = selectedPreviewTransport,
+                                usingFallback = selectedPreviewTransport != status.previewTransport
+                            ),
+                            previewDiagnosticsLabel = previewDiagnosticsLabel(
+                                width = status.previewTargetWidth,
+                                height = status.previewTargetHeight,
+                                targetFps = status.previewTargetFps,
+                                targetBitrateKbps = status.previewTargetBitrateKbps,
+                                estimatedBitrateKbps = status.previewEstimatedBitrateKbps,
+                                sentFps = status.previewSentFps,
+                                error = status.previewEncoderError
+                            ),
+                            previewStreamUrl = if (selectedPreviewTransport == PreviewTransport.H264) {
+                                localClient.buildPreviewH264SocketUrl(target)
+                            } else {
+                                localClient.buildPreviewStreamUrl(target)
+                            },
+                            previewMjpegFallbackUrl = localClient.buildPreviewStreamUrl(target),
+                            cameraLensLabel = lensUi.first,
+                            cameraLensTone = lensUi.second,
+                            ultraWideAvailable = if (current.mode == ZCamMode.SERVER) {
+                                localRearLensCatalog.ultraWideAvailable || status.ultraWideAvailable
+                            } else {
+                                status.ultraWideAvailable
+                            },
                             clientTorchEnabled = status.torchEnabled,
                             clientNightModeEnabled = status.nightModeEnabled,
                             clientLowLightBoostSupported = status.lowLightBoostSupported,
                             clientZoomLinear = status.zoomLinear.coerceIn(0f, 1f),
                             clientZoomRatio = status.zoomRatio.coerceAtLeast(1f),
                             clientMaxZoomRatio = status.maxZoomRatio.coerceAtLeast(1f),
+                            settings = current.settings.copy(
+                                ultraWideLensAvailable = if (current.mode == ZCamMode.SERVER) {
+                                    localRearLensCatalog.ultraWideAvailable || status.ultraWideAvailable
+                                } else {
+                                    current.settings.ultraWideLensAvailable
+                                }
+                            ),
                             pttPressed = status.audioTransmitting,
                             liveListenEnabled = status.audioLiveListening,
                             previewStateLabel = previewUi.first,
@@ -517,12 +675,48 @@ class ZCamMainViewModel @Inject constructor(
                             } else {
                                 StatusTone.ERROR
                             },
+                            previewStreamUrl = if (current.mode == ZCamMode.SERVER || current.mode == ZCamMode.CLIENT) {
+                                if (current.previewTransport == PreviewTransport.H264) {
+                                    localClient.buildPreviewH264SocketUrl(target)
+                                } else {
+                                    localClient.buildPreviewStreamUrl(target)
+                                }
+                            } else {
+                                current.previewStreamUrl
+                            },
+                            previewMjpegFallbackUrl = localClient.buildPreviewStreamUrl(target),
                             audioRuntimeLabel = "Audio unavailable",
                             audioRuntimeTone = StatusTone.ERROR,
+                            cameraLensLabel = if (current.mode == ZCamMode.SERVER && !current.runtimeOn) {
+                                "Lens: ${settingsSnapshot.stream.rearLens.label} selected"
+                            } else if (current.mode == ZCamMode.SERVER) {
+                                "Lens: unavailable"
+                            } else {
+                                current.cameraLensLabel
+                            },
+                            cameraLensTone = if (current.mode == ZCamMode.SERVER && !current.runtimeOn) {
+                                StatusTone.NEUTRAL
+                            } else if (current.mode == ZCamMode.SERVER) {
+                                StatusTone.WARNING
+                            } else {
+                                current.cameraLensTone
+                            },
+                            ultraWideAvailable = if (current.mode == ZCamMode.SERVER) {
+                                localRearLensCatalog.ultraWideAvailable
+                            } else {
+                                current.ultraWideAvailable
+                            },
                             serverBatteryPercent = if (current.mode == ZCamMode.CLIENT) null else current.serverBatteryPercent,
                             serverCharging = if (current.mode == ZCamMode.CLIENT) null else current.serverCharging,
                             serverBatteryLabel = failureBatteryLabel,
-                            serverBatteryTone = if (current.mode == ZCamMode.CLIENT) StatusTone.WARNING else current.serverBatteryTone
+                            serverBatteryTone = if (current.mode == ZCamMode.CLIENT) StatusTone.WARNING else current.serverBatteryTone,
+                            settings = current.settings.copy(
+                                ultraWideLensAvailable = if (current.mode == ZCamMode.SERVER) {
+                                    localRearLensCatalog.ultraWideAvailable
+                                } else {
+                                    current.settings.ultraWideLensAvailable
+                                }
+                            )
                         )
                     }
                 }
@@ -1623,10 +1817,16 @@ class ZCamMainViewModel @Inject constructor(
         viewModelScope.launch(dispatchers.io) {
             val current = state.value
             val draft = current.settings
+            val detectedCatalog = detectLocalRearLensCatalog()
+            localRearLensCatalog = detectedCatalog
             val serverPort = draft.serverPortInput.toIntOrNull()
             val streamWidth = draft.streamWidthInput.toIntOrNull()
             val streamHeight = draft.streamHeightInput.toIntOrNull()
             val streamFps = draft.streamFpsInput.toIntOrNull()
+            val previewWidth = draft.previewWidthInput.toIntOrNull()
+            val previewHeight = draft.previewHeightInput.toIntOrNull()
+            val previewFps = draft.previewFpsInput.toIntOrNull()
+            val previewBitrate = draft.previewBitrateKbpsInput.toIntOrNull()
             val segmentMinutes = draft.segmentMinutesInput.toIntOrNull()
             val maxStorage = draft.maxStorageGbInput.toIntOrNull()
             val minFree = draft.minFreeStorageGbInput.toIntOrNull()
@@ -1636,11 +1836,17 @@ class ZCamMainViewModel @Inject constructor(
                 streamWidth == null -> "Invalid stream width"
                 streamHeight == null -> "Invalid stream height"
                 streamFps == null -> "Invalid stream FPS"
+                previewWidth == null -> "Invalid preview width"
+                previewHeight == null -> "Invalid preview height"
+                previewFps == null -> "Invalid preview FPS"
+                previewBitrate == null -> "Invalid preview bitrate"
                 segmentMinutes == null -> "Invalid segment duration"
                 maxStorage == null -> "Invalid max storage value"
                 minFree == null -> "Invalid min free storage value"
                 draft.pinInput.isBlank() -> "PIN is required"
                 draft.apiTokenInput.isBlank() -> "API token is required"
+                draft.rearLensSelection == RearCameraLens.ULTRA_WIDE && !detectedCatalog.ultraWideAvailable ->
+                    "Ultra-wide camera not detected on this device"
                 else -> null
             }
 
@@ -1676,7 +1882,17 @@ class ZCamMainViewModel @Inject constructor(
                         width = streamWidth!!,
                         height = streamHeight!!
                     ),
-                    fps = streamFps!!
+                    fps = streamFps!!,
+                    rearLens = draft.rearLensSelection,
+                    preview = settingsSnapshot.stream.preview.copy(
+                        transport = draft.previewTransportSelection,
+                        resolution = settingsSnapshot.stream.preview.resolution.copy(
+                            width = previewWidth!!,
+                            height = previewHeight!!
+                        ),
+                        fps = previewFps!!,
+                        bitrateKbps = previewBitrate!!
+                    )
                 ),
                 recording = settingsSnapshot.recording.copy(
                     segmentMinutes = segmentMinutes!!,
@@ -1919,13 +2135,24 @@ class ZCamMainViewModel @Inject constructor(
         )
     }
 
-    private fun RuntimeSettings.toUiSettings(previous: SettingsUiState): SettingsUiState {
+    private fun RuntimeSettings.toUiSettings(
+        previous: SettingsUiState,
+        ultraWideLensAvailable: Boolean
+    ): SettingsUiState {
         return previous.copy(
             serverPortInput = serverPort.toString(),
             streamWidthInput = stream.resolution.width.toString(),
             streamHeightInput = stream.resolution.height.toString(),
             streamFpsInput = stream.fps.toString(),
             streamCodecLabel = stream.codec.name,
+            rearLensSelection = stream.rearLens,
+            ultraWideLensAvailable = ultraWideLensAvailable,
+            previewTransportSelection = stream.preview.transport,
+            previewProfileSelection = PreviewProfile.match(stream.preview),
+            previewWidthInput = stream.preview.resolution.width.toString(),
+            previewHeightInput = stream.preview.resolution.height.toString(),
+            previewFpsInput = stream.preview.fps.toString(),
+            previewBitrateKbpsInput = stream.preview.bitrateKbps.toString(),
             segmentMinutesInput = recording.segmentMinutes.toString(),
             maxStorageGbInput = recording.maxStorageGb.toString(),
             minFreeStorageGbInput = recording.minFreeStorageGb.toString(),
@@ -1963,6 +2190,78 @@ class ZCamMainViewModel @Inject constructor(
             verificationCode = verificationCode.chunked(3).joinToString(" "),
             expiresAtEpochMs = expiresAtEpochMs
         )
+    }
+
+    private fun refreshLocalRearLensCatalog() {
+        viewModelScope.launch(dispatchers.io) {
+            val catalog = detectLocalRearLensCatalog()
+            localRearLensCatalog = catalog
+            _state.update { current ->
+                current.copy(
+                    ultraWideAvailable = if (current.mode == ZCamMode.SERVER) {
+                        catalog.ultraWideAvailable
+                    } else {
+                        current.ultraWideAvailable
+                    },
+                    settings = current.settings.copy(
+                        ultraWideLensAvailable = if (current.mode == ZCamMode.SERVER) {
+                            catalog.ultraWideAvailable
+                        } else {
+                            current.settings.ultraWideLensAvailable
+                        }
+                    )
+                )
+            }
+        }
+    }
+
+    private suspend fun detectLocalRearLensCatalog(): RearCameraLensCatalog = withContext(dispatchers.io) {
+        runCatching {
+            RearCameraLensDetector.detectCatalog(appContext)
+        }.getOrDefault(RearCameraLensCatalog())
+    }
+
+    private fun cameraLensUi(
+        selectedLens: RearCameraLens,
+        activeLens: RearCameraLens,
+        runtimeActive: Boolean
+    ): Pair<String, StatusTone> {
+        return when {
+            !runtimeActive -> "Lens: ${selectedLens.label} selected" to StatusTone.NEUTRAL
+            activeLens != selectedLens -> "Lens: ${activeLens.label} (fallback active)" to StatusTone.WARNING
+            else -> "Lens: ${activeLens.label}" to StatusTone.HEALTHY
+        }
+    }
+
+    private fun previewTransportLabel(
+        transport: PreviewTransport,
+        usingFallback: Boolean
+    ): String {
+        return when {
+            transport == PreviewTransport.H264 && !usingFallback -> "Preview transport: H.264"
+            transport == PreviewTransport.MJPEG && usingFallback -> "Preview transport: MJPEG fallback"
+            transport == PreviewTransport.MJPEG -> "Preview transport: MJPEG"
+            else -> "Preview transport: H.264 fallback"
+        }
+    }
+
+    private fun previewDiagnosticsLabel(
+        width: Int,
+        height: Int,
+        targetFps: Int,
+        targetBitrateKbps: Int,
+        estimatedBitrateKbps: Int,
+        sentFps: Int,
+        error: String? = null
+    ): String {
+        val base = "${width}x$height ${targetFps} FPS target ${targetBitrateKbps} kbps"
+        val live = if (estimatedBitrateKbps > 0 || sentFps > 0) {
+            " | sent ${sentFps} FPS | est ${estimatedBitrateKbps} kbps"
+        } else {
+            ""
+        }
+        val errorText = error?.takeIf { it.isNotBlank() }?.let { " | $it" }.orEmpty()
+        return base + live + errorText
     }
 
     private fun refreshServerLanHost() {
@@ -2134,7 +2433,8 @@ class ZCamMainViewModel @Inject constructor(
     private fun shouldRefreshPreviewSnapshots(current: ZCamUiState): Boolean {
         return !current.showModePicker &&
             current.screen == ZCamScreen.MAIN &&
-            current.previewStreamUrl.isNotBlank()
+            current.previewMjpegFallbackUrl.isNotBlank() &&
+            current.previewTransport == PreviewTransport.MJPEG
     }
 
     private fun powerUiState(

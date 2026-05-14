@@ -3,6 +3,7 @@
 sealed interface RuntimeSettingsValidationError {
     data class InvalidServerPort(val value: Int) : RuntimeSettingsValidationError
     data class InvalidFps(val value: Int) : RuntimeSettingsValidationError
+    data class InvalidPreviewBitrateKbps(val value: Int) : RuntimeSettingsValidationError
     data class InvalidSegmentMinutes(val value: Int) : RuntimeSettingsValidationError
     data class InvalidMaxStorageGb(val value: Int) : RuntimeSettingsValidationError
     data class InvalidMinFreeStorageGb(val value: Int) : RuntimeSettingsValidationError

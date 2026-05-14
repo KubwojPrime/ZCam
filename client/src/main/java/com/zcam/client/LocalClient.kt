@@ -1,5 +1,7 @@
 package com.zcam.client
 
+import com.zcam.core.domain.config.PreviewTransport
+import com.zcam.core.domain.config.RearCameraLens
 import java.io.OutputStream
 
 data class ClientTarget(
@@ -16,6 +18,17 @@ data class ClientServerStatus(
     val uptimeMs: Long,
     val videoRunning: Boolean,
     val lastFrameAgeMs: Long,
+    val previewTransport: PreviewTransport,
+    val previewTargetWidth: Int,
+    val previewTargetHeight: Int,
+    val previewTargetFps: Int,
+    val previewTargetBitrateKbps: Int,
+    val previewEstimatedBitrateKbps: Int,
+    val previewSentFps: Int,
+    val previewSubscriberCount: Int,
+    val previewEncoderRunning: Boolean,
+    val previewMjpegFallbackAvailable: Boolean,
+    val previewEncoderError: String?,
     val torchEnabled: Boolean,
     val nightModeEnabled: Boolean,
     val lowLightBoostSupported: Boolean,
@@ -23,6 +36,9 @@ data class ClientServerStatus(
     val zoomRatio: Float,
     val minZoomRatio: Float,
     val maxZoomRatio: Float,
+    val selectedRearLens: RearCameraLens,
+    val activeRearLens: RearCameraLens,
+    val ultraWideAvailable: Boolean,
     val audioTransmitting: Boolean,
     val audioLiveListening: Boolean,
     val audioPlayingBack: Boolean,
@@ -88,6 +104,7 @@ interface LocalClient {
     suspend fun fetchStatus(target: ClientTarget): ClientCallResult<ClientServerStatus>
     suspend fun fetchSnapshot(target: ClientTarget): ClientCallResult<ByteArray>
     fun buildPreviewStreamUrl(target: ClientTarget): String
+    fun buildPreviewH264SocketUrl(target: ClientTarget): String
     suspend fun setPushToTalk(target: ClientTarget, enabled: Boolean): ClientCallResult<Unit>
     suspend fun setLiveListen(target: ClientTarget, enabled: Boolean): ClientCallResult<Unit>
     suspend fun setTorch(target: ClientTarget, enabled: Boolean): ClientCallResult<Unit>

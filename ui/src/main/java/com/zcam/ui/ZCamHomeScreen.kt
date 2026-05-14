@@ -59,6 +59,9 @@ import androidx.compose.ui.window.DialogProperties
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import com.zcam.core.domain.config.FeatureFlag
+import com.zcam.core.domain.config.PreviewProfile
+import com.zcam.core.domain.config.PreviewTransport
+import com.zcam.core.domain.config.RearCameraLens
 import java.text.DateFormat
 import java.util.Date
 import kotlinx.coroutines.launch
@@ -653,6 +656,130 @@ private fun SettingsScreen(
                         singleLine = true
                     )
                 }
+                Text(
+                    text = "Rear camera lens",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    ActiveActionButton(
+                        text = "Main",
+                        active = settings.rearLensSelection == RearCameraLens.MAIN,
+                        onClick = { onAction(ZCamUiAction.SettingsRearLensChanged(RearCameraLens.MAIN)) },
+                        modifier = Modifier.weight(1f)
+                    )
+                    ActiveActionButton(
+                        text = "Ultra-wide",
+                        active = settings.rearLensSelection == RearCameraLens.ULTRA_WIDE,
+                        onClick = { onAction(ZCamUiAction.SettingsRearLensChanged(RearCameraLens.ULTRA_WIDE)) },
+                        modifier = Modifier.weight(1f),
+                        enabled = settings.ultraWideLensAvailable || settings.rearLensSelection == RearCameraLens.ULTRA_WIDE
+                    )
+                }
+                StatusChip(
+                    label = if (settings.ultraWideLensAvailable) {
+                        "Ultra-wide rear lens detected"
+                    } else {
+                        "Ultra-wide rear lens not detected on this device"
+                    },
+                    tone = if (settings.ultraWideLensAvailable) StatusTone.HEALTHY else StatusTone.WARNING
+                )
+                Text(
+                    text = "Changing the rear lens saves to runtime settings. If the runtime is active, preview and recording pause briefly while the camera pipeline rebinds.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            SettingsSection(title = "Preview transport") {
+                Text(
+                    text = "Transport",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    ActiveActionButton(
+                        text = "H.264",
+                        active = settings.previewTransportSelection == PreviewTransport.H264,
+                        onClick = { onAction(ZCamUiAction.SettingsPreviewTransportChanged(PreviewTransport.H264)) },
+                        modifier = Modifier.weight(1f)
+                    )
+                    ActiveActionButton(
+                        text = "MJPEG",
+                        active = settings.previewTransportSelection == PreviewTransport.MJPEG,
+                        onClick = { onAction(ZCamUiAction.SettingsPreviewTransportChanged(PreviewTransport.MJPEG)) },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                Text(
+                    text = "Profiles",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    PreviewProfile.entries.forEach { profile ->
+                        ActiveActionButton(
+                            text = profile.label,
+                            active = settings.previewProfileSelection == profile,
+                            onClick = { onAction(ZCamUiAction.SettingsPreviewProfileSelected(profile)) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    OutlinedTextField(
+                        modifier = Modifier.weight(1f),
+                        value = settings.previewWidthInput,
+                        onValueChange = { onAction(ZCamUiAction.SettingsPreviewWidthChanged(it)) },
+                        label = { Text("Preview width") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        modifier = Modifier.weight(1f),
+                        value = settings.previewHeightInput,
+                        onValueChange = { onAction(ZCamUiAction.SettingsPreviewHeightChanged(it)) },
+                        label = { Text("Preview height") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        singleLine = true
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    OutlinedTextField(
+                        modifier = Modifier.weight(1f),
+                        value = settings.previewFpsInput,
+                        onValueChange = { onAction(ZCamUiAction.SettingsPreviewFpsChanged(it)) },
+                        label = { Text("Preview FPS") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        modifier = Modifier.weight(1f),
+                        value = settings.previewBitrateKbpsInput,
+                        onValueChange = { onAction(ZCamUiAction.SettingsPreviewBitrateChanged(it)) },
+                        label = { Text("Bitrate kbps") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        singleLine = true
+                    )
+                }
+                Text(
+                    text = "Balanced H.264 is the default appliance profile. MJPEG remains available as an explicit fallback/debug transport.",
+                    style = MaterialTheme.typography.bodySmall
+                )
             }
 
             SettingsSection(title = "Recording") {
@@ -1018,8 +1145,12 @@ private fun PreviewCard(state: ZCamUiState) {
                 fontWeight = FontWeight.SemiBold
             )
             StatusChip(label = state.previewStateLabel, tone = state.previewStateTone)
+            StatusChip(label = state.previewTransportLabel, tone = StatusTone.NEUTRAL)
+            StatusChip(label = state.previewDiagnosticsLabel, tone = StatusTone.NEUTRAL)
             LivePreviewSurface(
+                previewTransport = state.previewTransport,
                 previewStreamUrl = state.previewStreamUrl,
+                previewMjpegFallbackUrl = state.previewMjpegFallbackUrl,
                 previewLabel = state.previewLabel.ifBlank {
                     if (state.mode == ZCamMode.SERVER && !state.runtimeOn) {
                         "Start runtime to see live preview."
@@ -1058,7 +1189,9 @@ private fun PreviewCard(state: ZCamUiState) {
                     .background(MaterialTheme.colorScheme.scrim)
             ) {
                 LivePreviewSurface(
+                    previewTransport = state.previewTransport,
                     previewStreamUrl = state.previewStreamUrl,
+                    previewMjpegFallbackUrl = state.previewMjpegFallbackUrl,
                     previewLabel = state.previewLabel.ifBlank { "Preview unavailable" },
                     fallbackFrameJpeg = state.previewFrameJpeg,
                     modifier = Modifier.fillMaxSize(),
@@ -1106,6 +1239,7 @@ private fun RuntimeControls(
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             StatusChip(label = "Runtime: ${state.runtimeLabel}", tone = state.runtimeTone)
+            StatusChip(label = state.cameraLensLabel, tone = state.cameraLensTone)
             StatusChip(label = state.serverBatteryLabel, tone = state.serverBatteryTone)
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1396,7 +1530,7 @@ private fun ErrorCard(
 }
 
 @Composable
-private fun StatusChip(
+internal fun StatusChip(
     label: String,
     tone: StatusTone,
     compact: Boolean = false

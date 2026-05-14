@@ -76,6 +76,7 @@ class ZCamRuntimeCoordinator @Inject constructor(
 
     private var heartbeatJob: Job? = null
     private var recoveryCollectorJob: Job? = null
+    private var settingsCollectorJob: Job? = null
     private var thermalCollectorJob: Job? = null
     private var networkCollectorJob: Job? = null
 
@@ -123,6 +124,7 @@ class ZCamRuntimeCoordinator @Inject constructor(
 
             watchdogManager.start()
             registerWatchdogComponents()
+            startSettingsCollector()
             startRecoveryCollector()
             startEnvironmentCollectors()
 
@@ -167,6 +169,9 @@ class ZCamRuntimeCoordinator @Inject constructor(
 
         recoveryCollectorJob?.cancel()
         recoveryCollectorJob = null
+
+        settingsCollectorJob?.cancel()
+        settingsCollectorJob = null
 
         thermalCollectorJob?.cancel()
         thermalCollectorJob = null
@@ -231,6 +236,37 @@ class ZCamRuntimeCoordinator @Inject constructor(
                 }
                 launch {
                     recoverComponent(component, request)
+                }
+            }
+        }
+    }
+
+    private fun startSettingsCollector() {
+        if (settingsCollectorJob?.isActive == true) return
+
+        settingsCollectorJob = runtimeScope.launch {
+            var firstEmission = true
+            runtimeSettingsRepository.settings.collect { settings ->
+                val previousSettings = activeRuntimeSettings
+                activeRuntimeSettings = settings
+                watchdogRecoveryEnabled = settings.featureFlags.watchdogRecovery
+                val desiredStream = thermalAdjustedStream(settings.stream, activeThermalBand)
+
+                if (firstEmission) {
+                    activeStreamConfig = desiredStream
+                    firstEmission = false
+                    return@collect
+                }
+
+                if (!isRunning.get()) {
+                    activeStreamConfig = desiredStream
+                    return@collect
+                }
+
+                activeStreamConfig = desiredStream
+                val lensChanged = settings.stream.rearLens != previousSettings.stream.rearLens
+                if (lensChanged) {
+                    handleRearLensSelectionChanged(desiredStream)
                 }
             }
         }
@@ -307,6 +343,49 @@ class ZCamRuntimeCoordinator @Inject constructor(
                 message = "network unavailable"
             )
             logger.w(LogEventId.NETWORK_LOST, "Network connectivity lost")
+        }
+    }
+
+    private suspend fun handleRearLensSelectionChanged(desiredStream: StreamConfig) {
+        if (!activeComponents.containsKey(RuntimeComponent.CAMERA)) return
+
+        val storageLock = componentLocks[RuntimeComponent.STORAGE]
+        val cameraLock = componentLocks.getValue(RuntimeComponent.CAMERA)
+
+        suspend fun rebindCameraPipeline() {
+            logger.i(
+                LogEventId.RUNTIME_START_SEQUENCE,
+                "Rebinding camera pipeline for rear lens ${desiredStream.rearLens.wireName}"
+            )
+            val storageWasRunning = activeComponents.containsKey(RuntimeComponent.STORAGE) && isStorageRuntimeActive()
+            if (storageWasRunning) {
+                stopComponent(RuntimeComponent.STORAGE)
+            }
+
+            stopComponent(RuntimeComponent.CAMERA)
+            activeStreamConfig = desiredStream
+            startComponent(RuntimeComponent.CAMERA)
+
+            val cameraHealthy = health.value.components[RuntimeComponent.CAMERA]?.status == ComponentHealthStatus.HEALTHY
+            if (storageWasRunning && !storageSuspendedByThermal && cameraHealthy) {
+                startComponent(RuntimeComponent.STORAGE)
+            }
+        }
+
+        if (storageLock == null) {
+            cameraLock.withLock {
+                if (isRunning.get()) {
+                    rebindCameraPipeline()
+                }
+            }
+        } else {
+            storageLock.withLock {
+                cameraLock.withLock {
+                    if (isRunning.get()) {
+                        rebindCameraPipeline()
+                    }
+                }
+            }
         }
     }
 

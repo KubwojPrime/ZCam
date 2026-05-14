@@ -11,6 +11,12 @@ object RuntimeSettingsValidator {
         if (settings.stream.fps !in 1..60) {
             errors += RuntimeSettingsValidationError.InvalidFps(settings.stream.fps)
         }
+        if (settings.stream.preview.fps !in 1..30) {
+            errors += RuntimeSettingsValidationError.InvalidFps(settings.stream.preview.fps)
+        }
+        if (settings.stream.preview.bitrateKbps !in 200..5000) {
+            errors += RuntimeSettingsValidationError.InvalidPreviewBitrateKbps(settings.stream.preview.bitrateKbps)
+        }
         if (settings.recording.segmentMinutes !in 1..60) {
             errors += RuntimeSettingsValidationError.InvalidSegmentMinutes(settings.recording.segmentMinutes)
         }
