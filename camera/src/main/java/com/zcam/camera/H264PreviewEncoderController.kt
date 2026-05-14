@@ -32,6 +32,8 @@ internal class H264PreviewEncoderController(
     private val sentFps = AtomicInteger(0)
     private val emittedFrames = AtomicLong(0L)
     private val droppedFrames = AtomicLong(0L)
+    private val actualWidth = AtomicInteger(0)
+    private val actualHeight = AtomicInteger(0)
 
     @Volatile
     private var encoder: MediaCodec? = null
@@ -44,6 +46,12 @@ internal class H264PreviewEncoderController(
 
     @Volatile
     private var streamConfig: H264PreviewStreamConfig? = null
+
+    @Volatile
+    private var selectedEncoderInfo: MediaCodecInfo? = null
+
+    @Volatile
+    private var lastEncoderStartAttemptAtMs: Long = 0L
 
     private var windowStartedAtMs: Long = 0L
     private var windowBytes: Long = 0L
@@ -60,48 +68,22 @@ internal class H264PreviewEncoderController(
             lastError.set("No H.264 encoder available")
             return false
         }
-
-        return runCatching {
-            val codec = MediaCodec.createByCodecName(encoderInfo.name)
-            val capabilities = encoderInfo.getCapabilitiesForType(MIME_TYPE)
-            colorFormat = selectColorFormat(capabilities)
-            val format = MediaFormat.createVideoFormat(
-                MIME_TYPE,
-                config.resolution.width,
-                config.resolution.height
-            ).apply {
-                setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat)
-                setInteger(MediaFormat.KEY_BIT_RATE, config.bitrateKbps * 1_000)
-                setInteger(MediaFormat.KEY_FRAME_RATE, config.fps)
-                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, KEYFRAME_INTERVAL_SEC)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    setInteger(MediaFormat.KEY_PRIORITY, 0)
-                }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    setFloat(MediaFormat.KEY_OPERATING_RATE, config.fps.toFloat())
-                }
-            }
-            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            codec.start()
-            encoder = codec
-            streamConfig = null
-            lastError.set(null)
-            estimatedBitrateKbps.set(0)
-            sentFps.set(0)
-            emittedFrames.set(0L)
-            droppedFrames.set(0L)
-            windowStartedAtMs = 0L
-            windowBytes = 0L
-            windowFrames = 0
-            running.set(true)
-            executor.execute(::pumpLoop)
-            true
-        }.getOrElse { error ->
-            lastError.set(error.message ?: "encoder start failed")
-            logger.w("Preview H.264 encoder start failed: ${error.message}")
-            releaseEncoder()
-            false
-        }
+        selectedEncoderInfo = encoderInfo
+        streamConfig = null
+        lastError.set(null)
+        estimatedBitrateKbps.set(0)
+        sentFps.set(0)
+        emittedFrames.set(0L)
+        droppedFrames.set(0L)
+        actualWidth.set(0)
+        actualHeight.set(0)
+        windowStartedAtMs = 0L
+        windowBytes = 0L
+        windowFrames = 0
+        lastEncoderStartAttemptAtMs = 0L
+        running.set(true)
+        executor.execute(::pumpLoop)
+        return true
     }
 
     fun stop() {
@@ -109,6 +91,10 @@ internal class H264PreviewEncoderController(
         pendingFrame.set(null)
         subscribers.clear()
         streamConfig = null
+        selectedEncoderInfo = null
+        actualWidth.set(0)
+        actualHeight.set(0)
+        lastEncoderStartAttemptAtMs = 0L
         releaseEncoder()
         estimatedBitrateKbps.set(0)
         sentFps.set(0)
@@ -121,10 +107,6 @@ internal class H264PreviewEncoderController(
         presentationTimeUs: Long
     ) {
         if (!running.get()) return
-        if (width != previewConfig.resolution.width || height != previewConfig.resolution.height) {
-            droppedFrames.incrementAndGet()
-            return
-        }
         val copy = nv21.copyOf()
         if (pendingFrame.getAndSet(PreviewFrame(copy, width, height, presentationTimeUs)) != null) {
             droppedFrames.incrementAndGet()
@@ -156,6 +138,8 @@ internal class H264PreviewEncoderController(
             transport = previewConfig.transport,
             targetWidth = previewConfig.resolution.width,
             targetHeight = previewConfig.resolution.height,
+            actualWidth = actualWidth.get(),
+            actualHeight = actualHeight.get(),
             targetFps = previewConfig.fps,
             targetBitrateKbps = previewConfig.bitrateKbps,
             estimatedBitrateKbps = estimatedBitrateKbps.get(),
@@ -163,6 +147,7 @@ internal class H264PreviewEncoderController(
             subscriberCount = subscribers.size,
             encoderRunning = running.get() && encoder != null,
             mjpegFallbackAvailable = true,
+            droppedFrames = droppedFrames.get(),
             lastError = lastError.get()
         )
     }
@@ -180,6 +165,10 @@ internal class H264PreviewEncoderController(
         while (running.get()) {
             val frame = pendingFrame.getAndSet(null)
             if (frame != null) {
+                if (!ensureEncoderForFrame(frame.width, frame.height)) {
+                    droppedFrames.incrementAndGet()
+                    continue
+                }
                 queueInputFrame(frame)
                 drainEncoder()
             } else {
@@ -193,6 +182,70 @@ internal class H264PreviewEncoderController(
             }
         }
         drainEncoder()
+    }
+
+    private fun ensureEncoderForFrame(
+        width: Int,
+        height: Int
+    ): Boolean {
+        if (width <= 0 || height <= 0) {
+            lastError.set("Invalid preview frame size ${width}x${height}")
+            return false
+        }
+        val currentEncoder = encoder
+        if (currentEncoder != null && actualWidth.get() == width && actualHeight.get() == height) {
+            return true
+        }
+
+        val now = System.currentTimeMillis()
+        if (now - lastEncoderStartAttemptAtMs < START_RETRY_BACKOFF_MS) {
+            return false
+        }
+        lastEncoderStartAttemptAtMs = now
+        releaseEncoder()
+
+        val encoderInfo = selectedEncoderInfo ?: selectEncoder() ?: run {
+            lastError.set("No H.264 encoder available")
+            return false
+        }
+        selectedEncoderInfo = encoderInfo
+
+        return runCatching {
+            val codec = MediaCodec.createByCodecName(encoderInfo.name)
+            val capabilities = encoderInfo.getCapabilitiesForType(MIME_TYPE)
+            colorFormat = selectColorFormat(capabilities)
+            val format = MediaFormat.createVideoFormat(MIME_TYPE, width, height).apply {
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat)
+                setInteger(MediaFormat.KEY_BIT_RATE, previewConfig.bitrateKbps * 1_000)
+                setInteger(MediaFormat.KEY_FRAME_RATE, previewConfig.fps)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, KEYFRAME_INTERVAL_SEC)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    setInteger(MediaFormat.KEY_PRIORITY, 0)
+                    setFloat(MediaFormat.KEY_OPERATING_RATE, previewConfig.fps.toFloat())
+                }
+            }
+            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            codec.start()
+            encoder = codec
+            streamConfig = null
+            actualWidth.set(width)
+            actualHeight.set(height)
+            lastError.set(null)
+            subscribers.values.forEach { subscriber -> subscriber.started = false }
+            if (width != previewConfig.resolution.width || height != previewConfig.resolution.height) {
+                logger.w(
+                    "Preview H.264 encoder using actual frame size ${width}x${height} instead of requested ${previewConfig.resolution.width}x${previewConfig.resolution.height}"
+                )
+            }
+            true
+        }.getOrElse { error ->
+            actualWidth.set(0)
+            actualHeight.set(0)
+            lastError.set("encoder start failed for ${width}x${height}: ${error.message ?: "unknown"}")
+            logger.w("Preview H.264 encoder start failed for ${width}x${height}: ${error.message}")
+            releaseEncoder()
+            false
+        }
     }
 
     private fun queueInputFrame(frame: PreviewFrame) {
@@ -439,5 +492,6 @@ internal class H264PreviewEncoderController(
         const val IDLE_POLL_MS = 4L
         const val INPUT_TIMEOUT_US = 0L
         const val OUTPUT_TIMEOUT_US = 0L
+        const val START_RETRY_BACKOFF_MS = 1_500L
     }
 }

@@ -6,6 +6,8 @@ data class PreviewStreamingDiagnostics(
     val transport: PreviewTransport,
     val targetWidth: Int,
     val targetHeight: Int,
+    val actualWidth: Int,
+    val actualHeight: Int,
     val targetFps: Int,
     val targetBitrateKbps: Int,
     val estimatedBitrateKbps: Int,
@@ -13,6 +15,7 @@ data class PreviewStreamingDiagnostics(
     val subscriberCount: Int,
     val encoderRunning: Boolean,
     val mjpegFallbackAvailable: Boolean,
+    val droppedFrames: Long = 0L,
     val lastError: String? = null
 )
 

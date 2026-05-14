@@ -325,10 +325,13 @@ class ZCamMainViewModel @Inject constructor(
                             previewDiagnosticsLabel(
                                 width = settings.stream.preview.resolution.width,
                                 height = settings.stream.preview.resolution.height,
+                                actualWidth = 0,
+                                actualHeight = 0,
                                 targetFps = settings.stream.preview.fps,
                                 targetBitrateKbps = settings.stream.preview.bitrateKbps,
                                 estimatedBitrateKbps = 0,
-                                sentFps = 0
+                                sentFps = 0,
+                                droppedFrames = 0
                             )
                         } else {
                             state.previewDiagnosticsLabel
@@ -577,7 +580,8 @@ class ZCamMainViewModel @Inject constructor(
                             else -> "Preview live" to StatusTone.HEALTHY
                         }
                         val selectedPreviewTransport = when {
-                            status.previewTransport == PreviewTransport.H264 && status.previewEncoderRunning -> PreviewTransport.H264
+                            status.previewTransport == PreviewTransport.H264 &&
+                                (status.previewEncoderRunning || status.previewEncoderError.isNullOrBlank()) -> PreviewTransport.H264
                             else -> PreviewTransport.MJPEG
                         }
                         val audioUi = when {
@@ -608,10 +612,13 @@ class ZCamMainViewModel @Inject constructor(
                             previewDiagnosticsLabel = previewDiagnosticsLabel(
                                 width = status.previewTargetWidth,
                                 height = status.previewTargetHeight,
+                                actualWidth = status.previewActualWidth,
+                                actualHeight = status.previewActualHeight,
                                 targetFps = status.previewTargetFps,
                                 targetBitrateKbps = status.previewTargetBitrateKbps,
                                 estimatedBitrateKbps = status.previewEstimatedBitrateKbps,
                                 sentFps = status.previewSentFps,
+                                droppedFrames = status.previewDroppedFrames,
                                 error = status.previewEncoderError
                             ),
                             previewStreamUrl = if (selectedPreviewTransport == PreviewTransport.H264) {
@@ -2248,20 +2255,33 @@ class ZCamMainViewModel @Inject constructor(
     private fun previewDiagnosticsLabel(
         width: Int,
         height: Int,
+        actualWidth: Int,
+        actualHeight: Int,
         targetFps: Int,
         targetBitrateKbps: Int,
         estimatedBitrateKbps: Int,
         sentFps: Int,
+        droppedFrames: Long,
         error: String? = null
     ): String {
         val base = "${width}x$height ${targetFps} FPS target ${targetBitrateKbps} kbps"
+        val actual = if (actualWidth > 0 && actualHeight > 0) {
+            " | actual ${actualWidth}x${actualHeight}"
+        } else {
+            ""
+        }
         val live = if (estimatedBitrateKbps > 0 || sentFps > 0) {
             " | sent ${sentFps} FPS | est ${estimatedBitrateKbps} kbps"
         } else {
             ""
         }
+        val drops = if (droppedFrames > 0) {
+            " | dropped $droppedFrames"
+        } else {
+            ""
+        }
         val errorText = error?.takeIf { it.isNotBlank() }?.let { " | $it" }.orEmpty()
-        return base + live + errorText
+        return base + actual + live + drops + errorText
     }
 
     private fun refreshServerLanHost() {

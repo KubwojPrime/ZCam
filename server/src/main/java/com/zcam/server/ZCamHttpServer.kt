@@ -1547,19 +1547,24 @@ class ZCamHttpServer @Inject constructor(
             transport = PreviewTransport.MJPEG,
             targetWidth = frameStatusSource.snapshot().targetWidth,
             targetHeight = frameStatusSource.snapshot().targetHeight,
+            actualWidth = 0,
+            actualHeight = 0,
             targetFps = frameStatusSource.snapshot().targetFps,
             targetBitrateKbps = 0,
             estimatedBitrateKbps = 0,
             sentFps = 0,
             subscriberCount = 0,
             encoderRunning = false,
-            mjpegFallbackAvailable = true
+            mjpegFallbackAvailable = true,
+            droppedFrames = 0
         )
         return buildString(capacity = 320) {
             append('{')
             append("\"transport\":").append(jsonString(safeDiagnostics.transport.wireName)).append(',')
             append("\"targetWidth\":").append(safeDiagnostics.targetWidth).append(',')
             append("\"targetHeight\":").append(safeDiagnostics.targetHeight).append(',')
+            append("\"actualWidth\":").append(safeDiagnostics.actualWidth).append(',')
+            append("\"actualHeight\":").append(safeDiagnostics.actualHeight).append(',')
             append("\"targetFps\":").append(safeDiagnostics.targetFps).append(',')
             append("\"targetBitrateKbps\":").append(safeDiagnostics.targetBitrateKbps).append(',')
             append("\"estimatedBitrateKbps\":").append(safeDiagnostics.estimatedBitrateKbps).append(',')
@@ -1567,6 +1572,7 @@ class ZCamHttpServer @Inject constructor(
             append("\"subscriberCount\":").append(safeDiagnostics.subscriberCount).append(',')
             append("\"encoderRunning\":").append(safeDiagnostics.encoderRunning).append(',')
             append("\"mjpegFallbackAvailable\":").append(safeDiagnostics.mjpegFallbackAvailable).append(',')
+            append("\"droppedFrames\":").append(safeDiagnostics.droppedFrames).append(',')
             append("\"lastError\":").append(jsonString(safeDiagnostics.lastError))
             append('}')
         }
