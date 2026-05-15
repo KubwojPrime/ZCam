@@ -186,6 +186,7 @@ class ZCamMainViewModel @Inject constructor(
             }
             ZCamUiAction.FetchRecordings -> fetchRecordingsForRange()
             is ZCamUiAction.PlayRecording -> playRecording(action.fileName, action.seekToEpochMs)
+            is ZCamUiAction.PlayRecordingAtEpoch -> playRecordingAtEpoch(action.epochMs)
             is ZCamUiAction.DownloadRecording -> downloadRecordingToDevice(action.fileName)
 
             ZCamUiAction.RequestPairingQr -> requestPairingQr()
@@ -1265,6 +1266,30 @@ class ZCamMainViewModel @Inject constructor(
         }
     }
 
+    private fun playRecordingAtEpoch(epochMs: Long) {
+        val current = state.value
+        val item = current.recordings.items
+            .sortedBy(com.zcam.ui.RecordingItemUi::startedAtEpochMs)
+            .firstOrNull { recording ->
+                epochMs in recording.startedAtEpochMs..recording.endedAtEpochMs
+            }
+
+        if (item != null) {
+            playRecording(item.fileName, epochMs)
+            return
+        }
+
+        _state.update {
+            it.copy(
+                recordings = it.recordings.copy(
+                    resultMessage = "No recording available for ${formatRecordingTimestamp(epochMs)}",
+                    resultTone = StatusTone.WARNING
+                ),
+                errorMessage = null
+            )
+        }
+    }
+
     private fun adjustClientZoom(deltaLinear: Float) {
         val targetZoom = (state.value.clientZoomLinear + deltaLinear).coerceIn(0f, 1f)
         applyClientZoom(targetZoom)
@@ -2098,6 +2123,10 @@ class ZCamMainViewModel @Inject constructor(
             .atZone(ZoneId.systemDefault())
             .toLocalDateTime()
             .format(RECORDINGS_DATE_TIME_FORMATTER)
+    }
+
+    private fun formatRecordingTimestamp(epochMs: Long): String {
+        return formatRecordingTimeInput(epochMs)
     }
 
     private suspend fun readThermalState(): Pair<String, StatusTone> = withContext(dispatchers.io) {

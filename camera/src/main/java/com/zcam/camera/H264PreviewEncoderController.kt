@@ -34,6 +34,7 @@ internal class H264PreviewEncoderController(
     private val droppedFrames = AtomicLong(0L)
     private val actualWidth = AtomicInteger(0)
     private val actualHeight = AtomicInteger(0)
+    private val disabledReason = AtomicReference<String?>(null)
 
     @Volatile
     private var encoder: MediaCodec? = null
@@ -70,6 +71,7 @@ internal class H264PreviewEncoderController(
         }
         selectedEncoderInfo = encoderInfo
         streamConfig = null
+        disabledReason.set(null)
         lastError.set(null)
         estimatedBitrateKbps.set(0)
         sentFps.set(0)
@@ -92,6 +94,7 @@ internal class H264PreviewEncoderController(
         subscribers.clear()
         streamConfig = null
         selectedEncoderInfo = null
+        disabledReason.set(null)
         actualWidth.set(0)
         actualHeight.set(0)
         lastEncoderStartAttemptAtMs = 0L
@@ -106,11 +109,15 @@ internal class H264PreviewEncoderController(
         height: Int,
         presentationTimeUs: Long
     ) {
-        if (!running.get()) return
+        if (!acceptsFrames()) return
         val copy = nv21.copyOf()
         if (pendingFrame.getAndSet(PreviewFrame(copy, width, height, presentationTimeUs)) != null) {
             droppedFrames.incrementAndGet()
         }
+    }
+
+    fun acceptsFrames(): Boolean {
+        return running.get() && disabledReason.get() == null
     }
 
     fun registerSubscriber(
@@ -118,7 +125,7 @@ internal class H264PreviewEncoderController(
         onConfig: (H264PreviewStreamConfig) -> Unit,
         onAccessUnit: (H264PreviewAccessUnit) -> Unit
     ): Boolean {
-        if (previewConfig.transport != PreviewTransport.H264 || !running.get()) {
+        if (previewConfig.transport != PreviewTransport.H264 || !acceptsFrames()) {
             return false
         }
         subscribers[subscriberId] = Subscriber(onConfig = onConfig, onAccessUnit = onAccessUnit)
@@ -148,12 +155,12 @@ internal class H264PreviewEncoderController(
             encoderRunning = running.get() && encoder != null,
             mjpegFallbackAvailable = true,
             droppedFrames = droppedFrames.get(),
-            lastError = lastError.get()
+            lastError = disabledReason.get() ?: lastError.get()
         )
     }
 
     fun requestSyncFrame() {
-        if (!running.get() || Build.VERSION.SDK_INT < Build.VERSION_CODES.KITKAT) return
+        if (!acceptsFrames() || Build.VERSION.SDK_INT < Build.VERSION_CODES.KITKAT) return
         runCatching {
             encoder?.setParameters(Bundle().apply {
                 putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
@@ -193,11 +200,11 @@ internal class H264PreviewEncoderController(
         height: Int
     ): Boolean {
         if (width <= 0 || height <= 0) {
-            lastError.set("Invalid preview frame size ${width}x${height}")
+            disableH264("Invalid preview frame size ${width}x${height}; MJPEG fallback active")
             return false
         }
         if (width % 2 != 0 || height % 2 != 0) {
-            lastError.set("Unsupported odd preview frame size ${width}x${height}; MJPEG fallback active")
+            disableH264("Unsupported odd preview frame size ${width}x${height}; MJPEG fallback active")
             return false
         }
         val currentEncoder = encoder
@@ -222,7 +229,7 @@ internal class H264PreviewEncoderController(
             val capabilities = encoderInfo.getCapabilitiesForType(MIME_TYPE)
             val videoCapabilities = capabilities.videoCapabilities
             if (!videoCapabilities.isSizeSupported(width, height)) {
-                lastError.set("H.264 encoder ${encoderInfo.name} does not support ${width}x${height}; MJPEG fallback active")
+                disableH264("H.264 encoder ${encoderInfo.name} does not support ${width}x${height}; MJPEG fallback active")
                 return false
             }
             val codec = MediaCodec.createByCodecName(encoderInfo.name)
@@ -392,7 +399,16 @@ internal class H264PreviewEncoderController(
         message: String,
         error: Throwable? = null
     ) {
-        lastError.set("$message; MJPEG fallback active")
+        disableH264("$message; MJPEG fallback active", error)
+    }
+
+    private fun disableH264(
+        message: String,
+        error: Throwable? = null
+    ) {
+        running.set(false)
+        disabledReason.set(message)
+        lastError.set(message)
         if (error != null) {
             logger.w("Preview H.264 $message")
         } else {

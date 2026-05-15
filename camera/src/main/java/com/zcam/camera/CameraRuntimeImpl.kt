@@ -34,6 +34,7 @@ import com.zcam.core.domain.config.EventDetectionSensitivity
 import com.zcam.core.domain.config.PreviewTransport
 import com.zcam.core.domain.config.RearCameraLens
 import com.zcam.core.domain.config.StreamConfig
+import com.zcam.core.domain.config.VideoResolution
 import com.zcam.core.domain.recording.RecordingEvent
 import com.zcam.core.domain.recording.RecordingEventStore
 import com.zcam.core.logging.ZCamLogger
@@ -138,8 +139,19 @@ class CameraRuntimeImpl @Inject constructor(
 
             val normalizedFps = config.fps.coerceAtLeast(1)
             val normalizedPreviewFps = config.preview.fps.coerceAtLeast(1)
-            targetWidth.set(config.preview.resolution.width)
-            targetHeight.set(config.preview.resolution.height)
+            val normalizedPreviewSize = normalizePreviewSize(
+                width = config.preview.resolution.width,
+                height = config.preview.resolution.height
+            )
+            val normalizedPreviewConfig = config.preview.copy(
+                resolution = VideoResolution(
+                    width = normalizedPreviewSize.width,
+                    height = normalizedPreviewSize.height
+                ),
+                fps = normalizedPreviewFps
+            )
+            targetWidth.set(normalizedPreviewSize.width)
+            targetHeight.set(normalizedPreviewSize.height)
             targetFps.set(normalizedPreviewFps)
             producedFrames.set(0L)
             droppedFrames.set(0L)
@@ -167,6 +179,7 @@ class CameraRuntimeImpl @Inject constructor(
                 width = config.resolution.width,
                 height = config.resolution.height
             )
+            val previewTargetRotation = FIXED_PREVIEW_TARGET_ROTATION
             val selectedLensBinding = resolveLensBinding(
                 selectedLens = config.rearLens,
                 catalog = rearLensCatalog
@@ -181,8 +194,8 @@ class CameraRuntimeImpl @Inject constructor(
                 provider.unbindAll()
 
                 val preview = Preview.Builder()
-                    .setTargetResolution(Size(config.preview.resolution.width, config.preview.resolution.height))
-                    .setTargetRotation(targetRotation)
+                    .setTargetResolution(normalizedPreviewSize)
+                    .setTargetRotation(previewTargetRotation)
                     .build()
                     .also { useCase ->
                         useCase.setSurfaceProvider { request -> request.willNotProvideSurface() }
@@ -190,7 +203,8 @@ class CameraRuntimeImpl @Inject constructor(
 
                 val analysis = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .setTargetResolution(Size(config.preview.resolution.width, config.preview.resolution.height))
+                    .setTargetResolution(normalizedPreviewSize)
+                    .setTargetRotation(previewTargetRotation)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_NV21)
                     .build()
                 val recorder = Recorder.Builder()
@@ -241,8 +255,8 @@ class CameraRuntimeImpl @Inject constructor(
             }
 
             cameraProvider = provider
-            if (config.preview.transport == PreviewTransport.H264) {
-                val encoderStarted = previewEncoder.start(config.preview)
+            if (normalizedPreviewConfig.transport == PreviewTransport.H264) {
+                val encoderStarted = previewEncoder.start(normalizedPreviewConfig)
                 if (!encoderStarted) {
                     lastControlError.set("H.264 preview unavailable; use MJPEG fallback")
                     logger.w("H.264 preview unavailable, MJPEG fallback remains available")
@@ -262,7 +276,7 @@ class CameraRuntimeImpl @Inject constructor(
             }
             running.set(true)
             logger.i(
-                "Camera runtime started (record ${config.resolution.width}x${config.resolution.height}@$normalizedFps, preview ${config.preview.transport.wireName} ${config.preview.resolution.width}x${config.preview.resolution.height}@${config.preview.fps})"
+                "Camera runtime started (record ${config.resolution.width}x${config.resolution.height}@$normalizedFps, preview ${normalizedPreviewConfig.transport.wireName} ${normalizedPreviewConfig.resolution.width}x${normalizedPreviewConfig.resolution.height}@$normalizedPreviewFps fixedRotation=${rotationToDegrees(previewTargetRotation)})"
             )
         }
     }
@@ -725,6 +739,19 @@ class CameraRuntimeImpl @Inject constructor(
         }
     }
 
+    private fun normalizePreviewSize(
+        width: Int,
+        height: Int
+    ): Size {
+        val safeWidth = width.coerceAtLeast(2)
+        val safeHeight = height.coerceAtLeast(2)
+        val landscapeWidth = maxOf(safeWidth, safeHeight).makeEven()
+        val landscapeHeight = minOf(safeWidth, safeHeight).makeEven()
+        return Size(landscapeWidth, landscapeHeight)
+    }
+
+    private fun Int.makeEven(): Int = if (this % 2 == 0) this else this - 1
+
     private suspend fun <T> awaitFuture(future: ListenableFuture<T>): T {
         return suspendCancellableCoroutine { continuation ->
             future.addListener(
@@ -769,7 +796,7 @@ class CameraRuntimeImpl @Inject constructor(
                 image = image,
                 eventEpochMs = System.currentTimeMillis()
             )
-            val useH264Preview = previewTransport.get() == PreviewTransport.H264
+            val useH264Preview = previewTransport.get() == PreviewTransport.H264 && previewEncoder.acceptsFrames()
             val encodedPreview = encoder.encode(
                 image = image,
                 includeNv21 = useH264Preview
@@ -1103,6 +1130,7 @@ class CameraRuntimeImpl @Inject constructor(
         private const val DEFAULT_FPS = 15
         private const val JPEG_QUALITY = 80
         private const val HEALTHY_FRAME_AGE_MS = 5_000L
+        private const val FIXED_PREVIEW_TARGET_ROTATION = Surface.ROTATION_0
 
         // 1x1 JPEG as a fail-safe frame for snapshot/stream before first camera frame arrives.
         val PLACEHOLDER_JPEG: ByteArray = Base64.getDecoder().decode(

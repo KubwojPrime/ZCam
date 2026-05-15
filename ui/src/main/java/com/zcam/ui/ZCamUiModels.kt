@@ -236,6 +236,7 @@ sealed interface ZCamUiAction {
         val fileName: String,
         val seekToEpochMs: Long? = null
     ) : ZCamUiAction
+    data class PlayRecordingAtEpoch(val epochMs: Long) : ZCamUiAction
     data class DownloadRecording(val fileName: String) : ZCamUiAction
 
     data object RequestPairingQr : ZCamUiAction

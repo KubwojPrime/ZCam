@@ -1692,6 +1692,17 @@ class ZCamHttpServer @Inject constructor(
                 .timelineMarker { position: absolute; top: 4px; width: 8px; height: 22px; transform: translateX(-50%); border-radius: 999px; border: none; background: var(--err); padding: 0; }
                 .timelineMarker:disabled { background: var(--warn); opacity: .65; cursor: default; }
                 .timelinePlayhead { position: absolute; top: 2px; width: 2px; height: 26px; transform: translateX(-50%); background: var(--accent); }
+                .historyViewport { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--card2); touch-action: pan-x; }
+                .historyInner { position: relative; height: 126px; min-width: 100%; }
+                .historyAxis { position: absolute; left: 0; right: 0; top: 66px; height: 2px; background: #303847; }
+                .historySegment { position: absolute; top: 50px; height: 28px; border: none; border-radius: 7px; background: #1e5bb8; opacity: .88; padding: 0; }
+                .historySegment.selected { background: var(--ok); }
+                .historyTick { position: absolute; top: 84px; width: 1px; height: 12px; background: var(--muted); }
+                .historyTick.major { top: 78px; height: 20px; background: var(--text); }
+                .historyTickLabel { position: absolute; top: 101px; width: 78px; transform: translateX(-50%); color: var(--muted); font-size: 11px; text-align: center; white-space: nowrap; }
+                .historyEvent { position: absolute; top: 18px; width: 12px; height: 34px; transform: translateX(-50%); border: none; border-radius: 8px; background: var(--err); color: white; padding: 0; font-size: 11px; font-weight: 700; }
+                .historyEvent.cluster { width: 30px; height: 24px; border-radius: 999px; }
+                .historyPlayhead { position: absolute; top: 8px; bottom: 8px; width: 2px; transform: translateX(-50%); background: var(--ok); }
                 .progressWrap { display: grid; gap: 4px; }
                 progress { width: 100%; height: 8px; }
                 .speedRow button { flex: 1 1 64px; }
@@ -1869,10 +1880,10 @@ class ZCamHttpServer @Inject constructor(
                         <div id="recordingDownloadLabel" class="sub">Preparing download...</div>
                       </div>
                       <div id="recordingMeta" class="metaGrid"></div>
-                      <div class="sub">Global History Timeline</div>
+                      <div class="sub">Recording History Timeline</div>
                       <div id="globalRecordingTimeline" class="timelineShell"></div>
                       <div class="sub" id="globalRecordingTimelineHint">Load recordings to show event history.</div>
-                      <div class="sub">Current Recording Timeline</div>
+                      <div class="sub">Current Clip Timeline</div>
                       <div id="recordingTimeline" class="timelineShell"></div>
                       <div class="sub" id="recordingTimelineHint">Select a recording to show clip-local event markers.</div>
                       <div class="sub" id="recordingErrorLabel"></div>
@@ -1988,6 +1999,9 @@ class ZCamHttpServer @Inject constructor(
                 let pttSocketOpening = false;
                 let lastStatusPayload = null;
                 let recordingTimelinePlayhead = null;
+                let globalTimelinePlayhead = null;
+                let globalTimelineRange = null;
+                let globalTimelineWidthPx = 1;
                 let previewReloadTimer = null;
 
                 function readAuth() {
@@ -2296,8 +2310,112 @@ class ZCamHttpServer @Inject constructor(
                   updateTimelinePlayhead();
                 }
 
+                function historyTickIntervalMs(rangeMs) {
+                  const minute = 60 * 1000;
+                  const hour = 60 * minute;
+                  const day = 24 * hour;
+                  if (rangeMs < 90 * minute) return 15 * minute;
+                  if (rangeMs < 2 * hour) return 30 * minute;
+                  if (rangeMs <= 8 * hour) return hour;
+                  if (rangeMs <= 16 * hour) return 2 * hour;
+                  if (rangeMs <= day) return 4 * hour;
+                  if (rangeMs <= 3 * day) return 6 * hour;
+                  return 12 * hour;
+                }
+
+                function formatHistoryTick(epochMs, rangeMs) {
+                  const date = new Date(epochMs);
+                  if (rangeMs > 24 * 60 * 60 * 1000) {
+                    return date.toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+                  }
+                  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                }
+
+                function buildHistoryTicks(rangeStart, rangeEnd, intervalMs) {
+                  const rangeMs = Math.max(1, rangeEnd - rangeStart);
+                  const ticks = [];
+                  let tick = Math.floor(rangeStart / intervalMs) * intervalMs;
+                  if (tick < rangeStart) tick += intervalMs;
+                  while (tick <= rangeEnd) {
+                    ticks.push({
+                      epochMs: tick,
+                      label: formatHistoryTick(tick, rangeMs),
+                      major: rangeMs > 24 * 60 * 60 * 1000
+                        ? tick % (24 * 60 * 60 * 1000) === 0
+                        : intervalMs >= 60 * 60 * 1000 || tick % (60 * 60 * 1000) === 0
+                    });
+                    tick += intervalMs;
+                  }
+                  if (ticks.length === 0) {
+                    ticks.push({ epochMs: rangeStart, label: formatHistoryTick(rangeStart, rangeMs), major: true });
+                    ticks.push({ epochMs: rangeEnd, label: formatHistoryTick(rangeEnd, rangeMs), major: true });
+                  }
+                  return ticks;
+                }
+
+                function clusterHistoryEvents(events, rangeStart, rangeEnd, widthPx) {
+                  const durationMs = Math.max(1, rangeEnd - rangeStart);
+                  const positioned = events
+                    .filter((eventItem) => Number.isFinite(Number(eventItem.epochMs)) && eventItem.epochMs >= rangeStart && eventItem.epochMs <= rangeEnd)
+                    .map((eventItem) => ({
+                      item: eventItem,
+                      x: ((Number(eventItem.epochMs) - rangeStart) / durationMs) * widthPx
+                    }))
+                    .sort((a, b) => a.x - b.x);
+                  const clusters = [];
+                  let current = [];
+                  let lastX = 0;
+                  const flush = () => {
+                    if (current.length === 0) return;
+                    const representative = current.slice().sort((a, b) =>
+                      Number(b.confidencePercent || 0) - Number(a.confidencePercent || 0) ||
+                      Number(b.epochMs || 0) - Number(a.epochMs || 0)
+                    )[0];
+                    clusters.push({ epochMs: Number(representative.epochMs), count: current.length, item: representative });
+                    current = [];
+                  };
+                  positioned.forEach(({ item, x }) => {
+                    if (current.length > 0 && x - lastX > 26) flush();
+                    current.push(item);
+                    lastX = x;
+                  });
+                  flush();
+                  return clusters;
+                }
+
+                function jumpToHistoryTimestamp(epochMs) {
+                  const timestamp = Number(epochMs);
+                  const targetClip = recordingsCache.find((entry) =>
+                    timestamp >= Number(entry.startedAtEpochMs) && timestamp <= Number(entry.endedAtEpochMs)
+                  );
+                  if (!targetClip) {
+                    recordingsState.textContent = 'recordings: no recording available for ' + new Date(timestamp).toLocaleString();
+                    return;
+                  }
+                  const seekSeconds = Math.max(0, Math.floor((timestamp - Number(targetClip.startedAtEpochMs)) / 1000));
+                  selectRecording(targetClip.fileName, seekSeconds);
+                }
+
+                function updateGlobalTimelinePlayhead() {
+                  if (!globalTimelinePlayhead || !globalTimelineRange) return;
+                  const item = selectedRecordingItem();
+                  if (!item) {
+                    globalTimelinePlayhead.style.display = 'none';
+                    return;
+                  }
+                  const selectedEpoch = Number(item.startedAtEpochMs) + Math.max(0, recordingPlayer.currentTime || 0) * 1000;
+                  const durationMs = Math.max(1, globalTimelineRange.end - globalTimelineRange.start);
+                  const fraction = Math.max(0, Math.min(1, (selectedEpoch - globalTimelineRange.start) / durationMs));
+                  globalTimelinePlayhead.style.display = 'block';
+                  globalTimelinePlayhead.style.left = (fraction * globalTimelineWidthPx).toFixed(1) + 'px';
+                }
+
                 function renderGlobalRecordingTimeline() {
+                  const previousViewport = globalRecordingTimeline.querySelector('.historyViewport');
+                  const previousScrollLeft = previousViewport ? previousViewport.scrollLeft : null;
                   globalRecordingTimeline.innerHTML = '';
+                  globalTimelinePlayhead = null;
+                  globalTimelineRange = null;
                   if (recordingsCache.length === 0 && recordingEventsCache.length === 0) {
                     globalRecordingTimelineHint.textContent = 'Load recordings to show event history.';
                     return;
@@ -2313,46 +2431,82 @@ class ZCamHttpServer @Inject constructor(
                   }
 
                   const durationMs = Math.max(1, rangeEnd - rangeStart);
-                  const bar = document.createElement('div');
-                  bar.className = 'timelineBar';
-                  const track = document.createElement('div');
-                  track.className = 'timelineTrack';
-                  bar.appendChild(track);
+                  const tickInterval = historyTickIntervalMs(durationMs);
+                  const ticks = buildHistoryTicks(rangeStart, rangeEnd, tickInterval);
+                  const viewportWidth = Math.max(320, globalRecordingTimeline.clientWidth || window.innerWidth - 48);
+                  const innerWidth = Math.min(9600, Math.max(viewportWidth, ticks.length * 112));
+                  globalTimelineRange = { start: rangeStart, end: rangeEnd };
+                  globalTimelineWidthPx = innerWidth;
+
+                  const viewport = document.createElement('div');
+                  viewport.className = 'historyViewport';
+                  const inner = document.createElement('div');
+                  inner.className = 'historyInner';
+                  inner.style.width = innerWidth + 'px';
+                  inner.addEventListener('click', (event) => {
+                    if (event.target.closest('button')) return;
+                    const rect = inner.getBoundingClientRect();
+                    const x = Math.max(0, Math.min(innerWidth, event.clientX - rect.left));
+                    jumpToHistoryTimestamp(rangeStart + Math.round((x / innerWidth) * durationMs));
+                  });
+
+                  const axis = document.createElement('div');
+                  axis.className = 'historyAxis';
+                  inner.appendChild(axis);
 
                   recordingsCache.forEach((item) => {
                     const startFraction = Math.max(0, Math.min(1, (Number(item.startedAtEpochMs) - rangeStart) / durationMs));
                     const endFraction = Math.max(0, Math.min(1, (Number(item.endedAtEpochMs) - rangeStart) / durationMs));
                     const segment = document.createElement('button');
                     segment.type = 'button';
-                    segment.className = 'timelineSegment';
-                    segment.style.left = (startFraction * 100).toFixed(2) + '%';
-                    segment.style.width = (Math.max(0.02, endFraction - startFraction) * 100).toFixed(2) + '%';
-                    segment.title = item.fileName;
-                    segment.addEventListener('click', () => selectRecording(item.fileName, null));
-                    bar.appendChild(segment);
+                    segment.className = 'historySegment' + (selectedRecordingName === item.fileName ? ' selected' : '');
+                    segment.style.left = (startFraction * innerWidth).toFixed(1) + 'px';
+                    segment.style.width = Math.max(6, (endFraction - startFraction) * innerWidth).toFixed(1) + 'px';
+                    segment.title = item.fileName + ' | ' + new Date(item.startedAtEpochMs).toLocaleString();
+                    segment.addEventListener('click', () => jumpToHistoryTimestamp(Number(item.startedAtEpochMs)));
+                    inner.appendChild(segment);
                   });
 
-                  recordingEventsCache.forEach((eventItem) => {
-                    const markerFraction = Math.max(0, Math.min(1, (Number(eventItem.epochMs) - rangeStart) / durationMs));
+                  ticks.forEach((tick) => {
+                    const fraction = Math.max(0, Math.min(1, (tick.epochMs - rangeStart) / durationMs));
+                    const x = fraction * innerWidth;
+                    const line = document.createElement('div');
+                    line.className = 'historyTick' + (tick.major ? ' major' : '');
+                    line.style.left = x.toFixed(1) + 'px';
+                    inner.appendChild(line);
+                    const label = document.createElement('div');
+                    label.className = 'historyTickLabel';
+                    label.style.left = x.toFixed(1) + 'px';
+                    label.textContent = tick.label;
+                    inner.appendChild(label);
+                  });
+
+                  clusterHistoryEvents(recordingEventsCache, rangeStart, rangeEnd, innerWidth).forEach((cluster) => {
+                    const fraction = Math.max(0, Math.min(1, (cluster.epochMs - rangeStart) / durationMs));
                     const marker = document.createElement('button');
                     marker.type = 'button';
-                    marker.className = 'timelineMarker';
-                    marker.style.left = (markerFraction * 100).toFixed(2) + '%';
-                    marker.title = new Date(eventItem.epochMs).toLocaleString() + ' | ' + eventItem.confidencePercent + '% | ' + eventItem.source;
-                    marker.disabled = !eventItem.recordingFileName;
-                    marker.addEventListener('click', () => jumpToRecordingEvent(eventItem));
-                    bar.appendChild(marker);
+                    marker.className = 'historyEvent' + (cluster.count > 1 ? ' cluster' : '');
+                    marker.style.left = (fraction * innerWidth).toFixed(1) + 'px';
+                    marker.title = new Date(cluster.epochMs).toLocaleString() + ' | ' + cluster.count + ' event(s)';
+                    marker.textContent = cluster.count > 1 ? String(cluster.count) : '';
+                    marker.addEventListener('click', () => jumpToHistoryTimestamp(cluster.epochMs));
+                    inner.appendChild(marker);
                   });
 
-                  const labels = document.createElement('div');
-                  labels.className = 'row';
-                  labels.innerHTML = '<span class="sub">' + new Date(rangeStart).toLocaleString() + '</span>' +
-                    '<span class="sub">' + new Date(rangeEnd).toLocaleString() + '</span>';
-                  globalRecordingTimeline.appendChild(bar);
-                  globalRecordingTimeline.appendChild(labels);
+                  const playhead = document.createElement('div');
+                  playhead.className = 'historyPlayhead';
+                  inner.appendChild(playhead);
+                  globalTimelinePlayhead = playhead;
+
+                  viewport.appendChild(inner);
+                  globalRecordingTimeline.appendChild(viewport);
                   globalRecordingTimelineHint.textContent = recordingEventsCache.length > 0
-                    ? 'Global event markers cover all loaded retained recordings.'
-                    : 'No events in this loaded history range.';
+                    ? 'Drag the clock timeline horizontally. Blocks are real recording segments; red badges are event clusters.'
+                    : 'Drag the clock timeline horizontally. Blocks are real recording segments; gaps are missing recording time.';
+                  updateGlobalTimelinePlayhead();
+                  viewport.scrollLeft = Number.isFinite(previousScrollLeft)
+                    ? previousScrollLeft
+                    : Math.max(0, viewport.scrollWidth - viewport.clientWidth);
                 }
 
                 function updateSpeedButtons() {
@@ -2762,6 +2916,7 @@ class ZCamHttpServer @Inject constructor(
                   recordingSelection.textContent = 'selected: ' + fileName;
                   renderRecordingMeta(item);
                   renderRecordingTimeline();
+                  renderGlobalRecordingTimeline();
                   setRecordingError('', '');
                   setRecordingLoadState(true, 'Loading video from server...', null);
                   updateRecordingPlaybackState('playback: loading', 'warnText');
@@ -3325,6 +3480,7 @@ class ZCamHttpServer @Inject constructor(
                   }
                   renderRecordingTimeline();
                   updateTimelinePlayhead();
+                  updateGlobalTimelinePlayhead();
                 });
                 recordingPlayer.addEventListener('canplay', () => {
                   setRecordingLoadState(false, '', null);
@@ -3350,6 +3506,7 @@ class ZCamHttpServer @Inject constructor(
                 recordingPlayer.addEventListener('ended', () => {
                   updateRecordingPlaybackState('playback: ended', '');
                   updateTimelinePlayhead();
+                  updateGlobalTimelinePlayhead();
                 });
                 recordingPlayer.addEventListener('ratechange', () => {
                   selectedPlaybackRate = Number(recordingPlayer.playbackRate || 1);
@@ -3357,6 +3514,7 @@ class ZCamHttpServer @Inject constructor(
                 });
                 recordingPlayer.addEventListener('timeupdate', () => {
                   updateTimelinePlayhead();
+                  updateGlobalTimelinePlayhead();
                 });
                 recordingPlayer.addEventListener('error', () => {
                   setRecordingLoadState(false, '', null);

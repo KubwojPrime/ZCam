@@ -12,10 +12,12 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.VideoView
 import androidx.compose.foundation.gestures.rememberTransformableState
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -48,22 +50,28 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.graphics.Color as ComposeColor
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.zcam.core.domain.config.PreviewTransport
 import java.text.DateFormat
+import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlin.math.max
 
 @Composable
@@ -792,7 +800,7 @@ private fun RecordingEventMarkerStrip(
         }
     }
     Text(
-        text = "Current Recording Timeline. Event markers stay pinned to this clip. Tap a marker to jump to the event.",
+        text = "Current Clip Timeline. Event markers stay pinned to this clip. Tap a marker to jump to the event.",
         style = MaterialTheme.typography.bodySmall
     )
 }
@@ -818,7 +826,7 @@ private fun RecordingTimelineCard(
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Text(
-                text = "Global History Timeline",
+                text = "Recording History Timeline",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold
             )
@@ -830,64 +838,170 @@ private fun RecordingTimelineCard(
                 return@Column
             }
 
+            val totalRangeMs = (rangeEnd - rangeStart).coerceAtLeast(1L)
+            val tickIntervalMs = historyTickIntervalMs(totalRangeMs)
+            val ticks = remember(rangeStart, rangeEnd, tickIntervalMs) {
+                buildHistoryTicks(rangeStart, rangeEnd, tickIntervalMs)
+            }
+            val selectedEpochMs = state.recordings.items
+                .firstOrNull { it.fileName == state.recordings.selectedFileName }
+                ?.let { item ->
+                    item.startedAtEpochMs + state.recordings.selectedPlaybackOffsetMs
+                        .coerceIn(0L, item.durationMs.coerceAtLeast(0L))
+                }
+            val scrollState = rememberScrollState()
+            val coroutineScope = rememberCoroutineScope()
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedButton(
+                    onClick = { coroutineScope.launch { scrollState.animateScrollTo(0) } },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("Start")
+                }
+                OutlinedButton(
+                    onClick = { coroutineScope.launch { scrollState.animateScrollTo(scrollState.maxValue) } },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("Latest")
+                }
+            }
+
             BoxWithConstraints(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(96.dp)
+                    .height(152.dp)
             ) {
+                val density = LocalDensity.current
+                val targetWidth = ((ticks.size.coerceAtLeast(2)) * 112).dp
                 val timelineWidth = maxWidth
-                val totalRange = (rangeEnd - rangeStart).coerceAtLeast(1L).toFloat()
+                    .coerceAtLeast(targetWidth)
+                    .coerceAtMost(MAX_HISTORY_TIMELINE_WIDTH_DP)
+                val timelineWidthPx = with(density) { timelineWidth.toPx().coerceAtLeast(1f) }
+                val eventClusters = remember(events, rangeStart, rangeEnd, timelineWidthPx) {
+                    clusterHistoryEvents(events, rangeStart, rangeEnd, timelineWidthPx)
+                }
 
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(56.dp)
-                        .align(Alignment.Center)
+                        .height(152.dp)
+                        .horizontalScroll(scrollState)
                         .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(12.dp))
-                )
-
-                segments.forEach { item ->
-                    val startFraction = ((item.startedAtEpochMs - rangeStart) / totalRange).coerceIn(0f, 1f)
-                    val endFraction = ((item.endedAtEpochMs - rangeStart) / totalRange).coerceIn(0f, 1f)
-                    val widthFraction = (endFraction - startFraction).coerceAtLeast(0.03f)
+                ) {
                     Box(
                         modifier = Modifier
-                            .padding(top = 20.dp)
-                            .height(24.dp)
-                            .width(timelineWidth * widthFraction)
-                            .background(
-                                if (state.recordings.selectedFileName == item.fileName) {
-                                    MaterialTheme.colorScheme.tertiary
-                                } else {
-                                    MaterialTheme.colorScheme.primaryContainer
-                                },
-                                RoundedCornerShape(8.dp)
-                            )
-                            .clickable { onAction(ZCamUiAction.PlayRecording(item.fileName)) }
-                            .align(Alignment.TopStart)
-                            .offset(x = timelineWidth * startFraction)
-                    )
-                }
-
-                events.forEach { event ->
-                    val markerFraction = ((event.epochMs - rangeStart) / totalRange).coerceIn(0f, 1f)
-                    Box(
-                        modifier = Modifier
-                            .padding(top = 12.dp)
-                            .width(4.dp)
-                            .height(40.dp)
-                            .background(
-                                MaterialTheme.colorScheme.error,
-                                RoundedCornerShape(2.dp)
-                            )
-                            .align(Alignment.TopStart)
-                            .offset(x = timelineWidth * markerFraction)
-                            .clickable(enabled = !event.recordingFileName.isNullOrBlank()) {
-                                event.recordingFileName?.let { fileName ->
-                                    onAction(ZCamUiAction.PlayRecording(fileName, event.epochMs))
+                            .width(timelineWidth)
+                            .height(152.dp)
+                            .pointerInput(rangeStart, rangeEnd, timelineWidthPx) {
+                                detectTapGestures { offset ->
+                                    val fraction = (offset.x / timelineWidthPx).coerceIn(0f, 1f)
+                                    val selectedEpoch = rangeStart + (totalRangeMs * fraction).toLong()
+                                    onAction(ZCamUiAction.PlayRecordingAtEpoch(selectedEpoch))
                                 }
                             }
-                    )
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.TopStart)
+                                .offset(y = 72.dp)
+                                .fillMaxWidth()
+                                .height(2.dp)
+                                .background(MaterialTheme.colorScheme.outline.copy(alpha = 0.55f))
+                        )
+
+                        segments.forEach { item ->
+                            val startFraction = ((item.startedAtEpochMs - rangeStart).toFloat() / totalRangeMs).coerceIn(0f, 1f)
+                            val endFraction = ((item.endedAtEpochMs - rangeStart).toFloat() / totalRangeMs).coerceIn(0f, 1f)
+                            val widthFraction = (endFraction - startFraction).coerceAtLeast(0.002f)
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.TopStart)
+                                    .offset(x = timelineWidth * startFraction, y = 56.dp)
+                                    .width((timelineWidth * widthFraction).coerceAtLeast(6.dp))
+                                    .height(28.dp)
+                                    .background(
+                                        if (state.recordings.selectedFileName == item.fileName) {
+                                            MaterialTheme.colorScheme.tertiary
+                                        } else {
+                                            MaterialTheme.colorScheme.primaryContainer
+                                        },
+                                        RoundedCornerShape(6.dp)
+                                    )
+                                    .clickable {
+                                        onAction(ZCamUiAction.PlayRecordingAtEpoch(item.startedAtEpochMs))
+                                    }
+                            )
+                        }
+
+                        ticks.forEach { tick ->
+                            val fraction = ((tick.epochMs - rangeStart).toFloat() / totalRangeMs).coerceIn(0f, 1f)
+                            val x = timelineWidth * fraction
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.TopStart)
+                                    .offset(x = x, y = if (tick.major) 86.dp else 92.dp)
+                                    .width(1.dp)
+                                    .height(if (tick.major) 18.dp else 10.dp)
+                                    .background(MaterialTheme.colorScheme.outline)
+                            )
+                            Text(
+                                text = tick.label,
+                                style = MaterialTheme.typography.labelSmall,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier
+                                    .align(Alignment.TopStart)
+                                    .offset(x = x - 42.dp, y = 108.dp)
+                                    .width(84.dp)
+                            )
+                        }
+
+                        eventClusters.forEach { cluster ->
+                            val fraction = ((cluster.epochMs - rangeStart).toFloat() / totalRangeMs).coerceIn(0f, 1f)
+                            val markerWidth = if (cluster.count > 1) 30.dp else 14.dp
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.TopStart)
+                                    .offset(x = timelineWidth * fraction - (markerWidth / 2f), y = 18.dp)
+                                    .width(markerWidth)
+                                    .height(if (cluster.count > 1) 24.dp else 34.dp)
+                                    .background(
+                                        MaterialTheme.colorScheme.error,
+                                        RoundedCornerShape(if (cluster.count > 1) 12.dp else 7.dp)
+                                    )
+                                    .clickable {
+                                        onAction(ZCamUiAction.PlayRecordingAtEpoch(cluster.epochMs))
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (cluster.count > 1) {
+                                    Text(
+                                        text = cluster.count.toString(),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onError,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+                        }
+
+                        selectedEpochMs?.let { epoch ->
+                            if (epoch in rangeStart..rangeEnd) {
+                                val fraction = ((epoch - rangeStart).toFloat() / totalRangeMs).coerceIn(0f, 1f)
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.TopStart)
+                                        .offset(x = timelineWidth * fraction)
+                                        .width(2.dp)
+                                        .height(132.dp)
+                                        .background(MaterialTheme.colorScheme.secondary)
+                                )
+                            }
+                        }
+                    }
                 }
             }
 
@@ -899,7 +1013,8 @@ private fun RecordingTimelineCard(
                 Text(formatDateTime(rangeEnd), style = MaterialTheme.typography.bodySmall)
             }
             Text(
-                text = "Red markers are detected events across retained recording history. Tap a marker to jump to the matching segment.",
+                text = selectedEpochMs?.let { "Selected ${formatDateTime(it)}. Drag the timeline horizontally; tap any recorded block or event to seek." }
+                    ?: "Drag the timeline horizontally. Gaps are real missing recording time; tapping a gap reports no recording.",
                 style = MaterialTheme.typography.bodySmall
             )
         }
@@ -1009,6 +1124,119 @@ private fun RecordingSegmentsList(
                 }
             }
         }
+    }
+}
+
+private data class HistoryTickUi(
+    val epochMs: Long,
+    val label: String,
+    val major: Boolean
+)
+
+private data class HistoryEventClusterUi(
+    val epochMs: Long,
+    val count: Int
+)
+
+private const val MINUTE_MS = 60_000L
+private const val HOUR_MS = 60 * MINUTE_MS
+private const val DAY_MS = 24 * HOUR_MS
+private const val EVENT_CLUSTER_DISTANCE_PX = 26f
+private val MAX_HISTORY_TIMELINE_WIDTH_DP: Dp = 9_600.dp
+
+private fun historyTickIntervalMs(rangeMs: Long): Long {
+    return when {
+        rangeMs < 90 * MINUTE_MS -> 15 * MINUTE_MS
+        rangeMs < 2 * HOUR_MS -> 30 * MINUTE_MS
+        rangeMs <= 8 * HOUR_MS -> HOUR_MS
+        rangeMs <= 16 * HOUR_MS -> 2 * HOUR_MS
+        rangeMs <= DAY_MS -> 4 * HOUR_MS
+        rangeMs <= 3 * DAY_MS -> 6 * HOUR_MS
+        else -> 12 * HOUR_MS
+    }
+}
+
+private fun buildHistoryTicks(
+    rangeStart: Long,
+    rangeEnd: Long,
+    intervalMs: Long
+): List<HistoryTickUi> {
+    val rangeMs = (rangeEnd - rangeStart).coerceAtLeast(1L)
+    val ticks = mutableListOf<HistoryTickUi>()
+    var tick = (rangeStart / intervalMs) * intervalMs
+    if (tick < rangeStart) tick += intervalMs
+    while (tick <= rangeEnd) {
+        ticks += HistoryTickUi(
+            epochMs = tick,
+            label = formatHistoryTick(tick, rangeMs),
+            major = isMajorHistoryTick(tick, intervalMs, rangeMs)
+        )
+        tick += intervalMs
+    }
+    if (ticks.isEmpty()) {
+        ticks += HistoryTickUi(rangeStart, formatHistoryTick(rangeStart, rangeMs), major = true)
+        ticks += HistoryTickUi(rangeEnd, formatHistoryTick(rangeEnd, rangeMs), major = true)
+    }
+    return ticks
+}
+
+private fun clusterHistoryEvents(
+    events: List<RecordingEventUi>,
+    rangeStart: Long,
+    rangeEnd: Long,
+    timelineWidthPx: Float
+): List<HistoryEventClusterUi> {
+    val totalRangeMs = (rangeEnd - rangeStart).coerceAtLeast(1L).toFloat()
+    val positioned = events
+        .filter { it.epochMs in rangeStart..rangeEnd }
+        .map { event ->
+            val x = (((event.epochMs - rangeStart).toFloat() / totalRangeMs).coerceIn(0f, 1f)) * timelineWidthPx
+            event to x
+        }
+        .sortedBy { it.second }
+    if (positioned.isEmpty()) return emptyList()
+
+    val clusters = mutableListOf<HistoryEventClusterUi>()
+    var currentEvents = mutableListOf<RecordingEventUi>()
+    var currentLastX = positioned.first().second
+
+    fun flush() {
+        if (currentEvents.isEmpty()) return
+        val representative = currentEvents.maxWithOrNull(
+            compareBy<RecordingEventUi> { it.confidencePercent }.thenByDescending { it.epochMs }
+        ) ?: currentEvents.first()
+        clusters += HistoryEventClusterUi(
+            epochMs = representative.epochMs,
+            count = currentEvents.size
+        )
+        currentEvents = mutableListOf()
+    }
+
+    positioned.forEach { (event, x) ->
+        if (currentEvents.isNotEmpty() && x - currentLastX > EVENT_CLUSTER_DISTANCE_PX) {
+            flush()
+        }
+        currentEvents += event
+        currentLastX = x
+    }
+    flush()
+    return clusters
+}
+
+private fun formatHistoryTick(epochMs: Long, rangeMs: Long): String {
+    val pattern = if (rangeMs > DAY_MS) "MM-dd HH:mm" else "HH:mm"
+    return SimpleDateFormat(pattern, Locale.getDefault()).format(Date(epochMs))
+}
+
+private fun isMajorHistoryTick(
+    epochMs: Long,
+    intervalMs: Long,
+    rangeMs: Long
+): Boolean {
+    return when {
+        rangeMs > DAY_MS -> epochMs % DAY_MS == 0L
+        intervalMs < HOUR_MS -> epochMs % HOUR_MS == 0L
+        else -> true
     }
 }
 
