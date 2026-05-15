@@ -59,6 +59,7 @@ import androidx.compose.ui.window.DialogProperties
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import com.zcam.core.domain.config.FeatureFlag
+import com.zcam.core.domain.config.EventDetectionSensitivity
 import com.zcam.core.domain.config.PreviewProfile
 import com.zcam.core.domain.config.PreviewTransport
 import com.zcam.core.domain.config.RearCameraLens
@@ -693,6 +694,35 @@ private fun SettingsScreen(
                 )
             }
 
+            SettingsSection(title = "Event detection") {
+                Text(
+                    text = "Sensitivity",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    EventDetectionSensitivity.entries.forEach { sensitivity ->
+                        ActiveActionButton(
+                            text = sensitivity.label,
+                            active = settings.eventSensitivitySelection == sensitivity,
+                            onClick = { onAction(ZCamUiAction.SettingsEventSensitivityChanged(sensitivity)) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+                Text(
+                    text = when (settings.eventSensitivitySelection) {
+                        EventDetectionSensitivity.LOW -> "Low sensitivity requires larger motion and uses a longer cooldown."
+                        EventDetectionSensitivity.BALANCED -> "Balanced sensitivity is the default motion profile."
+                        EventDetectionSensitivity.HIGH -> "High sensitivity detects smaller movement and still applies cooldown to avoid event spam."
+                    },
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+
             SettingsSection(title = "Preview transport") {
                 Text(
                     text = "Transport",
@@ -1240,6 +1270,7 @@ private fun RuntimeControls(
         ) {
             StatusChip(label = "Runtime: ${state.runtimeLabel}", tone = state.runtimeTone)
             StatusChip(label = state.cameraLensLabel, tone = state.cameraLensTone)
+            StatusChip(label = state.eventSensitivityLabel, tone = StatusTone.NEUTRAL)
             StatusChip(label = state.serverBatteryLabel, tone = state.serverBatteryTone)
             Row(
                 modifier = Modifier.fillMaxWidth(),

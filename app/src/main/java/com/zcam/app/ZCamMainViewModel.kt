@@ -20,6 +20,7 @@ import com.zcam.client.LocalClient
 import com.zcam.core.device.PowerStatusProvider
 import com.zcam.core.dispatchers.DispatcherProvider
 import com.zcam.core.domain.config.FeatureFlag
+import com.zcam.core.domain.config.EventDetectionSensitivity
 import com.zcam.core.domain.config.PreviewProfile
 import com.zcam.core.domain.config.PreviewTransport
 import com.zcam.core.domain.config.RearCameraLens
@@ -212,6 +213,7 @@ class ZCamMainViewModel @Inject constructor(
             is ZCamUiAction.SettingsStreamHeightChanged -> updateSettingsDraft { copy(streamHeightInput = action.value.filter(Char::isDigit).take(5)) }
             is ZCamUiAction.SettingsStreamFpsChanged -> updateSettingsDraft { copy(streamFpsInput = action.value.filter(Char::isDigit).take(2)) }
             is ZCamUiAction.SettingsRearLensChanged -> updateSettingsDraft { copy(rearLensSelection = action.value) }
+            is ZCamUiAction.SettingsEventSensitivityChanged -> updateSettingsDraft { copy(eventSensitivitySelection = action.value) }
             is ZCamUiAction.SettingsPreviewTransportChanged -> updateSettingsDraft {
                 val appliedProfile = previewProfileSelection?.toConfig(action.value)
                 copy(
@@ -335,6 +337,11 @@ class ZCamMainViewModel @Inject constructor(
                             )
                         } else {
                             state.previewDiagnosticsLabel
+                        },
+                        eventSensitivityLabel = if (state.mode == ZCamMode.SERVER) {
+                            eventSensitivityLabel(settings.stream.eventSensitivity)
+                        } else {
+                            state.eventSensitivityLabel
                         },
                         ultraWideAvailable = if (state.mode == ZCamMode.SERVER) {
                             detectedCatalog.ultraWideAvailable
@@ -629,6 +636,7 @@ class ZCamMainViewModel @Inject constructor(
                             previewMjpegFallbackUrl = localClient.buildPreviewStreamUrl(target),
                             cameraLensLabel = lensUi.first,
                             cameraLensTone = lensUi.second,
+                            eventSensitivityLabel = eventSensitivityLabel(status.eventSensitivity),
                             ultraWideAvailable = if (current.mode == ZCamMode.SERVER) {
                                 localRearLensCatalog.ultraWideAvailable || status.ultraWideAvailable
                             } else {
@@ -1891,6 +1899,7 @@ class ZCamMainViewModel @Inject constructor(
                     ),
                     fps = streamFps!!,
                     rearLens = draft.rearLensSelection,
+                    eventSensitivity = draft.eventSensitivitySelection,
                     preview = settingsSnapshot.stream.preview.copy(
                         transport = draft.previewTransportSelection,
                         resolution = settingsSnapshot.stream.preview.resolution.copy(
@@ -2154,6 +2163,7 @@ class ZCamMainViewModel @Inject constructor(
             streamCodecLabel = stream.codec.name,
             rearLensSelection = stream.rearLens,
             ultraWideLensAvailable = ultraWideLensAvailable,
+            eventSensitivitySelection = stream.eventSensitivity,
             previewTransportSelection = stream.preview.transport,
             previewProfileSelection = PreviewProfile.match(stream.preview),
             previewWidthInput = stream.preview.resolution.width.toString(),
@@ -2250,6 +2260,10 @@ class ZCamMainViewModel @Inject constructor(
             transport == PreviewTransport.MJPEG -> "Preview transport: MJPEG"
             else -> "Preview transport: H.264 fallback"
         }
+    }
+
+    private fun eventSensitivityLabel(sensitivity: EventDetectionSensitivity): String {
+        return "Events: ${sensitivity.label} sensitivity"
     }
 
     private fun previewDiagnosticsLabel(

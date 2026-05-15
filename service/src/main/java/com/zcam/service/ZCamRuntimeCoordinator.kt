@@ -265,8 +265,12 @@ class ZCamRuntimeCoordinator @Inject constructor(
 
                 activeStreamConfig = desiredStream
                 val lensChanged = settings.stream.rearLens != previousSettings.stream.rearLens
+                val eventSensitivityChanged =
+                    settings.stream.eventSensitivity != previousSettings.stream.eventSensitivity
                 if (lensChanged) {
                     handleRearLensSelectionChanged(desiredStream)
+                } else if (eventSensitivityChanged) {
+                    cameraRuntime.setEventDetectionSensitivity(settings.stream.eventSensitivity)
                 }
             }
         }

@@ -162,26 +162,30 @@ internal class H264PreviewEncoderController(
     }
 
     private fun pumpLoop() {
-        while (running.get()) {
-            val frame = pendingFrame.getAndSet(null)
-            if (frame != null) {
-                if (!ensureEncoderForFrame(frame.width, frame.height)) {
-                    droppedFrames.incrementAndGet()
-                    continue
-                }
-                queueInputFrame(frame)
-                drainEncoder()
-            } else {
-                drainEncoder()
-                try {
-                    Thread.sleep(IDLE_POLL_MS)
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    break
+        runCatching {
+            while (running.get()) {
+                val frame = pendingFrame.getAndSet(null)
+                if (frame != null) {
+                    if (!ensureEncoderForFrame(frame.width, frame.height)) {
+                        droppedFrames.incrementAndGet()
+                        continue
+                    }
+                    queueInputFrame(frame)
+                    safeDrainEncoder()
+                } else {
+                    safeDrainEncoder()
+                    try {
+                        Thread.sleep(IDLE_POLL_MS)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        break
+                    }
                 }
             }
+            safeDrainEncoder()
+        }.onFailure { error ->
+            failEncoder("encoder loop failed: ${error.message ?: "unknown"}", error)
         }
-        drainEncoder()
     }
 
     private fun ensureEncoderForFrame(
@@ -190,6 +194,10 @@ internal class H264PreviewEncoderController(
     ): Boolean {
         if (width <= 0 || height <= 0) {
             lastError.set("Invalid preview frame size ${width}x${height}")
+            return false
+        }
+        if (width % 2 != 0 || height % 2 != 0) {
+            lastError.set("Unsupported odd preview frame size ${width}x${height}; MJPEG fallback active")
             return false
         }
         val currentEncoder = encoder
@@ -211,8 +219,13 @@ internal class H264PreviewEncoderController(
         selectedEncoderInfo = encoderInfo
 
         return runCatching {
-            val codec = MediaCodec.createByCodecName(encoderInfo.name)
             val capabilities = encoderInfo.getCapabilitiesForType(MIME_TYPE)
+            val videoCapabilities = capabilities.videoCapabilities
+            if (!videoCapabilities.isSizeSupported(width, height)) {
+                lastError.set("H.264 encoder ${encoderInfo.name} does not support ${width}x${height}; MJPEG fallback active")
+                return false
+            }
+            val codec = MediaCodec.createByCodecName(encoderInfo.name)
             colorFormat = selectColorFormat(capabilities)
             val format = MediaFormat.createVideoFormat(MIME_TYPE, width, height).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat)
@@ -241,16 +254,17 @@ internal class H264PreviewEncoderController(
         }.getOrElse { error ->
             actualWidth.set(0)
             actualHeight.set(0)
-            lastError.set("encoder start failed for ${width}x${height}: ${error.message ?: "unknown"}")
-            logger.w("Preview H.264 encoder start failed for ${width}x${height}: ${error.message}")
-            releaseEncoder()
+            failEncoder("encoder start failed for ${width}x${height}: ${error.message ?: "unknown"}", error)
             false
         }
     }
 
     private fun queueInputFrame(frame: PreviewFrame) {
         val codec = encoder ?: return
-        val index = codec.dequeueInputBuffer(INPUT_TIMEOUT_US)
+        val index = runCatching { codec.dequeueInputBuffer(INPUT_TIMEOUT_US) }.getOrElse { error ->
+            failEncoder("encoder input dequeue failed: ${error.message ?: "unknown"}", error)
+            return
+        }
         if (index < 0) {
             droppedFrames.incrementAndGet()
             return
@@ -268,9 +282,17 @@ internal class H264PreviewEncoderController(
             )
             codec.queueInputBuffer(index, 0, frame.nv21.size, frame.presentationTimeUs, 0)
         }.onFailure { error ->
-            lastError.set(error.message ?: "encoder input failure")
             droppedFrames.incrementAndGet()
             runCatching { codec.queueInputBuffer(index, 0, 0, frame.presentationTimeUs, 0) }
+            failEncoder("encoder input failure: ${error.message ?: "unknown"}", error)
+        }
+    }
+
+    private fun safeDrainEncoder() {
+        runCatching {
+            drainEncoder()
+        }.onFailure { error ->
+            failEncoder("encoder drain failure: ${error.message ?: "unknown"}", error)
         }
     }
 
@@ -364,6 +386,22 @@ internal class H264PreviewEncoderController(
         encoder = null
         runCatching { codec.stop() }
         runCatching { codec.release() }
+    }
+
+    private fun failEncoder(
+        message: String,
+        error: Throwable? = null
+    ) {
+        lastError.set("$message; MJPEG fallback active")
+        if (error != null) {
+            logger.w("Preview H.264 $message")
+        } else {
+            logger.w("Preview H.264 $message")
+        }
+        releaseEncoder()
+        streamConfig = null
+        actualWidth.set(0)
+        actualHeight.set(0)
     }
 
     private fun selectEncoder(): MediaCodecInfo? {

@@ -295,6 +295,7 @@ internal fun ClientCameraControlsSection(
                 fontWeight = FontWeight.SemiBold
             )
             StatusChip(label = state.cameraLensLabel, tone = state.cameraLensTone)
+            StatusChip(label = state.eventSensitivityLabel, tone = StatusTone.NEUTRAL)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -791,7 +792,7 @@ private fun RecordingEventMarkerStrip(
         }
     }
     Text(
-        text = "Event markers stay pinned to this clip timeline. Tap a marker to jump to the event.",
+        text = "Current Recording Timeline. Event markers stay pinned to this clip. Tap a marker to jump to the event.",
         style = MaterialTheme.typography.bodySmall
     )
 }
@@ -817,7 +818,7 @@ private fun RecordingTimelineCard(
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Text(
-                text = "Timeline",
+                text = "Global History Timeline",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold
             )
@@ -898,7 +899,7 @@ private fun RecordingTimelineCard(
                 Text(formatDateTime(rangeEnd), style = MaterialTheme.typography.bodySmall)
             }
             Text(
-                text = "Red markers are detected events. Tap a marker to jump to the matching recording.",
+                text = "Red markers are detected events across retained recording history. Tap a marker to jump to the matching segment.",
                 style = MaterialTheme.typography.bodySmall
             )
         }

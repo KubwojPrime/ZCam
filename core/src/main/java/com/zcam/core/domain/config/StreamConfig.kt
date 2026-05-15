@@ -5,5 +5,6 @@ data class StreamConfig(
     val fps: Int = 15,
     val codec: VideoCodec = VideoCodec.H264,
     val rearLens: RearCameraLens = RearCameraLens.MAIN,
-    val preview: PreviewStreamConfig = PreviewStreamConfig()
+    val preview: PreviewStreamConfig = PreviewStreamConfig(),
+    val eventSensitivity: EventDetectionSensitivity = EventDetectionSensitivity.BALANCED
 )

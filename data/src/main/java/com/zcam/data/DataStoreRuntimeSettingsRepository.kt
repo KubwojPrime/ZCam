@@ -11,6 +11,7 @@ import androidx.datastore.preferences.preferencesDataStore
 import com.zcam.core.dispatchers.IoDispatcher
 import com.zcam.core.domain.config.FeatureFlag
 import com.zcam.core.domain.config.FeatureFlags
+import com.zcam.core.domain.config.EventDetectionSensitivity
 import com.zcam.core.domain.config.LoopRecordingConfig
 import com.zcam.core.domain.config.PreviewStreamConfig
 import com.zcam.core.domain.config.PreviewTransport
@@ -131,6 +132,9 @@ class DataStoreRuntimeSettingsRepository @Inject constructor(
             rearLens = this[REAR_LENS]
                 ?.let(RearCameraLens::fromWireName)
                 ?: defaults.stream.rearLens,
+            eventSensitivity = this[EVENT_SENSITIVITY]
+                ?.let(EventDetectionSensitivity::fromWireName)
+                ?: defaults.stream.eventSensitivity,
             preview = PreviewStreamConfig(
                 transport = this[PREVIEW_TRANSPORT]
                     ?.let(PreviewTransport::fromWireName)
@@ -187,6 +191,7 @@ class DataStoreRuntimeSettingsRepository @Inject constructor(
         this[FPS] = settings.stream.fps
         this[VIDEO_CODEC] = settings.stream.codec.name
         this[REAR_LENS] = settings.stream.rearLens.wireName
+        this[EVENT_SENSITIVITY] = settings.stream.eventSensitivity.wireName
         this[PREVIEW_TRANSPORT] = settings.stream.preview.transport.wireName
         this[PREVIEW_WIDTH] = settings.stream.preview.resolution.width
         this[PREVIEW_HEIGHT] = settings.stream.preview.resolution.height
@@ -217,6 +222,7 @@ class DataStoreRuntimeSettingsRepository @Inject constructor(
         val FPS = intPreferencesKey("stream_fps")
         val VIDEO_CODEC = stringPreferencesKey("stream_codec")
         val REAR_LENS = stringPreferencesKey("stream_rear_lens")
+        val EVENT_SENSITIVITY = stringPreferencesKey("event_detection_sensitivity")
         val PREVIEW_TRANSPORT = stringPreferencesKey("preview_transport")
         val PREVIEW_WIDTH = intPreferencesKey("preview_width")
         val PREVIEW_HEIGHT = intPreferencesKey("preview_height")

@@ -2,6 +2,7 @@ package com.zcam.client
 
 import com.zcam.core.domain.config.PreviewTransport
 import com.zcam.core.domain.config.RearCameraLens
+import com.zcam.core.domain.config.EventDetectionSensitivity
 import java.io.OutputStream
 
 data class ClientTarget(
@@ -42,6 +43,7 @@ data class ClientServerStatus(
     val selectedRearLens: RearCameraLens,
     val activeRearLens: RearCameraLens,
     val ultraWideAvailable: Boolean,
+    val eventSensitivity: EventDetectionSensitivity,
     val audioTransmitting: Boolean,
     val audioLiveListening: Boolean,
     val audioPlayingBack: Boolean,

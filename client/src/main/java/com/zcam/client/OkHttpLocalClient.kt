@@ -1,6 +1,7 @@
 package com.zcam.client
 
 import com.zcam.core.dispatchers.DispatcherProvider
+import com.zcam.core.domain.config.EventDetectionSensitivity
 import com.zcam.core.domain.config.PreviewTransport
 import com.zcam.core.domain.config.RearCameraLens
 import com.zcam.core.logging.ZCamLogger
@@ -82,6 +83,7 @@ class OkHttpLocalClient @Inject constructor(
                 selectedRearLens = RearCameraLens.fromWireName(cameraControls?.optString("selectedRearLens")),
                 activeRearLens = RearCameraLens.fromWireName(cameraControls?.optString("activeRearLens")),
                 ultraWideAvailable = cameraControls?.optBoolean("ultraWideAvailable") ?: false,
+                eventSensitivity = EventDetectionSensitivity.fromWireName(cameraControls?.optString("eventSensitivity")),
                 audioTransmitting = audio?.optBoolean("transmitting") ?: false,
                 audioLiveListening = audio?.optBoolean("liveListening") ?: false,
                 audioPlayingBack = audio?.optBoolean("playingBack") ?: false,

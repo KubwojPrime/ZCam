@@ -1,6 +1,7 @@
 package com.zcam.ui
 
 import com.zcam.core.domain.config.FeatureFlag
+import com.zcam.core.domain.config.EventDetectionSensitivity
 import com.zcam.core.domain.config.PreviewProfile
 import com.zcam.core.domain.config.PreviewTransport
 import com.zcam.core.domain.config.RearCameraLens
@@ -104,6 +105,7 @@ data class SettingsUiState(
     val streamCodecLabel: String = "H264",
     val rearLensSelection: RearCameraLens = RearCameraLens.MAIN,
     val ultraWideLensAvailable: Boolean = false,
+    val eventSensitivitySelection: EventDetectionSensitivity = EventDetectionSensitivity.BALANCED,
     val previewTransportSelection: PreviewTransport = PreviewTransport.H264,
     val previewProfileSelection: PreviewProfile? = PreviewProfile.BALANCED,
     val previewWidthInput: String = "1280",
@@ -187,6 +189,7 @@ data class ZCamUiState(
     val audioRuntimeTone: StatusTone = StatusTone.NEUTRAL,
     val cameraLensLabel: String = "Lens: Main camera selected",
     val cameraLensTone: StatusTone = StatusTone.NEUTRAL,
+    val eventSensitivityLabel: String = "Events: Balanced sensitivity",
     val ultraWideAvailable: Boolean = false,
     val clientTorchEnabled: Boolean = false,
     val clientNightModeEnabled: Boolean = false,
@@ -250,6 +253,7 @@ sealed interface ZCamUiAction {
     data class SettingsStreamHeightChanged(val value: String) : ZCamUiAction
     data class SettingsStreamFpsChanged(val value: String) : ZCamUiAction
     data class SettingsRearLensChanged(val value: RearCameraLens) : ZCamUiAction
+    data class SettingsEventSensitivityChanged(val value: EventDetectionSensitivity) : ZCamUiAction
     data class SettingsPreviewTransportChanged(val value: PreviewTransport) : ZCamUiAction
     data class SettingsPreviewProfileSelected(val value: PreviewProfile) : ZCamUiAction
     data class SettingsPreviewWidthChanged(val value: String) : ZCamUiAction

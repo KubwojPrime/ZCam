@@ -30,6 +30,7 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
 import com.google.common.util.concurrent.ListenableFuture
 import com.zcam.core.dispatchers.DispatcherProvider
+import com.zcam.core.domain.config.EventDetectionSensitivity
 import com.zcam.core.domain.config.PreviewTransport
 import com.zcam.core.domain.config.RearCameraLens
 import com.zcam.core.domain.config.StreamConfig
@@ -77,7 +78,7 @@ class CameraRuntimeImpl @Inject constructor(
         Thread(runnable, "zcam-camera-analyzer").apply { isDaemon = true }
     }
     private val eventScope = CoroutineScope(SupervisorJob() + dispatchers.io)
-    private val motionEventDetector = MotionEventDetector()
+    private val motionEventDetector = MotionEventDetector(logger)
 
     private val targetWidth = AtomicInteger(DEFAULT_WIDTH)
     private val targetHeight = AtomicInteger(DEFAULT_HEIGHT)
@@ -149,6 +150,7 @@ class CameraRuntimeImpl @Inject constructor(
             lowLightBoostSupported.set(false)
             selectedRearLens.set(config.rearLens)
             previewTransport.set(config.preview.transport)
+            motionEventDetector.updateSensitivity(config.eventSensitivity)
             lastControlError.set(null)
             enableOrientationTracking()
 
@@ -323,6 +325,7 @@ class CameraRuntimeImpl @Inject constructor(
             selectedRearLens = selectedRearLens.get(),
             activeRearLens = activeRearLens.get(),
             ultraWideAvailable = ultraWideAvailable.get(),
+            eventSensitivity = motionEventDetector.currentSensitivity(),
             lastError = lastControlError.get()
         )
     }
@@ -434,6 +437,13 @@ class CameraRuntimeImpl @Inject constructor(
 
     override fun previewStreamingDiagnostics(): PreviewStreamingDiagnostics {
         return previewEncoder.diagnostics()
+    }
+
+    override suspend fun setEventDetectionSensitivity(
+        sensitivity: EventDetectionSensitivity
+    ) = withContext(dispatchers.io) {
+        motionEventDetector.updateSensitivity(sensitivity)
+        logger.i("Event detection sensitivity changed to ${sensitivity.wireName}")
     }
 
     override fun snapshot(): FramePipelineStatus = FramePipelineStatus(
@@ -914,11 +924,31 @@ class CameraRuntimeImpl @Inject constructor(
         val nv21: ByteArray?
     )
 
-    private class MotionEventDetector {
+    private class MotionEventDetector(
+        private val logger: ZCamLogger
+    ) {
         private var previousSamples = IntArray(0)
         private var warmupFrames = 0
         private var consecutiveHits = 0
         private var lastEventEpochMs = 0L
+        private var sensitivity = SensitivityProfile.BALANCED
+
+        fun updateSensitivity(next: EventDetectionSensitivity) {
+            sensitivity = when (next) {
+                EventDetectionSensitivity.LOW -> SensitivityProfile.LOW
+                EventDetectionSensitivity.BALANCED -> SensitivityProfile.BALANCED
+                EventDetectionSensitivity.HIGH -> SensitivityProfile.HIGH
+            }
+            consecutiveHits = 0
+        }
+
+        fun currentSensitivity(): EventDetectionSensitivity {
+            return when (sensitivity) {
+                SensitivityProfile.LOW -> EventDetectionSensitivity.LOW
+                SensitivityProfile.BALANCED -> EventDetectionSensitivity.BALANCED
+                SensitivityProfile.HIGH -> EventDetectionSensitivity.HIGH
+            }
+        }
 
         fun analyze(
             image: ImageProxy,
@@ -950,7 +980,7 @@ class CameraRuntimeImpl @Inject constructor(
             for (index in 0 until comparisons) {
                 val delta = kotlin.math.abs(samples[index] - previousSamples[index])
                 totalDelta += delta
-                if (delta >= SAMPLE_DELTA_THRESHOLD) {
+                if (delta >= sensitivity.sampleDeltaThreshold) {
                     changedSamples += 1
                 }
                 if (delta > peakDelta) {
@@ -961,29 +991,35 @@ class CameraRuntimeImpl @Inject constructor(
 
             val averageDelta = totalDelta / comparisons.toFloat()
             val changedRatio = changedSamples / comparisons.toFloat()
-            val hit = averageDelta >= AVERAGE_DELTA_THRESHOLD &&
-                peakDelta >= PEAK_DELTA_THRESHOLD &&
-                changedRatio >= CHANGED_SAMPLE_RATIO_THRESHOLD
+            val hit = averageDelta >= sensitivity.averageDeltaThreshold &&
+                peakDelta >= sensitivity.peakDeltaThreshold &&
+                changedRatio >= sensitivity.changedSampleRatioThreshold
 
             consecutiveHits = if (hit) {
-                (consecutiveHits + 1).coerceAtMost(CONSECUTIVE_HITS_REQUIRED)
+                (consecutiveHits + 1).coerceAtMost(sensitivity.consecutiveHitsRequired)
             } else {
                 0
             }
 
-            if (consecutiveHits < CONSECUTIVE_HITS_REQUIRED) {
+            if (consecutiveHits < sensitivity.consecutiveHitsRequired) {
                 return null
             }
-            if (eventEpochMs - lastEventEpochMs < EVENT_COOLDOWN_MS) {
+            if (eventEpochMs - lastEventEpochMs < sensitivity.eventCooldownMs) {
                 return null
             }
 
             consecutiveHits = 0
             lastEventEpochMs = eventEpochMs
+            logger.d(
+                "Motion event sensitivity=${sensitivity.label} averageDelta=$averageDelta " +
+                    "peakDelta=$peakDelta changedRatio=$changedRatio " +
+                    "thresholds(avg=${sensitivity.averageDeltaThreshold}, peak=${sensitivity.peakDeltaThreshold}, " +
+                    "ratio=${sensitivity.changedSampleRatioThreshold})"
+            )
             return RecordingEvent(
                 epochMs = eventEpochMs,
                 confidencePercent = (averageDelta * 2.5f).toInt().coerceIn(1, 100),
-                source = "motion"
+                source = "motion:${sensitivity.label}"
             )
         }
 
@@ -1015,17 +1051,49 @@ class CameraRuntimeImpl @Inject constructor(
             return samples.toIntArray()
         }
 
+        private enum class SensitivityProfile(
+            val label: String,
+            val consecutiveHitsRequired: Int,
+            val sampleDeltaThreshold: Int,
+            val averageDeltaThreshold: Float,
+            val peakDeltaThreshold: Int,
+            val changedSampleRatioThreshold: Float,
+            val eventCooldownMs: Long
+        ) {
+            LOW(
+                label = "low",
+                consecutiveHitsRequired = 5,
+                sampleDeltaThreshold = 34,
+                averageDeltaThreshold = 24f,
+                peakDeltaThreshold = 70,
+                changedSampleRatioThreshold = 0.45f,
+                eventCooldownMs = 25_000L
+            ),
+            BALANCED(
+                label = "balanced",
+                consecutiveHitsRequired = 4,
+                sampleDeltaThreshold = 28,
+                averageDeltaThreshold = 18f,
+                peakDeltaThreshold = 54,
+                changedSampleRatioThreshold = 0.35f,
+                eventCooldownMs = 15_000L
+            ),
+            HIGH(
+                label = "high",
+                consecutiveHitsRequired = 3,
+                sampleDeltaThreshold = 20,
+                averageDeltaThreshold = 12f,
+                peakDeltaThreshold = 38,
+                changedSampleRatioThreshold = 0.22f,
+                eventCooldownMs = 10_000L
+            )
+        }
+
         private companion object {
             const val SAMPLE_COLUMNS = 14
             const val SAMPLE_ROWS = 10
             const val MIN_SAMPLE_STEP = 8
             const val WARMUP_FRAME_COUNT = 8
-            const val CONSECUTIVE_HITS_REQUIRED = 4
-            const val SAMPLE_DELTA_THRESHOLD = 28
-            const val AVERAGE_DELTA_THRESHOLD = 18f
-            const val PEAK_DELTA_THRESHOLD = 54
-            const val CHANGED_SAMPLE_RATIO_THRESHOLD = 0.35f
-            const val EVENT_COOLDOWN_MS = 15_000L
         }
     }
 

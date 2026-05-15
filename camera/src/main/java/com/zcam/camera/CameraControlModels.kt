@@ -1,6 +1,7 @@
 package com.zcam.camera
 
 import com.zcam.core.domain.config.RearCameraLens
+import com.zcam.core.domain.config.EventDetectionSensitivity
 
 enum class CameraControlErrorCode {
     ENGINE_NOT_READY,
@@ -21,6 +22,7 @@ data class CameraControlsSnapshot(
     val selectedRearLens: RearCameraLens = RearCameraLens.MAIN,
     val activeRearLens: RearCameraLens = RearCameraLens.MAIN,
     val ultraWideAvailable: Boolean = false,
+    val eventSensitivity: EventDetectionSensitivity = EventDetectionSensitivity.BALANCED,
     val lastError: String? = null
 )
 

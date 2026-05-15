@@ -1537,6 +1537,7 @@ class ZCamHttpServer @Inject constructor(
             append("\"selectedRearLens\":").append(jsonString(state.selectedRearLens.wireName)).append(',')
             append("\"activeRearLens\":").append(jsonString(state.activeRearLens.wireName)).append(',')
             append("\"ultraWideAvailable\":").append(state.ultraWideAvailable).append(',')
+            append("\"eventSensitivity\":").append(jsonString(state.eventSensitivity.wireName)).append(',')
             append("\"lastError\":").append(jsonString(state.lastError))
             append('}')
         }
@@ -1686,7 +1687,10 @@ class ZCamHttpServer @Inject constructor(
                 .timelineShell { display: grid; gap: 6px; }
                 .timelineBar { position: relative; width: 100%; height: 30px; border-radius: 10px; border: 1px solid var(--border); background: var(--card2); overflow: hidden; }
                 .timelineTrack { position: absolute; left: 8px; right: 8px; top: 11px; height: 8px; border-radius: 999px; background: #0b0d12; }
+                .timelineSegment { position: absolute; top: 10px; height: 10px; border: none; border-radius: 999px; background: var(--accent); opacity: .45; padding: 0; }
+                .timelineSegment:focus-visible, .timelineMarker:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
                 .timelineMarker { position: absolute; top: 4px; width: 8px; height: 22px; transform: translateX(-50%); border-radius: 999px; border: none; background: var(--err); padding: 0; }
+                .timelineMarker:disabled { background: var(--warn); opacity: .65; cursor: default; }
                 .timelinePlayhead { position: absolute; top: 2px; width: 2px; height: 26px; transform: translateX(-50%); background: var(--accent); }
                 .progressWrap { display: grid; gap: 4px; }
                 progress { width: 100%; height: 8px; }
@@ -1783,6 +1787,7 @@ class ZCamHttpServer @Inject constructor(
                       <button type="button" class="compact" onclick="resetZoom()">Reset</button>
                       <button type="button" class="compact" onclick="adjustZoom(0.12)">Zoom +</button>
                       <span class="chip mono" id="zoomState">zoom: 1.0x</span>
+                      <span class="chip mono" id="eventSensitivityState">events: balanced</span>
                     </div>
                     <p class="sub" style="margin-top:10px;">Night mode maps to CameraX low-light boost; may require FPS <= 30.</p>
                   </div>
@@ -1864,6 +1869,10 @@ class ZCamHttpServer @Inject constructor(
                         <div id="recordingDownloadLabel" class="sub">Preparing download...</div>
                       </div>
                       <div id="recordingMeta" class="metaGrid"></div>
+                      <div class="sub">Global History Timeline</div>
+                      <div id="globalRecordingTimeline" class="timelineShell"></div>
+                      <div class="sub" id="globalRecordingTimelineHint">Load recordings to show event history.</div>
+                      <div class="sub">Current Recording Timeline</div>
                       <div id="recordingTimeline" class="timelineShell"></div>
                       <div class="sub" id="recordingTimelineHint">Select a recording to show clip-local event markers.</div>
                       <div class="sub" id="recordingErrorLabel"></div>
@@ -1910,6 +1919,7 @@ class ZCamHttpServer @Inject constructor(
                 const volumeRange = document.getElementById('volumeRange');
                 const volumeLabel = document.getElementById('volumeLabel');
                 const zoomState = document.getElementById('zoomState');
+                const eventSensitivityState = document.getElementById('eventSensitivityState');
                 const audioRuntimeState = document.getElementById('audioRuntimeState');
                 const audioSocketState = document.getElementById('audioSocketState');
                 const recordingsFromInput = document.getElementById('recordingsFromInput');
@@ -1930,6 +1940,8 @@ class ZCamHttpServer @Inject constructor(
                 const recordingDownloadProgress = document.getElementById('recordingDownloadProgress');
                 const recordingDownloadLabel = document.getElementById('recordingDownloadLabel');
                 const recordingMeta = document.getElementById('recordingMeta');
+                const globalRecordingTimeline = document.getElementById('globalRecordingTimeline');
+                const globalRecordingTimelineHint = document.getElementById('globalRecordingTimelineHint');
                 const recordingTimeline = document.getElementById('recordingTimeline');
                 const recordingTimelineHint = document.getElementById('recordingTimelineHint');
                 const recordingErrorLabel = document.getElementById('recordingErrorLabel');
@@ -2076,6 +2088,9 @@ class ZCamHttpServer @Inject constructor(
                   zoomState.textContent = 'zoom: ' + ratio.toFixed(1) + 'x' + (supported ? '' : ' fixed');
                   zoomState.className = 'chip mono ' + (supported ? 'okText' : 'warnText');
                   zoomState.dataset.linear = String(Math.max(0, Math.min(1, linear)));
+                  const sensitivity = String(cameraControls?.eventSensitivity || 'balanced');
+                  eventSensitivityState.textContent = 'events: ' + sensitivity;
+                  eventSensitivityState.className = 'chip mono okText';
                 }
 
                 function updateAudioRuntimeState(audio) {
@@ -2279,6 +2294,65 @@ class ZCamHttpServer @Inject constructor(
                     ? 'Clip event markers stay aligned to this recording timeline.'
                     : 'No event markers for this recording.';
                   updateTimelinePlayhead();
+                }
+
+                function renderGlobalRecordingTimeline() {
+                  globalRecordingTimeline.innerHTML = '';
+                  if (recordingsCache.length === 0 && recordingEventsCache.length === 0) {
+                    globalRecordingTimelineHint.textContent = 'Load recordings to show event history.';
+                    return;
+                  }
+                  const segmentStarts = recordingsCache.map((item) => Number(item.startedAtEpochMs)).filter(Number.isFinite);
+                  const segmentEnds = recordingsCache.map((item) => Number(item.endedAtEpochMs)).filter(Number.isFinite);
+                  const eventTimes = recordingEventsCache.map((item) => Number(item.epochMs)).filter(Number.isFinite);
+                  const rangeStart = Math.min(...segmentStarts, ...eventTimes);
+                  const rangeEnd = Math.max(...segmentEnds, ...eventTimes);
+                  if (!Number.isFinite(rangeStart) || !Number.isFinite(rangeEnd) || rangeEnd <= rangeStart) {
+                    globalRecordingTimelineHint.textContent = 'Global timeline unavailable for this range.';
+                    return;
+                  }
+
+                  const durationMs = Math.max(1, rangeEnd - rangeStart);
+                  const bar = document.createElement('div');
+                  bar.className = 'timelineBar';
+                  const track = document.createElement('div');
+                  track.className = 'timelineTrack';
+                  bar.appendChild(track);
+
+                  recordingsCache.forEach((item) => {
+                    const startFraction = Math.max(0, Math.min(1, (Number(item.startedAtEpochMs) - rangeStart) / durationMs));
+                    const endFraction = Math.max(0, Math.min(1, (Number(item.endedAtEpochMs) - rangeStart) / durationMs));
+                    const segment = document.createElement('button');
+                    segment.type = 'button';
+                    segment.className = 'timelineSegment';
+                    segment.style.left = (startFraction * 100).toFixed(2) + '%';
+                    segment.style.width = (Math.max(0.02, endFraction - startFraction) * 100).toFixed(2) + '%';
+                    segment.title = item.fileName;
+                    segment.addEventListener('click', () => selectRecording(item.fileName, null));
+                    bar.appendChild(segment);
+                  });
+
+                  recordingEventsCache.forEach((eventItem) => {
+                    const markerFraction = Math.max(0, Math.min(1, (Number(eventItem.epochMs) - rangeStart) / durationMs));
+                    const marker = document.createElement('button');
+                    marker.type = 'button';
+                    marker.className = 'timelineMarker';
+                    marker.style.left = (markerFraction * 100).toFixed(2) + '%';
+                    marker.title = new Date(eventItem.epochMs).toLocaleString() + ' | ' + eventItem.confidencePercent + '% | ' + eventItem.source;
+                    marker.disabled = !eventItem.recordingFileName;
+                    marker.addEventListener('click', () => jumpToRecordingEvent(eventItem));
+                    bar.appendChild(marker);
+                  });
+
+                  const labels = document.createElement('div');
+                  labels.className = 'row';
+                  labels.innerHTML = '<span class="sub">' + new Date(rangeStart).toLocaleString() + '</span>' +
+                    '<span class="sub">' + new Date(rangeEnd).toLocaleString() + '</span>';
+                  globalRecordingTimeline.appendChild(bar);
+                  globalRecordingTimeline.appendChild(labels);
+                  globalRecordingTimelineHint.textContent = recordingEventsCache.length > 0
+                    ? 'Global event markers cover all loaded retained recordings.'
+                    : 'No events in this loaded history range.';
                 }
 
                 function updateSpeedButtons() {
@@ -2788,17 +2862,21 @@ class ZCamHttpServer @Inject constructor(
                       recordingSelection.textContent = 'selected: none';
                       renderRecordingMeta(null);
                       recordingTimeline.innerHTML = '';
+                      globalRecordingTimeline.innerHTML = '';
                       recordingTimelineHint.textContent = 'Select a recording to show clip-local event markers.';
+                      globalRecordingTimelineHint.textContent = 'Load recordings to show event history.';
                       updateRecordingPlaybackState('playback: idle', '');
                       setRecordingLoadState(false, '', null);
                       setRecordingError('', '');
                     }
                     recordingsState.textContent = 'recordings: ' + recordingsCache.length + ' clip(s), ' + recordingEventsCache.length + ' event(s)';
+                    renderGlobalRecordingTimeline();
                     if (!selectedRecordingName && recordingsCache.length > 0) {
                       selectRecording(recordingsCache[0].fileName, null);
                     } else {
                       renderRecordings();
                       renderRecordingTimeline();
+                      renderGlobalRecordingTimeline();
                     }
                   } catch (error) {
                     recordingsState.textContent = 'recordings: load failed';
@@ -3172,7 +3250,9 @@ class ZCamHttpServer @Inject constructor(
                   recordingPlayer.load();
                   renderRecordingMeta(null);
                   recordingTimeline.innerHTML = '';
+                  globalRecordingTimeline.innerHTML = '';
                   recordingTimelineHint.textContent = 'Select a recording to show clip-local event markers.';
+                  globalRecordingTimelineHint.textContent = 'Load recordings to show event history.';
                   updateRecordingPlaybackState('playback: idle', '');
                   setRecordingLoadState(false, '', null);
                   setRecordingDownloadState(false, '', null);
