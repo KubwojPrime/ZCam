@@ -197,11 +197,13 @@ internal fun LivePreviewSurface(
                     ),
                 factory = { context ->
                     H264PreviewPlayerView(context).apply {
+                        preserveAspectRatio = containPreview
                         statusListener = { nextState -> renderState = nextState }
                         bindPreviewSocketUrl(previewStreamUrl)
                     }
                 },
                 update = { playerView ->
+                    playerView.preserveAspectRatio = containPreview
                     playerView.statusListener = { nextState -> renderState = nextState }
                     playerView.bindPreviewSocketUrl(previewStreamUrl)
                 }
@@ -261,7 +263,7 @@ internal fun LivePreviewSurface(
                     webView.settings.loadWithOverviewMode = zoomable
                     val objectFit = if (containPreview) "contain" else "cover"
                     val imageWidth = if (zoomable) "100%" else "100vw"
-                    val imageHeight = if (containPreview) "auto" else "100vh"
+                    val imageHeight = "100vh"
                     val html = """
                         <html>
                           <head>

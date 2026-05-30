@@ -6,6 +6,7 @@ import android.media.MediaFormat
 import android.os.Handler
 import android.os.Looper
 import android.util.AttributeSet
+import android.view.Gravity
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -48,13 +49,19 @@ internal class H264PreviewPlayerView @JvmOverloads constructor(
     private var receivedFps: Int = 0
     private var attached = false
     private var socketOpenedAtEpochMs: Long = 0L
+    var preserveAspectRatio: Boolean = false
+        set(value) {
+            if (field == value) return
+            field = value
+            updateSurfaceLayout()
+        }
 
     var statusListener: ((H264PreviewRenderState) -> Unit)? = null
 
     init {
         addView(
             surfaceView,
-            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
+            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT, Gravity.CENTER)
         )
         surfaceView.holder.addCallback(this)
     }
@@ -88,6 +95,11 @@ internal class H264PreviewPlayerView @JvmOverloads constructor(
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
+
+    override fun onSizeChanged(width: Int, height: Int, oldWidth: Int, oldHeight: Int) {
+        super.onSizeChanged(width, height, oldWidth, oldHeight)
+        updateSurfaceLayout()
+    }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         renderSurface = null
@@ -196,6 +208,7 @@ internal class H264PreviewPlayerView @JvmOverloads constructor(
                 csd0 = Base64.getDecoder().decode(payload.optString("csd0", "")),
                 csd1 = Base64.getDecoder().decode(payload.optString("csd1", ""))
             )
+            updateSurfaceLayout()
             configureDecoderIfReady()
         }.onFailure { error ->
             emitState(
@@ -234,6 +247,45 @@ internal class H264PreviewPlayerView @JvmOverloads constructor(
             )
             scheduleReconnect("decoder input failed", RECONNECT_MAX_DELAY_MS)
         }
+    }
+
+    private fun updateSurfaceLayout() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { updateSurfaceLayout() }
+            return
+        }
+        val config = streamConfig
+        val containerWidth = width
+        val containerHeight = height
+        val nextParams = if (
+            !preserveAspectRatio ||
+            config == null ||
+            config.width <= 0 ||
+            config.height <= 0 ||
+            containerWidth <= 0 ||
+            containerHeight <= 0
+        ) {
+            LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT, Gravity.CENTER)
+        } else {
+            val videoAspect = config.width.toFloat() / config.height.toFloat()
+            val containerAspect = containerWidth.toFloat() / containerHeight.toFloat()
+            val (surfaceWidth, surfaceHeight) = if (containerAspect > videoAspect) {
+                (containerHeight * videoAspect).toInt().coerceAtLeast(1) to containerHeight
+            } else {
+                containerWidth to (containerWidth / videoAspect).toInt().coerceAtLeast(1)
+            }
+            LayoutParams(surfaceWidth, surfaceHeight, Gravity.CENTER)
+        }
+
+        val currentParams = surfaceView.layoutParams as? LayoutParams
+        if (
+            currentParams?.width == nextParams.width &&
+            currentParams.height == nextParams.height &&
+            currentParams.gravity == nextParams.gravity
+        ) {
+            return
+        }
+        surfaceView.layoutParams = nextParams
     }
 
     private fun drainDecoder(codec: MediaCodec) {
