@@ -1,6 +1,29 @@
-﻿# ZCam (Android Skeleton)
+# ZCam
 
-ZCam to lokalna aplikacja Android (LAN only) zaprojektowana pod pracę 24/7.
+ZCam is a local-first Android camera and audio monitoring app designed for
+long-running LAN/VPN operation without a cloud backend.
+
+Current public release: `0.2.8`.
+
+Project status: pre-1.0 hardening. The app already contains the core runtime
+architecture, local HTTP API, pairing, recording, watchdog/recovery, and client
+mode. Before `1.0`, release signing, security defaults, final QA, and store/user
+documentation must be completed.
+
+## What ZCam Does
+
+- Runs an Android device as a local camera/audio server.
+- Streams live preview over LAN/VPN.
+- Supports H.264 preview with MJPEG fallback.
+- Provides push-to-talk and live audio transport.
+- Records video in looped MP4 segments with retention limits.
+- Exposes a local HTTP/WebSocket API and fallback web panel.
+- Supports QR pairing, PIN/token authentication, and trusted devices.
+- Monitors runtime health and performs bounded recovery.
+- Can restore desired runtime state after process restart or device reboot.
+
+ZCam is intended for networks controlled by the user. It does not depend on an
+external backend and should not be exposed directly to the public Internet.
 
 ## Stack
 
@@ -8,145 +31,212 @@ ZCam to lokalna aplikacja Android (LAN only) zaprojektowana pod pracę 24/7.
 - Jetpack Compose
 - CameraX
 - Foreground Service
-- lokalny HTTP server (NanoHTTPD)
-- MJPEG streaming
+- NanoHTTPD / NanoWSD
+- OkHttp
 - DataStore
-- Hilt DI
+- Hilt
+- Timber
+- JUnit
 
-## Moduły
+## Repository Layout
 
-- `app` - bootstrap aplikacji, manifest, Activity, uruchamianie service
-- `core` - logger, dispatchery coroutines, wspólne DI
-- `core` - logger, dispatchery coroutines, kontrakty domenowe i use-case
-- `camera` - runtime kamery + źródło ramek MJPEG (placeholder, gotowe do podpięcia CameraX encoder)
-- `server` - lokalny HTTP `/health` i `/mjpeg` (chunked multipart MJPEG)
-- `audio` - push-to-talk manager (szkielet runtime)
-- `storage` - loop recording manager z retencją segmentów
-- `watchdog` - heartbeat monitoring i wykrywanie zastałych komponentów
-- `security` - LAN access policy + PIN/token + trusted devices + QR pairing + token rotation/revocation
-- `client` - lokalny klient HTTP do sprawdzania serwera
-- `service` - foreground runtime coordinator + `ZCamForegroundService`
-- `data` - DataStore runtime settings + feature flags + trusted devices
-- `ui` - ekran Compose sterujący start/stop runtime
+- `app` - Android application entry point, manifest, `MainActivity`, boot
+  receiver, runtime restore policy, app-level ViewModel.
+- `core` - domain contracts, runtime settings models, feature flags,
+  dispatchers, logging, power status, and common DI.
+- `camera` - CameraX runtime, H.264 preview encoder, MJPEG snapshot source,
+  camera controls, lens detection, event detection, and segment recording
+  pipeline.
+- `server` - local HTTP/WebSocket server, status endpoints, video endpoints,
+  pairing/token endpoints, audio sockets, recordings API, and web panel.
+- `audio` - push-to-talk runtime, live audio capture/playback, cue playback,
+  volume control, and audio command models.
+- `storage` - loop recording manager, recording catalog/index, event store,
+  retention policy, and recording lookup/download support.
+- `watchdog` - heartbeat tracking, stale component detection, and recovery
+  request emission.
+- `security` - LAN/VPN access policy, PIN/token validation, trusted devices,
+  pairing sessions, token rotation/revocation, and token persistence.
+- `client` - local HTTP client, WebSocket audio transport, preview URLs,
+  recording download client, and pairing client models.
+- `service` - foreground runtime service, runtime coordinator, health model,
+  recovery policy, environment monitor, and component orchestration.
+- `data` - DataStore repositories for runtime settings, desired runtime state,
+  crash state, trusted device serialization, and client session state.
+- `ui` - Compose UI, UI state/action models, preview surfaces, recording
+  playback/timeline panels, pairing screens, and settings screens.
+- `ZCam_Project_Workflow` - product and engineering planning documents.
+- `release` - local APK output directory. Release APKs are uploaded to GitHub
+  Releases and are not source-controlled.
 
-## Przepływ runtime
+## Runtime Flow
 
-1. UI uruchamia `ZCamForegroundService`.
-2. Service startuje `ZCamRuntimeCoordinator`.
-3. Coordinator uruchamia watchdog i komponenty runtime (server/camera/audio/storage).
-4. Watchdog monitoruje heartbeat i emituje sygnały recovery.
-5. Coordinator wykonuje recovery z retry/backoff/cooldown.
-6. Server wystawia LAN-only endpointy:
-   - `GET /health`
-   - `GET /video` (`/mjpeg` alias)
-   - `GET /snapshot.jpg`
-   - `GET /api/status`
-   - `GET /api/security/pair/qr`
-   - `POST /api/security/pair`
-   - `POST /api/security/token/rotate`
-   - `POST /api/security/token/revoke`
+1. The UI starts `ZCamForegroundService`.
+2. The service starts `ZCamRuntimeCoordinator`.
+3. The coordinator loads `RuntimeSettings` from DataStore.
+4. Runtime components start in order: watchdog, camera, server, audio, storage.
+5. The watchdog receives heartbeats and emits recovery requests for stale
+   components.
+6. The coordinator applies bounded recovery with mutexes, exponential backoff,
+   and cooldown.
+7. The local server exposes status, preview, audio, security, and recording
+   endpoints.
 
-## Runtime Health i Recovery
+## Local API
 
-- Obserwowalne health states:
-  - `RuntimeHealthRepository.health` (stan runtime per komponent)
-  - `WatchdogEngine.health` (stan watchdog i heartbeat)
-- Recovery:
-  - exponential backoff (`RecoveryPolicy`)
-  - limit prób + cooldown (bez pętli awaryjnych)
-  - mutex per komponent (brak równoległych recovery tego samego komponentu)
-- Auto-restore:
-  - restart procesu: `ZCamApplication` odtwarza runtime z `RuntimeStateRepository`
-  - reboot urządzenia: `BootReceiver` odtwarza runtime z `RuntimeStateRepository`
-- Logowanie produkcyjne:
-  - logi runtime/watchdog/restore mają `event IDs` (`LogEventId`, np. `RUN-100`, `REC-101`, `WDG-102`)
+The server is LAN/VPN-gated and token-protected except for explicit public
+pairing/health flows.
 
-## Wątki i stabilność
+Main endpoints:
 
-- Brak ciężkich operacji na UI thread.
-- I/O i runtime działają na `Dispatchers.IO` / `Dispatchers.Default` przez `DispatcherProvider`.
-- Service działa jako foreground z typami: `camera|microphone|mediaPlayback`.
-- Loop recording ma politykę retencji (limit rozmiaru + minimum wolnego miejsca).
-- Watchdog raportuje stale heartbeat (bazowy mechanizm recovery).
+- `GET /`
+- `GET /health`
+- `GET /video`
+- `GET /mjpeg`
+- `GET /snapshot.jpg`
+- `GET /api/status`
+- `POST /api/camera/torch`
+- `POST /api/camera/night-mode`
+- `POST /api/camera/zoom`
+- `POST /api/audio/live`
+- `POST /api/audio/play`
+- `POST /api/audio/volume`
+- `GET /api/recordings`
+- `GET /api/recordings/events`
+- `GET /api/recordings/{fileName}`
+- `GET /api/security/pair/qr`
+- `POST /api/security/pair/request`
+- `POST /api/security/pair/complete`
+- `POST /api/security/pair`
+- `POST /api/security/token/rotate`
+- `POST /api/security/token/revoke`
+- `WS /ws/audio`
+- `WS /ws/preview`
 
-## Kontrakty Domenowe
+## Security Model
 
-- MJPEG streaming: `MjpegStreamingEngine` + use-case start/stop.
-- Loop recording: `LoopRecordingEngine` + use-case start/stop/sweep.
-- Audio PTT/live/playback: `AudioEngine` + use-case PTT/live/playback.
-- Security (PIN/token/trusted devices): `SecurityEngine` + use-case auth/trust/revoke.
-- Watchdog/recovery: `WatchdogEngine` + use-case heartbeat/recovery.
+ZCam uses a local-only security model:
 
-## Centralna Konfiguracja
+- LAN/VPN access policy rejects non-local clients before command handling.
+- Runtime endpoints require API token authentication.
+- Pairing requires a PIN and short-lived challenge/request flow.
+- Trusted devices are stored locally and validated by device ID.
+- Tokens can be rotated and revoked.
+- The security manager runs a sanity check after restart to repair inconsistent
+  token state.
 
-`RuntimeSettingsDefaults`:
-- 720p (`1280x720`)
-- 15 FPS
-- H.264
-- segment 5 min
-- limit 32 GB
-- min free 5 GB
+Important pre-1.0 security work is tracked in
+[`docs/1.0_READINESS.md`](docs/1.0_READINESS.md).
 
-Walidacja odbywa się przez `RuntimeSettingsValidator` przed zapisem do DataStore.
+## Privacy Model
 
-## Feature Flags i Runtime Settings
+ZCam is designed to operate without cloud services. Video, audio, runtime
+settings, trusted devices, and logs are stored locally on the Android device
+unless the user explicitly connects a client or downloads recordings over the
+local network.
 
-- Runtime settings są przechowywane w `DataStoreRuntimeSettingsRepository`.
-- Feature flags są silnie typowane (`FeatureFlag`, `FeatureFlags`) i zmieniane tylko przez allowlist (`FeatureFlagGuard`).
-- Trusted devices są serializowane bezpiecznie (Base64 URL-safe) i walidowane przed utrwaleniem.
+See [`PRIVACY.md`](PRIVACY.md) for the user-facing privacy statement.
 
-## Lokalny Model Security
+## Android Permissions
 
-- `LAN-only`: każde żądanie HTTP jest odrzucane, jeśli IP klienta nie jest z dozwolonych zakresów LAN/VPN.
-- `PIN + token`: pairing urządzenia wymaga poprawnego PIN-u i jednorazowego challenge, a endpointy runtime wymagają tokenu API.
-- `Trusted devices`: urządzenia są rejestrowane lokalnie w `DataStore` i egzekwowane podczas autoryzacji.
-- `QR pairing`: serwer generuje challenge (`sessionId`, `pairingCode`, payload `zcam://pair?...`) do sparowania klienta.
-- `Token lifecycle`: obsługa rotacji i odwoływania tokenów + sanity-check po restarcie (naprawa uszkodzonego stanu auth).
+ZCam requests permissions needed for its runtime role:
 
-## Testy Jednostkowe
+- Camera preview and recording.
+- Microphone capture and audio transport.
+- Local network communication.
+- Foreground service operation.
+- Wake lock for long-running runtime.
+- Notification permission for the foreground service.
+- Media/storage permissions for recordings on Android versions that require
+  them.
+- Boot completed permission for optional runtime restore after reboot.
 
-- kontrakty/use-case: `core/src/test/.../DomainUseCasesContractTest.kt`
-- walidacja konfiguracji: `core/src/test/.../RuntimeSettingsValidatorTest.kt`
-- feature flag guard: `core/src/test/.../FeatureFlagGuardTest.kt`
-- codec trusted devices: `data/src/test/.../TrustedDeviceCodecTest.kt`
-- recovery policy: `service/src/test/.../RecoveryPolicyTest.kt`
-- recovery runtime coordinator: `service/src/test/.../ZCamRuntimeCoordinatorRecoveryTest.kt`
-- watchdog stale->recovery: `watchdog/src/test/.../ProcessWatchdogManagerRecoveryTest.kt`
-- security: `security/src/test/.../LanAccessPolicyTest.kt`, `security/src/test/.../LocalSecurityManagerNegativeTest.kt`
-- security endpointy: `server/src/test/.../ZCamSecurityEndpointsIntegrationTest.kt`
+## Default Runtime Settings
 
-## Decyzje Techniczne Pod 24/7
+The defaults are centralized in `RuntimeSettingsDefaults`:
 
-1. Foreground Service jako centralny runtime.
-Uzasadnienie: system Android rzadziej ubija proces i daje przewidywalny cykl życia dla stałej pracy.
+- Server port: `8080`
+- Preview/recording baseline: `1280x720`
+- FPS: `15`
+- Codec: `H.264`
+- Preview profile: balanced H.264
+- Recording segment length: `5` minutes
+- Max recording storage: `32 GB`
+- Minimum free storage floor: `5 GB`
 
-2. Architektura modułowa (12 modułów funkcjonalnych).
-Uzasadnienie: izolacja awarii i prostsze testowanie/restarty pojedynczych obszarów (camera/server/audio/storage).
+Settings are validated by `RuntimeSettingsValidator` before persistence.
 
-3. Coroutines + dispatcher injection.
-Uzasadnienie: zero blokowania UI i kontrola, gdzie wykonuje się I/O / CPU (łatwiejsze strojenie pod długie sesje).
+## Build
 
-4. LAN-only policy na wejściu HTTP.
-Uzasadnienie: minimalizacja powierzchni ataku i brak zależności od Internetu/chmury.
+Prerequisites:
 
-5. DataStore dla konfiguracji operacyjnej.
-Uzasadnienie: transakcyjne, asynchroniczne, odporne na błędy I/O zapisy ustawień runtime.
+- Android Studio or Android SDK command-line tools.
+- JDK 17.
+- Android SDK for `compileSdk = 35`.
 
-6. Loop recording z retencją opartą o limit danych i free-space floor.
-Uzasadnienie: ochrona przed zapełnieniem pamięci i degradacją systemu podczas pracy ciągłej.
+Useful commands:
 
-7. Watchdog heartbeat.
-Uzasadnienie: szybka detekcja zastałych komponentów i gotowy punkt pod auto-recovery.
+```powershell
+.\gradlew.bat :ui:compileDebugKotlin
+.\gradlew.bat test
+.\gradlew.bat :app:assembleRelease
+```
 
-8. Produkcyjny logging przez wspólny interfejs (`ZCamLogger`).
-Uzasadnienie: jednolite logi dla diagnostyki błędów i utrzymania urządzenia po wdrożeniu.
+The current release build is signed with the debug signing config. This is
+acceptable for internal pre-1.0 test builds, but it is a blocker for a formal
+`1.0` release.
 
-## Uruchomienie
+## Tests
 
-1. Otwórz projekt w Android Studio (JDK 17 + Android SDK).
-2. Zsynchronizuj Gradle.
-3. Uruchom moduł `app`.
+Focused test areas:
 
-## Uwaga
+- Domain/use-case contracts.
+- Runtime settings validation.
+- Feature flag guard.
+- Trusted device codec.
+- Recovery policy and coordinator recovery behavior.
+- Watchdog stale component recovery.
+- Security policy and negative auth paths.
+- Server security/audio integration endpoints.
+- Storage retention and index recovery.
 
-W tym szkielecie CameraX i PTT są przygotowane architektonicznie, ale streaming ramek i audio runtime są jeszcze w trybie placeholder (MVP skeleton).
+Run all available unit tests with:
+
+```powershell
+.\gradlew.bat test
+```
+
+## Release Process
+
+1. Confirm `main` is clean except intended changes.
+2. Update `versionCode` and `versionName` in `app/build.gradle.kts`.
+3. Run tests and release build.
+4. Generate APK checksum.
+5. Commit source changes.
+6. Push `main`.
+7. Create a GitHub Release with the APK asset and checksum.
+8. Verify the uploaded asset digest.
+
+The detailed 1.0 gate is in [`docs/1.0_READINESS.md`](docs/1.0_READINESS.md).
+
+## License
+
+ZCam source code is licensed under the GNU Affero General Public License
+version 3 or later (`AGPL-3.0-or-later`). See [`LICENSE`](LICENSE).
+
+Forks and modified versions must preserve the attribution notice in
+[`NOTICE`](NOTICE):
+
+> Based on ZCam, original project by KubwojPrime.
+
+The ZCam name, logos, icons, and visual brand identifiers are not licensed
+under the AGPL. See [`TRADEMARKS.md`](TRADEMARKS.md).
+
+This model is intended to keep the code auditable and user-protective while
+requiring public forks and network-accessible modified versions to provide
+corresponding source code under the same license. Final legal approval remains
+the maintainer's responsibility.
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md).
