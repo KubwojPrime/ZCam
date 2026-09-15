@@ -19,6 +19,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
 import javax.inject.Inject
 
 @AndroidEntryPoint
@@ -30,12 +32,28 @@ class ZCamForegroundService : Service() {
     @Inject
     lateinit var logger: ZCamLogger
 
+    @Inject
+    lateinit var runtimeRestarter: ZCamRuntimeRestarter
+
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     override fun onCreate() {
         super.onCreate()
         logger.i(LogEventId.SERVICE_CREATED, "Foreground service created")
         ensureNotificationChannel()
+        serviceScope.launch {
+            runtimeRestarter.requests.collect {
+                try {
+                    delay(700L)
+                    runtimeCoordinator.stop(persistDesiredState = false)
+                    runtimeCoordinator.start()
+                } catch (error: Throwable) {
+                    logger.e(LogEventId.COMPONENT_FAILED, error, "Remote runtime restart failed")
+                } finally {
+                    runtimeRestarter.finishRestart()
+                }
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

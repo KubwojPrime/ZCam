@@ -813,8 +813,9 @@ class CameraRuntimeImpl @Inject constructor(
             producedFrames.incrementAndGet()
             lastFrameEpochMs.set(System.currentTimeMillis())
             if (event != null) {
+                val eventFrame = encodedPreview.jpeg.copyOf()
                 eventScope.launch {
-                    recordingEventStore.append(event)
+                    recordingEventStore.append(event, eventFrame)
                 }
             }
         } catch (error: Throwable) {

@@ -19,6 +19,7 @@ import com.zcam.core.domain.config.PreviewTransport
 import com.zcam.core.device.PowerStatusProvider
 import com.zcam.core.device.PowerStatusSnapshot
 import com.zcam.core.dispatchers.DispatcherProvider
+import com.zcam.core.domain.recording.RuntimeRestartRequester
 import com.zcam.core.logging.LogEventId
 import com.zcam.core.logging.ZCamLogger
 import com.zcam.core.logging.e
@@ -69,7 +70,8 @@ class ZCamHttpServer @Inject constructor(
     private val powerStatusProvider: PowerStatusProvider,
     private val dispatchers: DispatcherProvider,
     private val logger: ZCamLogger,
-    private val lanAccessPolicy: LanAccessPolicy
+    private val lanAccessPolicy: LanAccessPolicy,
+    private val runtimeRestartRequester: RuntimeRestartRequester? = null
 ) : LocalHttpServer {
 
     @Volatile
@@ -403,12 +405,14 @@ class ZCamHttpServer @Inject constructor(
     private fun routeRequest(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
         val uri = session.uri.orEmpty()
         return when {
+            uri.startsWith("/api/recordings/events/") -> handleEventFrameEndpoint(session)
             uri == "/api/recordings/events" -> handleRecordingEventsEndpoint(session)
             uri.startsWith("/api/recordings/") -> handleRecordingDownloadEndpoint(session)
             else -> when (uri) {
             "/" -> buildPanelResponse()
             "/health" -> NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, NanoHTTPD.MIME_PLAINTEXT, "ok")
             "/api/status" -> buildStatusResponse()
+            "/api/runtime/restart" -> handleRuntimeRestartEndpoint(session)
             "/api/recordings" -> handleRecordingsListEndpoint(session)
             "/video", "/mjpeg" -> buildVideoResponse()
             "/snapshot.jpg" -> buildSnapshotResponse()
@@ -427,6 +431,32 @@ class ZCamHttpServer @Inject constructor(
             else -> NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.NOT_FOUND, NanoHTTPD.MIME_PLAINTEXT, "not found")
             }
         }
+    }
+
+    private fun handleRuntimeRestartEndpoint(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
+        if (session.method != NanoHTTPD.Method.POST) return methodNotAllowed("POST")
+        val requester = runtimeRestartRequester
+            ?: return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.SERVICE_UNAVAILABLE, JSON_UTF8, "{\"status\":\"error\",\"reason\":\"restart_unavailable\"}")
+        if (!requester.requestRestart()) {
+            return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.CONFLICT, JSON_UTF8, "{\"status\":\"error\",\"reason\":\"restart_in_progress\"}")
+        }
+        return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.ACCEPTED, JSON_UTF8, "{\"status\":\"accepted\"}")
+    }
+
+    private fun handleEventFrameEndpoint(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
+        if (session.method != NanoHTTPD.Method.GET) return methodNotAllowed("GET")
+        val name = session.uri.orEmpty().removePrefix("/api/recordings/events/")
+        val epochMs = name.removeSuffix(".jpg").takeIf { name.endsWith(".jpg") }?.toLongOrNull()
+            ?.takeIf { it > 0L }
+            ?: return badRequest("invalid event frame id")
+        val frame = runBlocking { loopRecordingManager.readEventFrame(epochMs) }
+            ?: return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.NOT_FOUND, NanoHTTPD.MIME_PLAINTEXT, "event frame not found")
+        return NanoHTTPD.newFixedLengthResponse(
+            NanoHTTPD.Response.Status.OK,
+            "image/jpeg",
+            ByteArrayInputStream(frame),
+            frame.size.toLong()
+        ).apply { addHeader("Cache-Control", "no-store") }
     }
 
     private fun handlePairingRequestEndpoint(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {

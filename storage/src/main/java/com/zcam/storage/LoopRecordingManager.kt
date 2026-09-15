@@ -18,6 +18,8 @@ interface LoopRecordingManager : LoopRecordingEngine {
         limit: Int = 400
     ): List<RecordingEventSummary>
 
+    suspend fun readEventFrame(epochMs: Long): ByteArray? = null
+
     suspend fun resolveRecordingFile(fileName: String): File?
 }
 

@@ -21,13 +21,27 @@ class LocalRecordingEventStore @Inject constructor(
 
     private val mutex = Mutex()
 
-    override suspend fun append(event: RecordingEvent) = withContext(dispatchers.io) {
+    override suspend fun append(event: RecordingEvent, frameJpeg: ByteArray?) = withContext(dispatchers.io) {
         val normalized = RecordingEvent(
             epochMs = event.epochMs.coerceAtLeast(0L),
             confidencePercent = event.confidencePercent.coerceIn(1, 100),
             source = event.source.trim().ifBlank { DEFAULT_SOURCE }.take(MAX_SOURCE_LENGTH)
         )
         mutex.withLock {
+            if (frameJpeg != null && frameJpeg.size in 4..MAX_FRAME_BYTES &&
+                frameJpeg[0] == 0xff.toByte() && frameJpeg[1] == 0xd8.toByte()
+            ) {
+                runCatching {
+                    val frameFile = eventFrameFile(normalized.epochMs)
+                    frameFile.parentFile?.mkdirs()
+                    val tempFile = File(frameFile.parentFile, "${frameFile.name}.tmp")
+                    tempFile.writeBytes(frameJpeg)
+                    if (!tempFile.renameTo(frameFile)) {
+                        tempFile.delete()
+                    }
+                    pruneExcessFramesLocked()
+                }
+            }
             val file = eventIndexFile()
             file.parentFile?.mkdirs()
             file.appendText(
@@ -40,6 +54,14 @@ class LocalRecordingEventStore @Inject constructor(
                     append('\n')
                 }
             )
+        }
+    }
+
+    override suspend fun readFrame(epochMs: Long): ByteArray? = withContext(dispatchers.io) {
+        if (epochMs <= 0L) return@withContext null
+        mutex.withLock {
+            val file = eventFrameFile(epochMs)
+            if (file.isFile && file.length() in 1..MAX_FRAME_BYTES.toLong()) file.readBytes() else null
         }
     }
 
@@ -84,8 +106,25 @@ class LocalRecordingEventStore @Inject constructor(
                     } + "\n"
                 )
             }
+            eventFramesDir().listFiles()?.forEach { frame ->
+                if (frame.extension == "jpg" && (frame.nameWithoutExtension.toLongOrNull() ?: Long.MAX_VALUE) < cutoffEpochMs) {
+                    frame.delete()
+                }
+            }
         }
     }
+
+    private fun pruneExcessFramesLocked() {
+        val frames = eventFramesDir().listFiles()
+            ?.filter { it.isFile && it.extension == "jpg" }
+            ?.sortedBy { it.nameWithoutExtension.toLongOrNull() ?: Long.MAX_VALUE }
+            .orEmpty()
+        frames.take((frames.size - MAX_STORED_FRAMES).coerceAtLeast(0)).forEach(File::delete)
+    }
+
+    private fun eventFramesDir(): File = File(context.filesDir, "zcam_event_frames")
+
+    private fun eventFrameFile(epochMs: Long): File = File(eventFramesDir(), "$epochMs.jpg")
 
     private fun loadEventsLocked(): List<RecordingEvent> {
         val file = eventIndexFile()
@@ -123,5 +162,7 @@ class LocalRecordingEventStore @Inject constructor(
         const val DEFAULT_SOURCE = "motion"
         const val MAX_SOURCE_LENGTH = 32
         const val MAX_QUERY_LIMIT = 1_000
+        const val MAX_FRAME_BYTES = 1_500_000
+        const val MAX_STORED_FRAMES = 200
     }
 }

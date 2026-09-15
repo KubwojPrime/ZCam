@@ -3,7 +3,7 @@
 ZCam is a local-first Android camera and audio monitoring app designed for
 long-running LAN/VPN operation without a cloud backend.
 
-Current public release: `0.2.8`.
+Current public release: `0.2.9`.
 
 Project status: pre-1.0 hardening. The app already contains the core runtime
 architecture, local HTTP API, pairing, recording, watchdog/recovery, and client
@@ -103,6 +103,8 @@ Main endpoints:
 - `POST /api/audio/volume`
 - `GET /api/recordings`
 - `GET /api/recordings/events`
+- `GET /api/recordings/events/{epochMs}.jpg`
+- `POST /api/runtime/restart`
 - `GET /api/recordings/{fileName}`
 - `GET /api/security/pair/qr`
 - `POST /api/security/pair/request`
@@ -112,6 +114,22 @@ Main endpoints:
 - `POST /api/security/token/revoke`
 - `WS /ws/audio`
 - `WS /ws/preview`
+
+## Client Event Alerts And Restart
+
+In Client mode, enable Motion alerts after pairing to run a foreground LAN/VPN
+monitor. The monitor checks for new events every five seconds and shows an
+Android notification with the JPEG frame captured at detection time. Event
+frames stay in private app storage on the server, are served only through the
+authenticated API, and are capped at 200 retained frames. Notifications depend
+on network reachability, notification permission, and Android allowing the
+client monitor service to run.
+
+The client can request a restart of a reachable server through the authenticated
+API. The server acknowledges the request, then restarts its runtime. If Android
+has killed the entire server process, no LAN listener remains to receive a
+request; the client reports that the server is unreachable. This local-only
+mode cannot guarantee remote wake after a full process kill or force-stop.
 
 ## Security Model
 

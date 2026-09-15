@@ -147,6 +147,28 @@ class OkHttpLocalClient @Inject constructor(
         }
     }
 
+    override suspend fun fetchEventFrame(target: ClientTarget, epochMs: Long): ClientCallResult<ByteArray> = withContext(dispatchers.io) {
+        if (epochMs <= 0L) return@withContext ClientCallResult.Failure(null, "invalid_event_id")
+        val request = requestBuilder(target, "/api/recordings/events/$epochMs.jpg").get().build()
+        runCatching<ClientCallResult<ByteArray>> {
+            client.newCall(request).execute().use { response ->
+                val body = response.body?.takeIf { it.contentLength() <= MAX_EVENT_FRAME_BYTES }
+                    ?.bytes()
+                if (!response.isSuccessful || body == null || body.isEmpty() || body.size > MAX_EVENT_FRAME_BYTES) {
+                    ClientCallResult.Failure(response.code, "event_frame_unavailable")
+                } else {
+                    ClientCallResult.Success(body)
+                }
+            }
+        }.getOrElse { error ->
+            logger.w("Event frame fetch failed: ${error.message}")
+            ClientCallResult.Failure(null, "event_frame_io_error")
+        }
+    }
+
+    override suspend fun restartRuntime(target: ClientTarget): ClientCallResult<Unit> =
+        executeAction(target, "/api/runtime/restart", "{}")
+
     override suspend fun setPushToTalk(target: ClientTarget, enabled: Boolean): ClientCallResult<Unit> {
         val payload = JSONObject()
             .put("mode", "ptt")
@@ -615,6 +637,7 @@ class OkHttpLocalClient @Inject constructor(
     }
 
     private companion object {
+        const val MAX_EVENT_FRAME_BYTES = 1_500_000
         val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
         const val DOWNLOAD_BUFFER_BYTES = 64 * 1024
     }

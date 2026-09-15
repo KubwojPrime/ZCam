@@ -86,6 +86,8 @@ class LocalLoopRecordingManager @Inject constructor(
         logger.i(LogEventId.RECORDING_STOPPED, "Loop recording stopped")
     }
 
+    override suspend fun readEventFrame(epochMs: Long): ByteArray? = recordingEventStore.readFrame(epochMs)
+
     override suspend fun forceRetentionSweep() = withContext(dispatchers.io) {
         stateMutex.withLock {
             val directory = recordingDir()

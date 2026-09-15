@@ -17,6 +17,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
 
     <uses-feature android:name="android.hardware.camera.any" android:required="true" />
     <uses-feature android:name="android.hardware.microphone" android:required="true" />
@@ -57,6 +59,12 @@
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="camera|microphone|mediaPlayback" />
+
+        <service
+            android:name=".ClientEventMonitorService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
 
         <receiver
             android:name=".BootReceiver"

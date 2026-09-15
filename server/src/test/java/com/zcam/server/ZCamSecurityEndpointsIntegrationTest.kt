@@ -91,6 +91,21 @@ class ZCamSecurityEndpointsIntegrationTest {
     }
 
     @Test
+    fun restart_and_event_frame_require_authentication() {
+        postJson("/api/runtime/restart", "{}").use {
+            it.body?.string()
+            assertEquals(401, it.code)
+        }
+        client.newCall(Request.Builder()
+            .url("http://127.0.0.1:$port/api/recordings/events/123.jpg")
+            .get()
+            .header("Connection", "close")
+            .build()).execute().use {
+            assertEquals(401, it.code)
+        }
+    }
+
+    @Test
     fun rejects_unauthorized_access_to_protected_endpoint() {
         val request = Request.Builder()
             .url("http://127.0.0.1:$port/api/status")
@@ -259,6 +274,7 @@ class ZCamSecurityEndpointsIntegrationTest {
         Request.Builder()
             .url("http://127.0.0.1:$port$path")
             .post(body.toRequestBody(JSON_MEDIA_TYPE))
+            .header("Connection", "close")
             .build()
     ).execute()
 

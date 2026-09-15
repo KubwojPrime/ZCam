@@ -217,6 +217,8 @@ class MainActivity : ComponentActivity() {
                 emptyList()
             }
 
+            ZCamUiAction.ToggleEventAlerts -> notificationPermissions()
+
             else -> emptyList()
         }
     }

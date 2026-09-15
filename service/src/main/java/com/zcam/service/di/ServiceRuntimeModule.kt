@@ -7,6 +7,8 @@ import com.zcam.service.runtime.RecoveryPolicy
 import com.zcam.service.runtime.RetryBackoffScheduler
 import com.zcam.service.runtime.RuntimeEnvironmentMonitor
 import com.zcam.service.runtime.RuntimeHealthRepository
+import com.zcam.service.ZCamRuntimeRestarter
+import com.zcam.core.domain.recording.RuntimeRestartRequester
 import dagger.Binds
 import dagger.Module
 import dagger.Provides
@@ -17,6 +19,10 @@ import javax.inject.Singleton
 @Module
 @InstallIn(SingletonComponent::class)
 abstract class ServiceBindingsModule {
+
+    @Binds
+    @Singleton
+    abstract fun bindRuntimeRestartRequester(impl: ZCamRuntimeRestarter): RuntimeRestartRequester
 
     @Binds
     @Singleton

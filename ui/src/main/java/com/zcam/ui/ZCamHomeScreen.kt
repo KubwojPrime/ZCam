@@ -1494,6 +1494,22 @@ private fun ClientSection(
             ) {
                 Text("Check connection")
             }
+            OutlinedButton(
+                modifier = Modifier.fillMaxWidth(),
+                onClick = { onAction(ZCamUiAction.RestartRemoteRuntime) }
+            ) {
+                Text("Restart server")
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Motion alerts", modifier = Modifier.weight(1f))
+                Switch(
+                    checked = state.eventAlertsEnabled,
+                    onCheckedChange = { onAction(ZCamUiAction.ToggleEventAlerts) }
+                )
+            }
             StatusChip(
                 label = state.clientStatusLabel,
                 tone = if (state.clientReachable) StatusTone.HEALTHY else StatusTone.WARNING

@@ -13,6 +13,7 @@ import com.zcam.camera.MjpegFrameSource
 import com.zcam.core.device.PowerStatusProvider
 import com.zcam.core.device.PowerStatusSnapshot
 import com.zcam.core.dispatchers.DispatcherProvider
+import com.zcam.core.domain.recording.RuntimeRestartRequester
 import com.zcam.core.domain.config.TrustedDevice
 import com.zcam.core.logging.ZCamLogger
 import com.zcam.security.LanAccessPolicy
@@ -52,6 +53,8 @@ import java.util.concurrent.atomic.AtomicReference
 
 class ZCamAudioEndpointsIntegrationTest {
 
+    private var restartRequested = false
+
     private val client = OkHttpClient()
     private val logger = NoopLogger()
     private val dispatchers = TestDispatcherProvider()
@@ -82,7 +85,13 @@ class ZCamAudioEndpointsIntegrationTest {
             powerStatusProvider = FakePowerStatusProvider(),
             dispatchers = dispatchers,
             logger = logger,
-            lanAccessPolicy = LanAccessPolicy()
+            lanAccessPolicy = LanAccessPolicy(),
+            runtimeRestartRequester = object : RuntimeRestartRequester {
+                override fun requestRestart(): Boolean {
+                    restartRequested = true
+                    return true
+                }
+            }
         )
         port = findFreePort()
         runBlocking {
@@ -96,6 +105,26 @@ class ZCamAudioEndpointsIntegrationTest {
         runBlocking {
             httpServer.stop()
             audioManager.stop()
+        }
+    }
+
+    @Test
+    fun runtime_restart_endpoint_accepts_request() {
+        postJson("/api/runtime/restart", "{}").use {
+            assertEquals(202, it.code)
+            assertTrue(restartRequested)
+        }
+    }
+
+    @Test
+    fun event_frame_endpoint_returns_jpeg() {
+        client.newCall(Request.Builder()
+            .url("http://127.0.0.1:$port/api/recordings/events/123.jpg")
+            .get()
+            .build()).execute().use {
+            assertEquals(200, it.code)
+            assertEquals("image/jpeg", it.header("Content-Type"))
+            assertTrue(it.body?.bytes()?.contentEquals(byteArrayOf(0xff.toByte(), 0xd8.toByte(), 0xff.toByte(), 0xd9.toByte())) == true)
         }
     }
 
@@ -473,6 +502,9 @@ class ZCamAudioEndpointsIntegrationTest {
             toEpochMs: Long?,
             limit: Int
         ): List<com.zcam.storage.RecordingEventSummary> = emptyList()
+
+        override suspend fun readEventFrame(epochMs: Long): ByteArray? =
+            if (epochMs == 123L) byteArrayOf(0xff.toByte(), 0xd8.toByte(), 0xff.toByte(), 0xd9.toByte()) else null
 
         override suspend fun resolveRecordingFile(fileName: String): java.io.File? = null
     }

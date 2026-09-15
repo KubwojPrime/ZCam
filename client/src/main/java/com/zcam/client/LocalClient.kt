@@ -108,6 +108,8 @@ interface LocalClient {
     suspend fun isServerAlive(target: ClientTarget): Boolean
     suspend fun fetchStatus(target: ClientTarget): ClientCallResult<ClientServerStatus>
     suspend fun fetchSnapshot(target: ClientTarget): ClientCallResult<ByteArray>
+    suspend fun fetchEventFrame(target: ClientTarget, epochMs: Long): ClientCallResult<ByteArray>
+    suspend fun restartRuntime(target: ClientTarget): ClientCallResult<Unit>
     fun buildPreviewStreamUrl(target: ClientTarget): String
     fun buildPreviewH264SocketUrl(target: ClientTarget): String
     suspend fun setPushToTalk(target: ClientTarget, enabled: Boolean): ClientCallResult<Unit>

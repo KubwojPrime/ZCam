@@ -90,7 +90,11 @@ class ZCamMainViewModel @Inject constructor(
     private val logger: ZCamLogger
 ) : ViewModel() {
 
-    private val _state = MutableStateFlow(ZCamUiState())
+    private val _state = MutableStateFlow(
+        ZCamUiState(eventAlertsEnabled = appContext.getSharedPreferences(
+            ClientEventMonitorService.PREFERENCES_NAME, Context.MODE_PRIVATE
+        ).getBoolean(ClientEventMonitorService.ENABLED_KEY, false))
+    )
     val state = _state.asStateFlow()
 
     private var settingsSnapshot: RuntimeSettings = RuntimeSettingsDefaults.value
@@ -127,6 +131,8 @@ class ZCamMainViewModel @Inject constructor(
             }
             is ZCamUiAction.ModeChanged -> {
                 if (action.mode != ZCamMode.CLIENT) {
+                    ClientEventMonitorService.setEnabled(appContext, false)
+                    appContext.stopService(ClientEventMonitorService.serviceIntent(appContext))
                     viewModelScope.launch(dispatchers.io) {
                         localAudioTransport.stopAll()
                     }
@@ -139,7 +145,8 @@ class ZCamMainViewModel @Inject constructor(
                         showModePicker = false,
                         screen = if (current.showModePicker) ZCamScreen.MAIN else current.screen,
                         showPairingSuggestionDialog = false,
-                        errorMessage = null
+                        errorMessage = null,
+                        eventAlertsEnabled = if (action.mode == ZCamMode.CLIENT) current.eventAlertsEnabled else false
                     )
                 }
                 scheduleClientSessionPersist()
@@ -159,6 +166,8 @@ class ZCamMainViewModel @Inject constructor(
             ZCamUiAction.StartRuntime -> startRuntime()
             ZCamUiAction.StopRuntime -> stopRuntime()
             ZCamUiAction.RefreshClientStatus -> refreshClientStatusNow()
+            ZCamUiAction.RestartRemoteRuntime -> restartRemoteRuntime()
+            ZCamUiAction.ToggleEventAlerts -> toggleEventAlerts()
             is ZCamUiAction.ClientHostChanged -> {
                 _state.update { it.copy(clientHost = action.host.trim()) }
                 scheduleClientSessionPersist()
@@ -963,6 +972,49 @@ class ZCamMainViewModel @Inject constructor(
             when (val result = localClient.playQuickSound(currentTargetForCommands(), clipId, aversive)) {
                 is ClientCallResult.Success -> _state.update { it.copy(errorMessage = null) }
                 is ClientCallResult.Failure -> _state.update { it.copy(errorMessage = "Playback failed: ${result.reason}") }
+            }
+        }
+    }
+
+    private fun restartRemoteRuntime() {
+        if (state.value.mode != ZCamMode.CLIENT) return
+        viewModelScope.launch(dispatchers.io) {
+            when (val result = localClient.restartRuntime(currentTargetForCommands())) {
+                is ClientCallResult.Success -> {
+                    _state.update { it.copy(clientStatusLabel = "Restart requested", errorMessage = null) }
+                    delay(2_000L)
+                    refreshClientStatusNow()
+                }
+                is ClientCallResult.Failure -> _state.update {
+                    it.copy(errorMessage = if (result.code == null) {
+                        "Server unreachable. A stopped Android process cannot be started over LAN/VPN."
+                    } else {
+                        "Restart failed: ${result.reason}"
+                    })
+                }
+            }
+        }
+    }
+
+    private fun toggleEventAlerts() {
+        if (state.value.mode != ZCamMode.CLIENT) return
+        if (state.value.eventAlertsEnabled) {
+            ClientEventMonitorService.setEnabled(appContext, false)
+            appContext.stopService(ClientEventMonitorService.serviceIntent(appContext))
+            _state.update { it.copy(eventAlertsEnabled = false) }
+            return
+        }
+        if (state.value.pairing.issuedToken.isBlank()) {
+            _state.update { it.copy(errorMessage = "Pair with the server before enabling motion alerts.") }
+            return
+        }
+        viewModelScope.launch(dispatchers.io) {
+            try {
+                persistClientSession()
+                ContextCompat.startForegroundService(appContext, ClientEventMonitorService.startIntent(appContext))
+                _state.update { it.copy(eventAlertsEnabled = true, errorMessage = null) }
+            } catch (error: Exception) {
+                _state.update { it.copy(errorMessage = "Could not start event alerts: ${error.message}") }
             }
         }
     }

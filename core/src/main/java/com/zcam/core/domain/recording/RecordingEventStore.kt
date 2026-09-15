@@ -7,7 +7,9 @@ data class RecordingEvent(
 )
 
 interface RecordingEventStore {
-    suspend fun append(event: RecordingEvent)
+    suspend fun append(event: RecordingEvent, frameJpeg: ByteArray? = null)
+
+    suspend fun readFrame(epochMs: Long): ByteArray?
 
     suspend fun query(
         fromEpochMs: Long? = null,
