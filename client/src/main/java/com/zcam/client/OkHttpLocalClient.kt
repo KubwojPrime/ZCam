@@ -434,6 +434,7 @@ class OkHttpLocalClient @Inject constructor(
                                     epochMs = item.optLong("epochMs"),
                                     confidencePercent = item.optInt("confidencePercent"),
                                     source = item.optString("source"),
+                                    type = item.optString("type", "object_motion"),
                                     recordingFileName = item.optString("recordingFileName").ifBlank { null },
                                     recordingStartedAtEpochMs = item.optNullableLong("recordingStartedAtEpochMs"),
                                     recordingEndedAtEpochMs = item.optNullableLong("recordingEndedAtEpochMs"),
@@ -457,16 +458,12 @@ class OkHttpLocalClient @Inject constructor(
 
     override fun buildRecordingPlaybackUrl(target: ClientTarget, fileName: String): String {
         val encodedName = URLEncoder.encode(fileName, StandardCharsets.UTF_8.name())
-        val base = "http://${target.host}:${target.port}/api/recordings/$encodedName"
-        val query = buildList {
-            target.token?.takeIf { it.isNotBlank() }?.let {
-                add("token=" + URLEncoder.encode(it, StandardCharsets.UTF_8.name()))
-            }
-            target.deviceId?.takeIf { it.isNotBlank() }?.let {
-                add("deviceId=" + URLEncoder.encode(it, StandardCharsets.UTF_8.name()))
-            }
-        }.joinToString("&")
-        return if (query.isBlank()) base else "$base?$query"
+        return "http://${target.host}:${target.port}/api/recordings/$encodedName"
+    }
+
+    override fun recordingPlaybackHeaders(target: ClientTarget): Map<String, String> = buildMap {
+        target.token?.takeIf(String::isNotBlank)?.let { put("X-ZCam-Token", it) }
+        target.deviceId?.takeIf(String::isNotBlank)?.let { put("X-ZCam-Device-Id", it) }
     }
 
     override suspend fun downloadRecording(

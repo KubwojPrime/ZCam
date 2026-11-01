@@ -38,6 +38,7 @@ data class RecordingEventSummary(
     val epochMs: Long,
     val confidencePercent: Int,
     val source: String,
+    val type: String = "object_motion",
     val recordingFileName: String?,
     val recordingStartedAtEpochMs: Long? = null,
     val recordingEndedAtEpochMs: Long? = null,

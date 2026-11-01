@@ -715,9 +715,9 @@ private fun SettingsScreen(
                 }
                 Text(
                     text = when (settings.eventSensitivitySelection) {
-                        EventDetectionSensitivity.LOW -> "Low sensitivity requires larger motion and uses a longer cooldown."
-                        EventDetectionSensitivity.BALANCED -> "Balanced sensitivity is the default motion profile."
-                        EventDetectionSensitivity.HIGH -> "High sensitivity detects smaller movement and still applies cooldown to avoid event spam."
+                        EventDetectionSensitivity.LOW -> "Low sensitivity tracks larger moving regions and uses a longer cooldown."
+                        EventDetectionSensitivity.BALANCED -> "Balanced separates localized object motion from camera interference."
+                        EventDetectionSensitivity.HIGH -> "High sensitivity tracks smaller moving regions while retaining noise filtering."
                     },
                     style = MaterialTheme.typography.bodySmall
                 )

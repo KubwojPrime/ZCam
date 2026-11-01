@@ -3,6 +3,7 @@
 import com.zcam.core.dispatchers.DispatcherProvider
 import com.zcam.core.domain.watchdog.RecoveryReason
 import com.zcam.core.logging.ZCamLogger
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -15,6 +16,7 @@ import org.junit.Test
 
 class ProcessWatchdogManagerRecoveryTest {
 
+    @OptIn(ExperimentalCoroutinesApi::class)
     @Test
     fun emits_recovery_event_for_stale_component() = runTest {
         val dispatcher = StandardTestDispatcher(testScheduler)
@@ -30,6 +32,7 @@ class ProcessWatchdogManagerRecoveryTest {
                 override fun e(throwable: Throwable?, message: String) = Unit
             }
         )
+        manager.currentTimeMillis = { testScheduler.currentTime + 1L }
 
         val events = mutableListOf<com.zcam.core.domain.watchdog.RecoveryRequest>()
         val collector = launch {

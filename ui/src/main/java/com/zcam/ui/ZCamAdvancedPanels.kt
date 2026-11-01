@@ -1,7 +1,6 @@
 package com.zcam.ui
 
 import android.graphics.BitmapFactory
-import android.net.Uri
 import android.os.Build
 import android.view.ViewGroup
 import android.webkit.WebResourceError
@@ -10,7 +9,6 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.VideoView
 import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.transformable
@@ -60,12 +58,25 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.zcam.core.domain.config.PreviewTransport
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.SeekParameters
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.ui.PlayerView
+import okhttp3.OkHttpClient
 import java.text.DateFormat
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -482,21 +493,50 @@ internal fun RecordingsStudioScreen(
 }
 
 @Composable
+@androidx.annotation.OptIn(UnstableApi::class)
 private fun RecordingPlayerCard(
     state: ZCamUiState,
     onAction: (ZCamUiAction) -> Unit
 ) {
     val selectedUrl = state.recordings.selectedPlaybackUrl
     val selectedOffsetMs = state.recordings.selectedPlaybackOffsetMs
-    var videoViewRef by remember { mutableStateOf<VideoView?>(null) }
-    var mediaPlayerRef by remember { mutableStateOf<android.media.MediaPlayer?>(null) }
-    var durationMs by remember(selectedUrl) { mutableLongStateOf(0L) }
-    var positionMs by remember(selectedUrl) { mutableLongStateOf(selectedOffsetMs) }
-    var scrubPositionMs by remember(selectedUrl) { mutableLongStateOf(selectedOffsetMs) }
+    val playbackItems = state.recordings.playbackItems
+    val playbackHeaders = state.recordings.playbackHeaders
+    val context = LocalContext.current
+    val httpClient = remember { OkHttpClient() }
+    val playlistKey = remember(playbackItems, playbackHeaders) {
+        playbackItems.joinToString("|") { "${it.fileName}:${it.url}" } + playbackHeaders.hashCode()
+    }
+    val player = remember(playlistKey) {
+        val dataSourceFactory = OkHttpDataSource.Factory(httpClient)
+            .setDefaultRequestProperties(playbackHeaders)
+        ExoPlayer.Builder(context)
+            .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
+            .setLoadControl(
+                DefaultLoadControl.Builder()
+                    .setBufferDurationsMs(10_000, 60_000, 1_000, 2_000)
+                    .build()
+            )
+            .build()
+            .apply {
+                setSeekParameters(SeekParameters.CLOSEST_SYNC)
+                setMediaItems(playbackItems.map { item ->
+                    MediaItem.Builder()
+                        .setMediaId(item.fileName)
+                        .setUri(item.url)
+                        .build()
+                })
+                prepare()
+            }
+    }
+    var durationMs by remember(player) { mutableLongStateOf(0L) }
+    var positionMs by remember(player) { mutableLongStateOf(selectedOffsetMs) }
+    var scrubPositionMs by remember(player) { mutableLongStateOf(selectedOffsetMs) }
     var scrubbing by remember { mutableStateOf(false) }
-    var initialSeekMs by remember(selectedUrl, selectedOffsetMs) { mutableLongStateOf(selectedOffsetMs) }
-    var isPlaying by remember(selectedUrl) { mutableStateOf(false) }
-    var playbackSpeed by remember(selectedUrl) { mutableStateOf(1f) }
+    var isPlaying by remember(player) { mutableStateOf(false) }
+    var isBuffering by remember(player) { mutableStateOf(false) }
+    var playbackError by remember(player) { mutableStateOf("") }
+    var playbackSpeed by remember(player) { mutableStateOf(1f) }
     val selectedItem = state.recordings.items.firstOrNull { it.fileName == state.recordings.selectedFileName }
     val selectedEvents = state.recordings.events
         .filter { it.recordingFileName == selectedItem?.fileName }
@@ -507,6 +547,42 @@ private fun RecordingPlayerCard(
         (state.recordings.playbackDownloadedBytes.toFloat() / loadingTotalBytes.toFloat()).coerceIn(0f, 1f)
     } else {
         null
+    }
+
+    DisposableEffect(player) {
+        val listener = object : Player.Listener {
+            override fun onIsPlayingChanged(value: Boolean) {
+                isPlaying = value
+            }
+
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                isBuffering = playbackState == Player.STATE_BUFFERING
+            }
+
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                mediaItem?.mediaId?.takeIf(String::isNotBlank)?.let {
+                    onAction(ZCamUiAction.RecordingPlaybackSegmentChanged(it))
+                }
+            }
+
+            override fun onPlayerError(error: PlaybackException) {
+                playbackError = error.errorCodeName
+            }
+        }
+        player.addListener(listener)
+        onDispose {
+            player.removeListener(listener)
+            player.release()
+        }
+    }
+
+    LaunchedEffect(player, state.recordings.playbackSeekRequestId) {
+        if (state.recordings.playbackSeekRequestId <= 0L) return@LaunchedEffect
+        val index = playbackItems.indexOfFirst { it.fileName == state.recordings.selectedFileName }
+        if (index >= 0) {
+            player.seekTo(index, selectedOffsetMs)
+            player.playWhenReady = true
+        }
     }
 
     Card(
@@ -569,56 +645,38 @@ private fun RecordingPlayerCard(
                         .fillMaxWidth()
                         .height(240.dp),
                     factory = { context ->
-                        VideoView(context).apply {
+                        PlayerView(context).apply {
                             layoutParams = ViewGroup.LayoutParams(
                                 ViewGroup.LayoutParams.MATCH_PARENT,
                                 ViewGroup.LayoutParams.MATCH_PARENT
                             )
-                            setOnPreparedListener { mediaPlayer ->
-                                mediaPlayerRef = mediaPlayer
-                                durationMs = mediaPlayer.duration.toLong().coerceAtLeast(0L)
-                                if (initialSeekMs > 0L) {
-                                    seekTo(initialSeekMs.coerceAtMost(durationMs).toInt())
-                                    positionMs = initialSeekMs.coerceAtMost(durationMs)
-                                    scrubPositionMs = positionMs
-                                    initialSeekMs = 0L
-                                }
-                                applyPlaybackSpeed(mediaPlayer, playbackSpeed)
-                                start()
-                                isPlaying = true
-                            }
-                            setOnCompletionListener {
-                                isPlaying = false
-                                positionMs = durationMs
-                                scrubPositionMs = durationMs
-                            }
+                            useController = false
+                            this.player = player
                         }
                     },
                     update = { view ->
-                        videoViewRef = view
-                        val playbackKey = "$selectedUrl#$selectedOffsetMs"
-                        if (view.tag != playbackKey) {
-                            view.tag = playbackKey
-                            durationMs = 0L
-                            positionMs = selectedOffsetMs
-                            scrubPositionMs = selectedOffsetMs
-                            initialSeekMs = selectedOffsetMs
-                            view.stopPlayback()
-                            view.setVideoURI(Uri.parse(selectedUrl))
-                            view.requestFocus()
-                            isPlaying = false
-                        }
+                        view.player = player
                     }
                 )
 
-                LaunchedEffect(videoViewRef, selectedUrl, scrubbing) {
-                    while (videoViewRef != null && selectedUrl.isNotBlank()) {
+                LaunchedEffect(player, playlistKey, scrubbing) {
+                    var progressTicks = 0
+                    while (playbackItems.isNotEmpty()) {
                         if (!scrubbing) {
-                            val currentPosition = videoViewRef?.currentPosition?.toLong()?.coerceAtLeast(0L) ?: 0L
+                            val currentPosition = player.currentPosition.coerceAtLeast(0L)
                             positionMs = currentPosition
                             scrubPositionMs = currentPosition
+                            durationMs = player.duration.takeUnless { it == C.TIME_UNSET }?.coerceAtLeast(0L)
+                                ?: selectedItem?.durationMs
+                                ?: 0L
+                            progressTicks += 1
+                            if (progressTicks % 4 == 0) {
+                                player.currentMediaItem?.mediaId?.takeIf(String::isNotBlank)?.let { fileName ->
+                                    onAction(ZCamUiAction.RecordingPlaybackProgress(fileName, currentPosition))
+                                }
+                            }
                         }
-                        isPlaying = videoViewRef?.isPlaying == true
+                        isPlaying = player.isPlaying
                         delay(250L)
                     }
                 }
@@ -641,6 +699,13 @@ private fun RecordingPlayerCard(
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
+                if (isBuffering) {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    Text("Buffering from server...", style = MaterialTheme.typography.bodySmall)
+                }
+                if (playbackError.isNotBlank()) {
+                    Text("Playback error: $playbackError", style = MaterialTheme.typography.bodySmall)
+                }
 
                 val sliderMax = max(effectiveDurationMs, 1L).toFloat()
                 Row(
@@ -651,8 +716,7 @@ private fun RecordingPlayerCard(
                         text = if (isPlaying) "Playing" else "Play",
                         active = isPlaying,
                         onClick = {
-                            videoViewRef?.start()
-                            isPlaying = true
+                            player.play()
                         },
                         modifier = Modifier.weight(1f),
                         enabled = selectedUrl.isNotBlank()
@@ -661,8 +725,7 @@ private fun RecordingPlayerCard(
                         text = if (isPlaying) "Pause" else "Paused",
                         active = !isPlaying,
                         onClick = {
-                            videoViewRef?.pause()
-                            isPlaying = false
+                            player.pause()
                         },
                         modifier = Modifier.weight(1f),
                         enabled = selectedUrl.isNotBlank()
@@ -678,7 +741,7 @@ private fun RecordingPlayerCard(
                             active = playbackSpeed == speed,
                             onClick = {
                                 playbackSpeed = speed
-                                mediaPlayerRef?.let { mediaPlayer -> applyPlaybackSpeed(mediaPlayer, speed) }
+                                player.setPlaybackSpeed(speed)
                             },
                             modifier = Modifier.weight(1f)
                         )
@@ -700,7 +763,7 @@ private fun RecordingPlayerCard(
                     },
                     onValueChangeFinished = {
                         val target = scrubPositionMs.coerceAtMost(effectiveDurationMs)
-                        videoViewRef?.seekTo(target.toInt())
+                        player.seekTo(target)
                         positionMs = target
                         scrubbing = false
                     },
@@ -792,7 +855,11 @@ private fun RecordingEventMarkerStrip(
                 modifier = Modifier
                     .width(6.dp)
                     .height(20.dp)
-                    .background(MaterialTheme.colorScheme.error, RoundedCornerShape(6.dp))
+                    .background(
+                        if (event.type == "camera_tamper") MaterialTheme.colorScheme.error
+                        else MaterialTheme.colorScheme.primary,
+                        RoundedCornerShape(6.dp)
+                    )
                     .align(Alignment.CenterStart)
                     .offset(x = barWidth * markerFraction)
                     .clickable {
@@ -851,6 +918,15 @@ private fun RecordingTimelineCard(
                     item.startedAtEpochMs + state.recordings.selectedPlaybackOffsetMs
                         .coerceIn(0L, item.durationMs.coerceAtLeast(0L))
                 }
+            var timelineScrubEpochMs by remember(rangeStart, rangeEnd) {
+                mutableLongStateOf(selectedEpochMs ?: rangeStart)
+            }
+            var timelineScrubbing by remember { mutableStateOf(false) }
+            LaunchedEffect(selectedEpochMs, timelineScrubbing) {
+                if (!timelineScrubbing && selectedEpochMs != null) {
+                    timelineScrubEpochMs = selectedEpochMs.coerceIn(rangeStart, rangeEnd)
+                }
+            }
             val scrollState = rememberScrollState()
             val coroutineScope = rememberCoroutineScope()
 
@@ -971,7 +1047,8 @@ private fun RecordingTimelineCard(
                                     .width(markerWidth)
                                     .height(if (cluster.count > 1) 24.dp else 34.dp)
                                     .background(
-                                        MaterialTheme.colorScheme.error,
+                                        if (cluster.containsCameraTamper) MaterialTheme.colorScheme.error
+                                        else MaterialTheme.colorScheme.primary,
                                         RoundedCornerShape(if (cluster.count > 1) 12.dp else 7.dp)
                                     )
                                     .clickable {
@@ -1007,6 +1084,24 @@ private fun RecordingTimelineCard(
                 }
             }
 
+            Text("Time", style = MaterialTheme.typography.labelMedium)
+            Slider(
+                value = (
+                    (timelineScrubEpochMs.coerceIn(rangeStart, rangeEnd) - rangeStart).toDouble() /
+                        totalRangeMs.toDouble()
+                    ).toFloat().coerceIn(0f, 1f),
+                onValueChange = { value ->
+                    timelineScrubbing = true
+                    timelineScrubEpochMs = (
+                        rangeStart + (totalRangeMs.toDouble() * value.coerceIn(0f, 1f)).toLong()
+                        ).coerceIn(rangeStart, rangeEnd)
+                },
+                onValueChangeFinished = {
+                    timelineScrubbing = false
+                    onAction(ZCamUiAction.PlayRecordingAtEpoch(timelineScrubEpochMs))
+                },
+                valueRange = 0f..1f
+            )
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween
@@ -1017,6 +1112,10 @@ private fun RecordingTimelineCard(
             Text(
                 text = selectedEpochMs?.let { "Selected ${formatDateTime(it)}. Drag the timeline horizontally; tap any recorded block or event to seek." }
                     ?: "Drag the timeline horizontally. Gaps are real missing recording time; tapping a gap reports no recording.",
+                style = MaterialTheme.typography.bodySmall
+            )
+            Text(
+                text = "Blue markers: moving object. Red markers: camera interference.",
                 style = MaterialTheme.typography.bodySmall
             )
         }
@@ -1137,7 +1236,8 @@ private data class HistoryTickUi(
 
 private data class HistoryEventClusterUi(
     val epochMs: Long,
-    val count: Int
+    val count: Int,
+    val containsCameraTamper: Boolean
 )
 
 private const val MINUTE_MS = 60_000L
@@ -1209,7 +1309,8 @@ private fun clusterHistoryEvents(
         ) ?: currentEvents.first()
         clusters += HistoryEventClusterUi(
             epochMs = representative.epochMs,
-            count = currentEvents.size
+            count = currentEvents.size,
+            containsCameraTamper = currentEvents.any { it.type == "camera_tamper" }
         )
         currentEvents = mutableListOf()
     }
@@ -1279,15 +1380,5 @@ private fun resultToneColor(tone: StatusTone): ComposeColor {
         StatusTone.HEALTHY -> ComposeColor(0xFF1F7A3D)
         StatusTone.WARNING -> MaterialTheme.colorScheme.onSecondaryContainer
         StatusTone.ERROR -> MaterialTheme.colorScheme.error
-    }
-}
-
-private fun applyPlaybackSpeed(
-    mediaPlayer: android.media.MediaPlayer,
-    speed: Float
-) {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
-    runCatching {
-        mediaPlayer.playbackParams = mediaPlayer.playbackParams.setSpeed(speed)
     }
 }

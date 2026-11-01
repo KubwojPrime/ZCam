@@ -35,7 +35,6 @@ import com.zcam.core.domain.config.PreviewTransport
 import com.zcam.core.domain.config.RearCameraLens
 import com.zcam.core.domain.config.StreamConfig
 import com.zcam.core.domain.config.VideoResolution
-import com.zcam.core.domain.recording.RecordingEvent
 import com.zcam.core.domain.recording.RecordingEventStore
 import com.zcam.core.logging.ZCamLogger
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -79,7 +78,7 @@ class CameraRuntimeImpl @Inject constructor(
         Thread(runnable, "zcam-camera-analyzer").apply { isDaemon = true }
     }
     private val eventScope = CoroutineScope(SupervisorJob() + dispatchers.io)
-    private val motionEventDetector = MotionEventDetector(logger)
+    private val motionEventDetector = SceneEventDetector(logger)
 
     private val targetWidth = AtomicInteger(DEFAULT_WIDTH)
     private val targetHeight = AtomicInteger(DEFAULT_HEIGHT)
@@ -951,179 +950,6 @@ class CameraRuntimeImpl @Inject constructor(
         val jpeg: ByteArray,
         val nv21: ByteArray?
     )
-
-    private class MotionEventDetector(
-        private val logger: ZCamLogger
-    ) {
-        private var previousSamples = IntArray(0)
-        private var warmupFrames = 0
-        private var consecutiveHits = 0
-        private var lastEventEpochMs = 0L
-        private var sensitivity = SensitivityProfile.BALANCED
-
-        fun updateSensitivity(next: EventDetectionSensitivity) {
-            sensitivity = when (next) {
-                EventDetectionSensitivity.LOW -> SensitivityProfile.LOW
-                EventDetectionSensitivity.BALANCED -> SensitivityProfile.BALANCED
-                EventDetectionSensitivity.HIGH -> SensitivityProfile.HIGH
-            }
-            consecutiveHits = 0
-        }
-
-        fun currentSensitivity(): EventDetectionSensitivity {
-            return when (sensitivity) {
-                SensitivityProfile.LOW -> EventDetectionSensitivity.LOW
-                SensitivityProfile.BALANCED -> EventDetectionSensitivity.BALANCED
-                SensitivityProfile.HIGH -> EventDetectionSensitivity.HIGH
-            }
-        }
-
-        fun analyze(
-            image: ImageProxy,
-            eventEpochMs: Long
-        ): RecordingEvent? {
-            val samples = sampleLuma(image)
-            if (samples.isEmpty()) return null
-            if (previousSamples.isEmpty()) {
-                previousSamples = samples
-                warmupFrames = 1
-                return null
-            }
-
-            if (warmupFrames < WARMUP_FRAME_COUNT) {
-                previousSamples = samples
-                warmupFrames += 1
-                return null
-            }
-
-            val comparisons = minOf(previousSamples.size, samples.size)
-            if (comparisons == 0) {
-                previousSamples = samples
-                return null
-            }
-
-            var changedSamples = 0
-            var totalDelta = 0
-            var peakDelta = 0
-            for (index in 0 until comparisons) {
-                val delta = kotlin.math.abs(samples[index] - previousSamples[index])
-                totalDelta += delta
-                if (delta >= sensitivity.sampleDeltaThreshold) {
-                    changedSamples += 1
-                }
-                if (delta > peakDelta) {
-                    peakDelta = delta
-                }
-            }
-            previousSamples = samples
-
-            val averageDelta = totalDelta / comparisons.toFloat()
-            val changedRatio = changedSamples / comparisons.toFloat()
-            val hit = averageDelta >= sensitivity.averageDeltaThreshold &&
-                peakDelta >= sensitivity.peakDeltaThreshold &&
-                changedRatio >= sensitivity.changedSampleRatioThreshold
-
-            consecutiveHits = if (hit) {
-                (consecutiveHits + 1).coerceAtMost(sensitivity.consecutiveHitsRequired)
-            } else {
-                0
-            }
-
-            if (consecutiveHits < sensitivity.consecutiveHitsRequired) {
-                return null
-            }
-            if (eventEpochMs - lastEventEpochMs < sensitivity.eventCooldownMs) {
-                return null
-            }
-
-            consecutiveHits = 0
-            lastEventEpochMs = eventEpochMs
-            logger.d(
-                "Motion event sensitivity=${sensitivity.label} averageDelta=$averageDelta " +
-                    "peakDelta=$peakDelta changedRatio=$changedRatio " +
-                    "thresholds(avg=${sensitivity.averageDeltaThreshold}, peak=${sensitivity.peakDeltaThreshold}, " +
-                    "ratio=${sensitivity.changedSampleRatioThreshold})"
-            )
-            return RecordingEvent(
-                epochMs = eventEpochMs,
-                confidencePercent = (averageDelta * 2.5f).toInt().coerceIn(1, 100),
-                source = "motion:${sensitivity.label}"
-            )
-        }
-
-        private fun sampleLuma(image: ImageProxy): IntArray {
-            val plane = image.planes.firstOrNull() ?: return IntArray(0)
-            val buffer = plane.buffer.duplicate()
-            val rowStride = plane.rowStride
-            val pixelStride = plane.pixelStride.coerceAtLeast(1)
-            val width = image.width
-            val height = image.height
-            if (width <= 0 || height <= 0 || !buffer.hasRemaining()) return IntArray(0)
-
-            val xStep = (width / SAMPLE_COLUMNS).coerceAtLeast(MIN_SAMPLE_STEP)
-            val yStep = (height / SAMPLE_ROWS).coerceAtLeast(MIN_SAMPLE_STEP)
-            val samples = ArrayList<Int>(SAMPLE_COLUMNS * SAMPLE_ROWS)
-            var y = 0
-            while (y < height) {
-                val rowBase = y * rowStride
-                var x = 0
-                while (x < width) {
-                    val index = rowBase + (x * pixelStride)
-                    if (index < buffer.limit()) {
-                        samples += (buffer.get(index).toInt() and 0xFF)
-                    }
-                    x += xStep
-                }
-                y += yStep
-            }
-            return samples.toIntArray()
-        }
-
-        private enum class SensitivityProfile(
-            val label: String,
-            val consecutiveHitsRequired: Int,
-            val sampleDeltaThreshold: Int,
-            val averageDeltaThreshold: Float,
-            val peakDeltaThreshold: Int,
-            val changedSampleRatioThreshold: Float,
-            val eventCooldownMs: Long
-        ) {
-            LOW(
-                label = "low",
-                consecutiveHitsRequired = 5,
-                sampleDeltaThreshold = 34,
-                averageDeltaThreshold = 24f,
-                peakDeltaThreshold = 70,
-                changedSampleRatioThreshold = 0.45f,
-                eventCooldownMs = 25_000L
-            ),
-            BALANCED(
-                label = "balanced",
-                consecutiveHitsRequired = 4,
-                sampleDeltaThreshold = 28,
-                averageDeltaThreshold = 18f,
-                peakDeltaThreshold = 54,
-                changedSampleRatioThreshold = 0.35f,
-                eventCooldownMs = 15_000L
-            ),
-            HIGH(
-                label = "high",
-                consecutiveHitsRequired = 3,
-                sampleDeltaThreshold = 20,
-                averageDeltaThreshold = 12f,
-                peakDeltaThreshold = 38,
-                changedSampleRatioThreshold = 0.22f,
-                eventCooldownMs = 10_000L
-            )
-        }
-
-        private companion object {
-            const val SAMPLE_COLUMNS = 14
-            const val SAMPLE_ROWS = 10
-            const val MIN_SAMPLE_STEP = 8
-            const val WARMUP_FRAME_COUNT = 8
-        }
-    }
 
     private companion object {
         private const val DEFAULT_WIDTH = 1280

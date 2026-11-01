@@ -53,10 +53,18 @@ data class RecordingEventUi(
     val epochMs: Long,
     val confidencePercent: Int,
     val source: String,
+    val type: String,
     val recordingFileName: String?,
     val recordingStartedAtEpochMs: Long?,
     val recordingEndedAtEpochMs: Long?,
     val recordingOffsetMs: Long?
+)
+
+data class RecordingPlaybackItemUi(
+    val fileName: String,
+    val url: String,
+    val startedAtEpochMs: Long,
+    val durationMs: Long
 )
 
 data class RecordingsUiState(
@@ -71,6 +79,9 @@ data class RecordingsUiState(
     val selectedPlaybackUrl: String = "",
     val selectedPlaybackOffsetMs: Long = 0L,
     val selectedPlaybackSourceLabel: String = "",
+    val playbackItems: List<RecordingPlaybackItemUi> = emptyList(),
+    val playbackHeaders: Map<String, String> = emptyMap(),
+    val playbackSeekRequestId: Long = 0L,
     val playbackLoading: Boolean = false,
     val playbackLoadingMessage: String = "",
     val playbackDownloadedBytes: Long = 0L,
@@ -240,6 +251,8 @@ sealed interface ZCamUiAction {
         val seekToEpochMs: Long? = null
     ) : ZCamUiAction
     data class PlayRecordingAtEpoch(val epochMs: Long) : ZCamUiAction
+    data class RecordingPlaybackProgress(val fileName: String, val positionMs: Long) : ZCamUiAction
+    data class RecordingPlaybackSegmentChanged(val fileName: String) : ZCamUiAction
     data class DownloadRecording(val fileName: String) : ZCamUiAction
 
     data object RequestPairingQr : ZCamUiAction

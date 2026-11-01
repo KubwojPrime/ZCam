@@ -101,7 +101,6 @@ class ZCamMainViewModel @Inject constructor(
     private var localRearLensCatalog: RearCameraLensCatalog = RearCameraLensCatalog()
     private var volumeSyncJob: Job? = null
     private var clientSessionSyncJob: Job? = null
-    private var playbackLoadJob: Job? = null
     private var recordingDownloadJob: Job? = null
 
     init {
@@ -136,7 +135,6 @@ class ZCamMainViewModel @Inject constructor(
                     viewModelScope.launch(dispatchers.io) {
                         localAudioTransport.stopAll()
                     }
-                    playbackLoadJob?.cancel()
                     recordingDownloadJob?.cancel()
                 }
                 _state.update { current ->
@@ -196,6 +194,26 @@ class ZCamMainViewModel @Inject constructor(
             ZCamUiAction.FetchRecordings -> fetchRecordingsForRange()
             is ZCamUiAction.PlayRecording -> playRecording(action.fileName, action.seekToEpochMs)
             is ZCamUiAction.PlayRecordingAtEpoch -> playRecordingAtEpoch(action.epochMs)
+            is ZCamUiAction.RecordingPlaybackProgress -> _state.update { current ->
+                if (current.recordings.selectedFileName != action.fileName) current else current.copy(
+                    recordings = current.recordings.copy(
+                        selectedPlaybackOffsetMs = action.positionMs.coerceAtLeast(0L)
+                    )
+                )
+            }
+            is ZCamUiAction.RecordingPlaybackSegmentChanged -> _state.update { current ->
+                val item = current.recordings.items.firstOrNull { it.fileName == action.fileName }
+                if (item == null) current else current.copy(
+                    recordings = current.recordings.copy(
+                        selectedFileName = item.fileName,
+                        selectedPlaybackUrl = current.recordings.playbackItems
+                            .firstOrNull { it.fileName == item.fileName }
+                            ?.url
+                            .orEmpty(),
+                        selectedPlaybackOffsetMs = 0L
+                    )
+                )
+            }
             is ZCamUiAction.DownloadRecording -> downloadRecordingToDevice(action.fileName)
 
             ZCamUiAction.RequestPairingQr -> requestPairingQr()
@@ -1133,13 +1151,20 @@ class ZCamMainViewModel @Inject constructor(
                         val selectedFileName = it.recordings.selectedFileName
                             .takeIf { fileName -> items.any { item -> item.fileName == fileName } }
                             ?: items.firstOrNull()?.fileName.orEmpty()
-                        val selectedItem = items.firstOrNull { item -> item.fileName == selectedFileName }
-                        val cachedPlaybackUrl = selectedItem?.let(::cachedPlaybackUrlFor)
-                        val preservedPlaybackUrl = if (selectedFileName.isNotBlank() && selectedFileName == it.recordings.selectedFileName) {
-                            it.recordings.selectedPlaybackUrl.ifBlank { cachedPlaybackUrl.orEmpty() }
-                        } else {
-                            cachedPlaybackUrl.orEmpty()
-                        }
+                        val playbackItems = items
+                            .sortedBy(com.zcam.ui.RecordingItemUi::startedAtEpochMs)
+                            .map { item ->
+                                com.zcam.ui.RecordingPlaybackItemUi(
+                                    fileName = item.fileName,
+                                    url = localClient.buildRecordingPlaybackUrl(target, item.fileName),
+                                    startedAtEpochMs = item.startedAtEpochMs,
+                                    durationMs = item.durationMs
+                                )
+                            }
+                        val selectedPlaybackUrl = playbackItems
+                            .firstOrNull { item -> item.fileName == selectedFileName }
+                            ?.url
+                            .orEmpty()
                         val resultMessage = buildString {
                             append("Found ${items.size} recording(s)")
                             if (eventsFailureReason == null) {
@@ -1156,33 +1181,19 @@ class ZCamMainViewModel @Inject constructor(
                                 items = items,
                                 events = events,
                                 selectedFileName = selectedFileName,
-                                selectedPlaybackUrl = preservedPlaybackUrl,
+                                selectedPlaybackUrl = selectedPlaybackUrl,
                                 selectedPlaybackOffsetMs = if (selectedFileName == it.recordings.selectedFileName) {
                                     it.recordings.selectedPlaybackOffsetMs
                                 } else {
                                     0L
                                 },
                                 selectedPlaybackSourceLabel = recordingSourceLabel(target),
-                                playbackLoading = if (selectedFileName == it.recordings.selectedFileName) {
-                                    it.recordings.playbackLoading
-                                } else {
-                                    false
-                                },
-                                playbackLoadingMessage = if (selectedFileName == it.recordings.selectedFileName) {
-                                    it.recordings.playbackLoadingMessage
-                                } else {
-                                    ""
-                                },
-                                playbackDownloadedBytes = if (selectedFileName == it.recordings.selectedFileName) {
-                                    it.recordings.playbackDownloadedBytes
-                                } else {
-                                    0L
-                                },
-                                playbackTotalBytes = if (selectedFileName == it.recordings.selectedFileName) {
-                                    it.recordings.playbackTotalBytes
-                                } else {
-                                    null
-                                }
+                                playbackItems = playbackItems,
+                                playbackHeaders = localClient.recordingPlaybackHeaders(target),
+                                playbackLoading = false,
+                                playbackLoadingMessage = "",
+                                playbackDownloadedBytes = 0L,
+                                playbackTotalBytes = null
                             ),
                             errorMessage = null
                         )
@@ -1210,9 +1221,8 @@ class ZCamMainViewModel @Inject constructor(
         val current = state.value
         val item = current.recordings.items.firstOrNull { it.fileName == fileName } ?: return
         val offsetMs = seekToEpochMs?.let { (it - item.startedAtEpochMs).coerceAtLeast(0L) } ?: 0L
-        val cachedPlaybackUrl = cachedPlaybackUrlFor(item)
         val target = currentTargetForCommands()
-        val playbackUrl = cachedPlaybackUrl.orEmpty()
+        val playbackUrl = localClient.buildRecordingPlaybackUrl(target, fileName)
 
         _state.update {
             it.copy(
@@ -1221,100 +1231,15 @@ class ZCamMainViewModel @Inject constructor(
                     selectedPlaybackUrl = playbackUrl,
                     selectedPlaybackOffsetMs = offsetMs.coerceAtMost(item.durationMs),
                     selectedPlaybackSourceLabel = recordingSourceLabel(target),
-                    playbackLoading = cachedPlaybackUrl == null,
-                    playbackLoadingMessage = if (cachedPlaybackUrl == null) "Loading video from server..." else "",
-                    playbackDownloadedBytes = if (cachedPlaybackUrl == null) 0L else item.sizeBytes,
-                    playbackTotalBytes = if (cachedPlaybackUrl == null) item.sizeBytes.takeIf { it > 0L } else item.sizeBytes
+                    playbackHeaders = localClient.recordingPlaybackHeaders(target),
+                    playbackLoading = false,
+                    playbackLoadingMessage = "",
+                    playbackDownloadedBytes = 0L,
+                    playbackTotalBytes = null,
+                    playbackSeekRequestId = it.recordings.playbackSeekRequestId + 1L
                 ),
                 errorMessage = null
             )
-        }
-
-        if (cachedPlaybackUrl != null) {
-            return
-        }
-
-        playbackLoadJob?.cancel()
-        playbackLoadJob = viewModelScope.launch(dispatchers.io) {
-            val cacheFile = playbackCacheFile(fileName)
-            val tempFile = File(cacheFile.parentFile, "${cacheFile.name}.part")
-            tempFile.parentFile?.mkdirs()
-            tempFile.delete()
-
-            val downloadResult = runCatching {
-                localClient.downloadRecording(
-                    target = target,
-                    fileName = fileName,
-                    destination = tempFile.outputStream()
-                ) { downloadedBytes, totalBytes ->
-                    _state.update { latest ->
-                        if (latest.recordings.selectedFileName != fileName) {
-                            latest
-                        } else {
-                            latest.copy(
-                                recordings = latest.recordings.copy(
-                                    playbackLoading = true,
-                                    playbackLoadingMessage = "Loading video from server...",
-                                    playbackDownloadedBytes = downloadedBytes,
-                                    playbackTotalBytes = totalBytes ?: item.sizeBytes.takeIf { it > 0L }
-                                )
-                            )
-                        }
-                    }
-                }
-            }.getOrElse { error ->
-                tempFile.delete()
-                ClientCallResult.Failure(
-                    code = null,
-                    reason = "io_error",
-                    responseBody = error.message
-                )
-            }
-
-            when (downloadResult) {
-                is ClientCallResult.Success -> {
-                    tempFile.copyTo(cacheFile, overwrite = true)
-                    tempFile.delete()
-                    val completedUrl = Uri.fromFile(cacheFile).toString()
-                    _state.update { latest ->
-                        if (latest.recordings.selectedFileName != fileName) {
-                            latest
-                        } else {
-                            latest.copy(
-                                recordings = latest.recordings.copy(
-                                    selectedPlaybackUrl = completedUrl,
-                                    playbackLoading = false,
-                                    playbackLoadingMessage = "",
-                                    playbackDownloadedBytes = item.sizeBytes,
-                                    playbackTotalBytes = item.sizeBytes
-                                ),
-                                errorMessage = null
-                            )
-                        }
-                    }
-                }
-
-                is ClientCallResult.Failure -> {
-                    tempFile.delete()
-                    val fallbackUrl = localClient.buildRecordingPlaybackUrl(target, fileName)
-                    _state.update { latest ->
-                        if (latest.recordings.selectedFileName != fileName) {
-                            latest
-                        } else {
-                            latest.copy(
-                                recordings = latest.recordings.copy(
-                                    selectedPlaybackUrl = fallbackUrl,
-                                    playbackLoading = false,
-                                    playbackLoadingMessage = "Video load failed. Falling back to direct playback.",
-                                    playbackDownloadedBytes = 0L,
-                                    playbackTotalBytes = null
-                                ),
-                                errorMessage = "Playback load failed: ${downloadResult.reason}${downloadResult.responseBody?.let { body -> " ($body)" } ?: ""}"
-                            )
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -1720,6 +1645,7 @@ class ZCamMainViewModel @Inject constructor(
                 epochMs = event.epochMs,
                 confidencePercent = event.confidencePercent,
                 source = event.source,
+                type = event.type,
                 recordingFileName = matchedItem?.fileName ?: event.recordingFileName,
                 recordingStartedAtEpochMs = startedAtEpochMs,
                 recordingEndedAtEpochMs = endedAtEpochMs,
@@ -1759,16 +1685,6 @@ class ZCamMainViewModel @Inject constructor(
 
     private fun playbackCacheFile(fileName: String): File {
         return File(appContext.cacheDir, "zcam/playback/$fileName")
-    }
-
-    private fun cachedPlaybackUrlFor(item: com.zcam.ui.RecordingItemUi): String? {
-        val file = playbackCacheFile(item.fileName)
-        if (!file.exists() || !file.isFile) return null
-        if (item.sizeBytes > 0L && file.length() != item.sizeBytes) {
-            file.delete()
-            return null
-        }
-        return Uri.fromFile(file).toString()
     }
 
     private fun createRecordingDownloadDestination(item: com.zcam.ui.RecordingItemUi): RecordingDownloadDestination? {
@@ -2147,7 +2063,6 @@ class ZCamMainViewModel @Inject constructor(
     }
 
     override fun onCleared() {
-        playbackLoadJob?.cancel()
         recordingDownloadJob?.cancel()
         viewModelScope.launch(dispatchers.io) {
             localAudioTransport.stopAll()

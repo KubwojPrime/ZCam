@@ -33,11 +33,13 @@ class ProcessWatchdogManager @Inject constructor(
     private val logger: ZCamLogger
 ) : WatchdogManager {
 
+    internal var currentTimeMillis: () -> Long = System::currentTimeMillis
+
     private val scope = CoroutineScope(SupervisorJob() + dispatchers.default)
     private val _health = MutableStateFlow(
         WatchdogHealthSnapshot(
             started = false,
-            generatedAtEpochMs = System.currentTimeMillis(),
+            generatedAtEpochMs = currentTimeMillis(),
             components = emptyMap()
         )
     )
@@ -52,7 +54,7 @@ class ProcessWatchdogManager @Inject constructor(
         if (watchJob?.isActive == true) return@withContext
 
         _health.update {
-            it.copy(started = true, generatedAtEpochMs = System.currentTimeMillis())
+            it.copy(started = true, generatedAtEpochMs = currentTimeMillis())
         }
 
         watchJob = scope.launch {
@@ -68,7 +70,7 @@ class ProcessWatchdogManager @Inject constructor(
         watchJob?.cancel()
         watchJob = null
 
-        val now = System.currentTimeMillis()
+        val now = currentTimeMillis()
         _health.update { snapshot ->
             snapshot.copy(
                 started = false,
@@ -87,7 +89,7 @@ class ProcessWatchdogManager @Inject constructor(
     }
 
     override suspend fun registerComponent(component: String, timeoutMs: Long) = withContext(dispatchers.default) {
-        val now = System.currentTimeMillis()
+        val now = currentTimeMillis()
         _health.update { snapshot ->
             snapshot.copy(
                 generatedAtEpochMs = now,
@@ -109,7 +111,7 @@ class ProcessWatchdogManager @Inject constructor(
         status: WatchdogComponentStatus,
         details: String?
     ) = withContext(dispatchers.default) {
-        val now = System.currentTimeMillis()
+        val now = currentTimeMillis()
         _health.update { snapshot ->
             val existing = snapshot.components[component] ?: WatchdogComponentHealth(component = component)
             snapshot.copy(
@@ -126,7 +128,7 @@ class ProcessWatchdogManager @Inject constructor(
     }
 
     override suspend fun heartbeat(component: String) = withContext(dispatchers.default) {
-        val now = System.currentTimeMillis()
+        val now = currentTimeMillis()
         _health.update { snapshot ->
             val existing = snapshot.components[component] ?: WatchdogComponentHealth(component = component)
             snapshot.copy(
@@ -153,7 +155,7 @@ class ProcessWatchdogManager @Inject constructor(
     }
 
     private suspend fun evaluateStaleComponents() {
-        val now = System.currentTimeMillis()
+        val now = currentTimeMillis()
         val snapshot = _health.value
         if (!snapshot.started) return
 

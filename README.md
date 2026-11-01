@@ -125,11 +125,26 @@ authenticated API, and are capped at 200 retained frames. Notifications depend
 on network reachability, notification permission, and Android allowing the
 client monitor service to run.
 
+Event detection uses an adaptive low-resolution background model and spatial
+motion regions instead of whole-frame brightness sampling. Localized movement
+is reported as `object_motion`, while global scene displacement, lens covering,
+or a sudden loss of scene detail is reported as `camera_tamper`. Existing
+event index entries remain readable and are treated as object motion.
+
 The client can request a restart of a reachable server through the authenticated
 API. The server acknowledges the request, then restarts its runtime. If Android
 has killed the entire server process, no LAN listener remains to receive a
 request; the client reports that the server is unreachable. This local-only
 mode cannot guarantee remote wake after a full process kill or force-stop.
+
+## Recording Playback
+
+Client playback uses Media3 and streams finalized MP4 segments directly from
+the authenticated server endpoint with HTTP byte ranges. Loaded segments form
+one playlist, so the global time slider can seek between recordings without
+downloading complete files first. The separate Download command still saves a
+full copy to the client device. Seeking over a slow link can briefly buffer,
+but it requests only the required media range and keeps the timeline available.
 
 ## Security Model
 

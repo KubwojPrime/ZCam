@@ -175,6 +175,7 @@ class LocalLoopRecordingManager @Inject constructor(
                 epochMs = event.epochMs,
                 confidencePercent = event.confidencePercent,
                 source = event.source,
+                type = event.type.wireName,
                 recordingFileName = matchedSegment?.fileName,
                 recordingStartedAtEpochMs = matchedSegment?.startedAtEpochMs,
                 recordingEndedAtEpochMs = matchedSegment?.endedAtEpochMs,

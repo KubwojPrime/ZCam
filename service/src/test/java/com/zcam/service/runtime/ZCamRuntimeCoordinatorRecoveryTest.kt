@@ -4,6 +4,7 @@ import com.zcam.audio.PushToTalkManager
 import com.zcam.audio.AudioTransportConfig
 import com.zcam.camera.CameraRuntime
 import com.zcam.core.dispatchers.DispatcherProvider
+import com.zcam.core.domain.config.EventDetectionSensitivity
 import com.zcam.core.domain.config.FeatureFlags
 import com.zcam.core.domain.config.RearCameraLens
 import com.zcam.core.domain.config.RuntimeSettings
@@ -738,6 +739,8 @@ class ZCamRuntimeCoordinatorRecoveryTest {
 
         override fun latestFrame(): ByteArray = byteArrayOf(0)
 
+        override suspend fun setEventDetectionSensitivity(sensitivity: EventDetectionSensitivity) = Unit
+
         override suspend fun setTorch(enabled: Boolean): com.zcam.camera.CameraControlCommandResult {
             return com.zcam.camera.CameraControlCommandResult.Success(
                 snapshot = controlsSnapshot(),
@@ -789,6 +792,8 @@ class ZCamRuntimeCoordinatorRecoveryTest {
         override suspend fun isHealthy(): Boolean = healthy
 
         override fun latestFrame(): ByteArray = byteArrayOf(1)
+
+        override suspend fun setEventDetectionSensitivity(sensitivity: EventDetectionSensitivity) = Unit
 
         override suspend fun setTorch(enabled: Boolean): com.zcam.camera.CameraControlCommandResult {
             return com.zcam.camera.CameraControlCommandResult.Success(

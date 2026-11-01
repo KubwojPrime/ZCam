@@ -88,6 +88,7 @@ data class ClientRecordingEvent(
     val epochMs: Long,
     val confidencePercent: Int,
     val source: String,
+    val type: String,
     val recordingFileName: String?,
     val recordingStartedAtEpochMs: Long?,
     val recordingEndedAtEpochMs: Long?,
@@ -162,6 +163,7 @@ interface LocalClient {
     ): ClientCallResult<List<ClientRecordingEvent>>
 
     fun buildRecordingPlaybackUrl(target: ClientTarget, fileName: String): String
+    fun recordingPlaybackHeaders(target: ClientTarget): Map<String, String>
 
     suspend fun downloadRecording(
         target: ClientTarget,

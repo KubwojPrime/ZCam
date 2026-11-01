@@ -101,10 +101,13 @@ class ClientEventMonitorService : Service() {
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+        val cameraTamper = event.type.equals("camera_tamper", ignoreCase = true)
         val builder = NotificationCompat.Builder(this, EVENT_CHANNEL)
             .setSmallIcon(android.R.drawable.ic_menu_camera)
-            .setContentTitle("Motion detected")
-            .setContentText("ZCam server: ${target.host}")
+            .setContentTitle(if (cameraTamper) "Camera interference detected" else "Moving object detected")
+            .setContentText(
+                if (cameraTamper) "Check the ZCam camera at ${target.host}" else "ZCam server: ${target.host}"
+            )
             .setContentIntent(openIntent)
             .setAutoCancel(true)
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)

@@ -41,6 +41,9 @@ dependencies {
     implementation(libs.androidx.compose.runtime)
     implementation(libs.okhttp)
     implementation(libs.zxing.core)
+    implementation(libs.androidx.media3.exoplayer)
+    implementation(libs.androidx.media3.datasource.okhttp)
+    implementation(libs.androidx.media3.ui)
 
     debugImplementation(libs.androidx.compose.ui.tooling)
 }

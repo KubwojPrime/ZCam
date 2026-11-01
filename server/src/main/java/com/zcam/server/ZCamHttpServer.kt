@@ -1280,6 +1280,7 @@ class ZCamHttpServer @Inject constructor(
             append("\"epochMs\":").append(event.epochMs).append(',')
             append("\"confidencePercent\":").append(event.confidencePercent).append(',')
             append("\"source\":").append(jsonString(event.source)).append(',')
+            append("\"type\":").append(jsonString(event.type)).append(',')
             append("\"recordingFileName\":").append(jsonString(event.recordingFileName)).append(',')
             append("\"recordingStartedAtEpochMs\":").append(event.recordingStartedAtEpochMs?.toString() ?: "null").append(',')
             append("\"recordingEndedAtEpochMs\":").append(event.recordingEndedAtEpochMs?.toString() ?: "null").append(',')

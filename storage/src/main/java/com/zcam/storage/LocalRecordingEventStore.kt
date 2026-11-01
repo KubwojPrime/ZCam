@@ -5,6 +5,7 @@ import android.os.Environment
 import com.zcam.core.dispatchers.DispatcherProvider
 import com.zcam.core.domain.recording.RecordingEvent
 import com.zcam.core.domain.recording.RecordingEventStore
+import com.zcam.core.domain.recording.RecordingEventType
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -25,7 +26,8 @@ class LocalRecordingEventStore @Inject constructor(
         val normalized = RecordingEvent(
             epochMs = event.epochMs.coerceAtLeast(0L),
             confidencePercent = event.confidencePercent.coerceIn(1, 100),
-            source = event.source.trim().ifBlank { DEFAULT_SOURCE }.take(MAX_SOURCE_LENGTH)
+            source = event.source.trim().ifBlank { DEFAULT_SOURCE }.take(MAX_SOURCE_LENGTH),
+            type = event.type
         )
         mutex.withLock {
             if (frameJpeg != null && frameJpeg.size in 4..MAX_FRAME_BYTES &&
@@ -51,6 +53,8 @@ class LocalRecordingEventStore @Inject constructor(
                     append(normalized.confidencePercent)
                     append('\t')
                     append(normalized.source)
+                    append('\t')
+                    append(normalized.type.wireName)
                     append('\n')
                 }
             )
@@ -101,7 +105,8 @@ class LocalRecordingEventStore @Inject constructor(
                         listOf(
                             event.epochMs.toString(),
                             event.confidencePercent.toString(),
-                            event.source
+                            event.source,
+                            event.type.wireName
                         ).joinToString("\t")
                     } + "\n"
                 )
@@ -140,10 +145,14 @@ class LocalRecordingEventStore @Inject constructor(
         val confidence = parts[1].toIntOrNull() ?: return null
         val source = parts[2].trim()
         if (source.isBlank()) return null
+        val type = parts.getOrNull(3)
+            ?.let(RecordingEventType::fromWireName)
+            ?: RecordingEventType.fromSource(source)
         return RecordingEvent(
             epochMs = epochMs.coerceAtLeast(0L),
             confidencePercent = confidence.coerceIn(1, 100),
-            source = source.take(MAX_SOURCE_LENGTH)
+            source = source.take(MAX_SOURCE_LENGTH),
+            type = type
         )
     }
 
