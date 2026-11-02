@@ -3,12 +3,12 @@
 ZCam is a local-first Android camera and audio monitoring app designed for
 long-running LAN/VPN operation without a cloud backend.
 
-Current public release: `0.2.9`.
+Current public release: `0.2.11`.
 
 Project status: pre-1.0 hardening. The app already contains the core runtime
 architecture, local HTTP API, pairing, recording, watchdog/recovery, and client
-mode. Before `1.0`, release signing, security defaults, final QA, and store/user
-documentation must be completed.
+mode. Before `1.0`, security defaults, final QA, and store/user documentation
+must be completed.
 
 ## What ZCam Does
 
@@ -229,9 +229,11 @@ Useful commands:
 .\gradlew.bat :app:assembleRelease
 ```
 
-The current release build is signed with the debug signing config. This is
-acceptable for internal pre-1.0 test builds, but it is a blocker for a formal
-`1.0` release.
+Release builds use a dedicated private signing key. Copy
+`keystore.properties.example` to the ignored `keystore.properties` file and
+provide the local key path, alias, and passwords before running
+`:app:assembleRelease`. Never commit either file containing secrets or the
+keystore itself.
 
 ## Tests
 
