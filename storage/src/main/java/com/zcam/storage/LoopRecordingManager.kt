@@ -36,6 +36,7 @@ data class RecordingClipSummary(
 
 data class RecordingEventSummary(
     val epochMs: Long,
+    val endedAtEpochMs: Long = epochMs,
     val confidencePercent: Int,
     val source: String,
     val type: String = "object_motion",
@@ -43,4 +44,6 @@ data class RecordingEventSummary(
     val recordingStartedAtEpochMs: Long? = null,
     val recordingEndedAtEpochMs: Long? = null,
     val recordingOffsetMs: Long? = null
-)
+) {
+    val durationMs: Long = (endedAtEpochMs - epochMs).coerceAtLeast(0L)
+}

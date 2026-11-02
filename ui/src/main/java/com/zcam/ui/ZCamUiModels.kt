@@ -51,6 +51,8 @@ data class RecordingItemUi(
 
 data class RecordingEventUi(
     val epochMs: Long,
+    val endedAtEpochMs: Long,
+    val durationMs: Long,
     val confidencePercent: Int,
     val source: String,
     val type: String,

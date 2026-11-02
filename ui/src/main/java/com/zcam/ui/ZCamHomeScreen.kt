@@ -5,6 +5,7 @@ import android.graphics.Color
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -1191,7 +1192,8 @@ private fun PreviewCard(state: ZCamUiState) {
                 fallbackFrameJpeg = state.previewFrameJpeg,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(210.dp)
+                    .aspectRatio(16f / 9f),
+                containPreview = true
             )
             if (state.mode == ZCamMode.CLIENT) {
                 OutlinedButton(

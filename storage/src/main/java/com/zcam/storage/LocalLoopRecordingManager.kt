@@ -173,6 +173,7 @@ class LocalLoopRecordingManager @Inject constructor(
             val matchedSegment = matchSegmentForEvent(catalog.segments, event.epochMs)
             RecordingEventSummary(
                 epochMs = event.epochMs,
+                endedAtEpochMs = event.endedAtEpochMs,
                 confidencePercent = event.confidencePercent,
                 source = event.source,
                 type = event.type.wireName,

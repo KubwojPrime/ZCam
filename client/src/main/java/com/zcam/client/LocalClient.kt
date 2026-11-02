@@ -86,6 +86,8 @@ data class ClientRecordingSummary(
 
 data class ClientRecordingEvent(
     val epochMs: Long,
+    val endedAtEpochMs: Long,
+    val durationMs: Long,
     val confidencePercent: Int,
     val source: String,
     val type: String,

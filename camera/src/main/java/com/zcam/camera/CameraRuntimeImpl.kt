@@ -13,9 +13,13 @@ import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.core.CameraInfo
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.CameraControl
+import androidx.camera.core.AspectRatio
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FileOutputOptions
 import androidx.camera.video.Quality
@@ -102,12 +106,20 @@ class CameraRuntimeImpl @Inject constructor(
     private val previewTransport = AtomicReference(PreviewTransport.H264)
     private val previewEncoder = H264PreviewEncoderController(logger)
     private val recordingTargetRotation = AtomicInteger(Surface.ROTATION_90)
+    private val recordingLandscape = AtomicBoolean(true)
     private val deviceOrientationDegrees = AtomicInteger(OrientationEventListener.ORIENTATION_UNKNOWN)
     private val orientationListener by lazy {
         object : OrientationEventListener(appContext) {
             override fun onOrientationChanged(orientation: Int) {
                 if (orientation != OrientationEventListener.ORIENTATION_UNKNOWN) {
                     deviceOrientationDegrees.set(orientation)
+                    recordingTargetRotation.set(
+                        targetRotationForOrientation(
+                            orientationDegrees = orientation,
+                            prefersLandscape = recordingLandscape.get(),
+                            fallback = recordingTargetRotation.get()
+                        )
+                    )
                 }
             }
         }
@@ -174,11 +186,16 @@ class CameraRuntimeImpl @Inject constructor(
                 height = config.resolution.height,
                 fps = normalizedFps
             )
+            recordingLandscape.set(config.resolution.width >= config.resolution.height)
             val targetRotation = determineStableTargetRotation(
                 width = config.resolution.width,
                 height = config.resolution.height
             )
             val previewTargetRotation = FIXED_PREVIEW_TARGET_ROTATION
+            val previewResolutionSelector = resolutionSelector(normalizedPreviewSize)
+            val recordingResolutionSelector = resolutionSelector(
+                normalizePreviewSize(config.resolution.width, config.resolution.height)
+            )
             val selectedLensBinding = resolveLensBinding(
                 selectedLens = config.rearLens,
                 catalog = rearLensCatalog
@@ -193,7 +210,7 @@ class CameraRuntimeImpl @Inject constructor(
                 provider.unbindAll()
 
                 val preview = Preview.Builder()
-                    .setTargetResolution(normalizedPreviewSize)
+                    .setResolutionSelector(previewResolutionSelector)
                     .setTargetRotation(previewTargetRotation)
                     .build()
                     .also { useCase ->
@@ -202,7 +219,7 @@ class CameraRuntimeImpl @Inject constructor(
 
                 val analysis = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .setTargetResolution(normalizedPreviewSize)
+                    .setResolutionSelector(previewResolutionSelector)
                     .setTargetRotation(previewTargetRotation)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_NV21)
                     .build()
@@ -211,13 +228,14 @@ class CameraRuntimeImpl @Inject constructor(
                     .setTargetVideoEncodingBitRate(targetRecordingBitrate)
                     .setQualitySelector(
                         QualitySelector.fromOrderedList(
-                            listOf(Quality.HD, Quality.FHD, Quality.SD, Quality.LOWEST)
+                            recordingQualityOrder(config.resolution)
                         )
                     )
                     .build()
-                val videoCapture = VideoCapture.withOutput(recorder).also { useCase ->
-                    useCase.targetRotation = targetRotation
-                }
+                val videoCapture = VideoCapture.Builder(recorder)
+                    .setResolutionSelector(recordingResolutionSelector)
+                    .setTargetRotation(targetRotation)
+                    .build()
 
                 analysis.setAnalyzer(cameraExecutor) { image ->
                     analyzeFrame(image, encoder, minFrameIntervalMs)
@@ -476,7 +494,12 @@ class CameraRuntimeImpl @Inject constructor(
 
             val videoCapture = videoCaptureUseCase ?: error("VideoCapture is not bound.")
             outputFile.parentFile?.mkdirs()
-            videoCapture.targetRotation = recordingTargetRotation.get()
+            val segmentRotation = determineStableTargetRotation(
+                width = if (recordingLandscape.get()) 2 else 1,
+                height = if (recordingLandscape.get()) 1 else 2
+            )
+            recordingTargetRotation.set(segmentRotation)
+            videoCapture.targetRotation = segmentRotation
 
             val finalizeDeferred = CompletableDeferred<VideoSegmentResult>()
             activeRecordingFinalize = finalizeDeferred
@@ -690,43 +713,11 @@ class CameraRuntimeImpl @Inject constructor(
         width: Int,
         height: Int
     ): Int {
-        val orientationDegrees = deviceOrientationDegrees.get()
-        val prefersLandscape = width >= height
-        return if (prefersLandscape) {
-            nearestRotation(
-                orientationDegrees = orientationDegrees,
-                candidates = intArrayOf(Surface.ROTATION_90, Surface.ROTATION_270),
-                fallback = Surface.ROTATION_90
-            )
-        } else {
-            nearestRotation(
-                orientationDegrees = orientationDegrees,
-                candidates = intArrayOf(Surface.ROTATION_0, Surface.ROTATION_180),
-                fallback = Surface.ROTATION_0
-            )
-        }
-    }
-
-    private fun nearestRotation(
-        orientationDegrees: Int,
-        candidates: IntArray,
-        fallback: Int
-    ): Int {
-        if (orientationDegrees !in 0..359) return fallback
-        return candidates.minByOrNull { candidate ->
-            angularDistanceDegrees(
-                orientationDegrees = orientationDegrees,
-                candidateDegrees = rotationToDegrees(candidate)
-            )
-        } ?: fallback
-    }
-
-    private fun angularDistanceDegrees(
-        orientationDegrees: Int,
-        candidateDegrees: Int
-    ): Int {
-        val rawDistance = kotlin.math.abs(orientationDegrees - candidateDegrees)
-        return minOf(rawDistance, 360 - rawDistance)
+        return targetRotationForOrientation(
+            orientationDegrees = deviceOrientationDegrees.get(),
+            prefersLandscape = width >= height,
+            fallback = if (width >= height) Surface.ROTATION_90 else Surface.ROTATION_0
+        )
     }
 
     private fun rotationToDegrees(rotation: Int): Int {
@@ -747,6 +738,34 @@ class CameraRuntimeImpl @Inject constructor(
         val landscapeWidth = maxOf(safeWidth, safeHeight).makeEven()
         val landscapeHeight = minOf(safeWidth, safeHeight).makeEven()
         return Size(landscapeWidth, landscapeHeight)
+    }
+
+    private fun resolutionSelector(target: Size): ResolutionSelector {
+        val targetRatio = target.width.toDouble() / target.height.toDouble()
+        val preferredAspectRatio = if (
+            kotlin.math.abs(targetRatio - (16.0 / 9.0)) <= kotlin.math.abs(targetRatio - (4.0 / 3.0))
+        ) {
+            AspectRatio.RATIO_16_9
+        } else {
+            AspectRatio.RATIO_4_3
+        }
+        return ResolutionSelector.Builder()
+            .setAspectRatioStrategy(
+                AspectRatioStrategy(preferredAspectRatio, AspectRatioStrategy.FALLBACK_RULE_AUTO)
+            )
+            .setResolutionStrategy(
+                ResolutionStrategy(target, ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)
+            )
+            .build()
+    }
+
+    private fun recordingQualityOrder(resolution: VideoResolution): List<Quality> {
+        val longestEdge = maxOf(resolution.width, resolution.height)
+        return when {
+            longestEdge >= 1920 -> listOf(Quality.FHD, Quality.UHD, Quality.HD, Quality.SD, Quality.LOWEST)
+            longestEdge >= 1280 -> listOf(Quality.HD, Quality.FHD, Quality.SD, Quality.LOWEST)
+            else -> listOf(Quality.SD, Quality.HD, Quality.LOWEST)
+        }
     }
 
     private fun Int.makeEven(): Int = if (this % 2 == 0) this else this - 1
@@ -984,4 +1003,24 @@ class CameraRuntimeImpl @Inject constructor(
             else -> baseBitrate
         }
     }
+}
+
+internal fun targetRotationForOrientation(
+    orientationDegrees: Int,
+    prefersLandscape: Boolean,
+    fallback: Int
+): Int {
+    if (orientationDegrees !in 0..359) return fallback
+    val measuredRotation = when (orientationDegrees) {
+        in 45..134 -> Surface.ROTATION_270
+        in 135..224 -> Surface.ROTATION_180
+        in 225..314 -> Surface.ROTATION_90
+        else -> Surface.ROTATION_0
+    }
+    val matchesRequestedAspect = if (prefersLandscape) {
+        measuredRotation == Surface.ROTATION_90 || measuredRotation == Surface.ROTATION_270
+    } else {
+        measuredRotation == Surface.ROTATION_0 || measuredRotation == Surface.ROTATION_180
+    }
+    return if (matchesRequestedAspect) measuredRotation else fallback
 }

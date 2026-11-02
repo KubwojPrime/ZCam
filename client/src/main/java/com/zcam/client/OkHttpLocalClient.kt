@@ -432,6 +432,8 @@ class OkHttpLocalClient @Inject constructor(
                             add(
                                 ClientRecordingEvent(
                                     epochMs = item.optLong("epochMs"),
+                                    endedAtEpochMs = item.optLong("endedAtEpochMs", item.optLong("epochMs")),
+                                    durationMs = item.optLong("durationMs", 0L),
                                     confidencePercent = item.optInt("confidencePercent"),
                                     source = item.optString("source"),
                                     type = item.optString("type", "object_motion"),

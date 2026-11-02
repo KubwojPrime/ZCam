@@ -131,7 +131,7 @@ internal fun LivePreviewSurface(
     fallbackFrameJpeg: ByteArray? = null,
     modifier: Modifier = Modifier,
     zoomable: Boolean = false,
-    containPreview: Boolean = false
+    containPreview: Boolean = true
 ) {
     val fallbackBitmap = remember(fallbackFrameJpeg) {
         fallbackFrameJpeg?.takeIf { it.isNotEmpty() }?.let { jpeg ->
@@ -850,10 +850,12 @@ private fun RecordingEventMarkerStrip(
         )
         events.forEach { event ->
             val offsetMs = event.recordingOffsetMs ?: return@forEach
-            val markerFraction = (offsetMs / durationMs).coerceIn(0f, 1f)
+            val startFraction = (offsetMs / durationMs).coerceIn(0f, 1f)
+            val endFraction = ((offsetMs + event.durationMs) / durationMs).coerceIn(startFraction, 1f)
+            val eventWidth = (barWidth * (endFraction - startFraction)).coerceAtLeast(6.dp)
             Box(
                 modifier = Modifier
-                    .width(6.dp)
+                    .width(eventWidth)
                     .height(20.dp)
                     .background(
                         if (event.type == "camera_tamper") MaterialTheme.colorScheme.error
@@ -861,7 +863,7 @@ private fun RecordingEventMarkerStrip(
                         RoundedCornerShape(6.dp)
                     )
                     .align(Alignment.CenterStart)
-                    .offset(x = barWidth * markerFraction)
+                    .offset(x = barWidth * startFraction)
                     .clickable {
                         onAction(ZCamUiAction.PlayRecording(selectedItem.fileName, event.epochMs))
                     }
@@ -869,7 +871,7 @@ private fun RecordingEventMarkerStrip(
         }
     }
     Text(
-        text = "Current Clip Timeline. Event markers stay pinned to this clip. Tap a marker to jump to the event.",
+        text = "Current Clip Timeline. Event bars show their duration. Tap a bar to jump to its beginning.",
         style = MaterialTheme.typography.bodySmall
     )
 }
@@ -881,10 +883,14 @@ private fun RecordingTimelineCard(
 ) {
     val segments = state.recordings.items.sortedBy(RecordingItemUi::startedAtEpochMs)
     val events = state.recordings.events.sortedBy(RecordingEventUi::epochMs)
-    val rangeStart = segments.minOfOrNull(RecordingItemUi::startedAtEpochMs)
-        ?: events.minOfOrNull(RecordingEventUi::epochMs)
-    val rangeEnd = segments.maxOfOrNull(RecordingItemUi::endedAtEpochMs)
-        ?: events.maxOfOrNull(RecordingEventUi::epochMs)
+    val rangeStart = listOfNotNull(
+        segments.minOfOrNull(RecordingItemUi::startedAtEpochMs),
+        events.minOfOrNull(RecordingEventUi::epochMs)
+    ).minOrNull()
+    val rangeEnd = listOfNotNull(
+        segments.maxOfOrNull(RecordingItemUi::endedAtEpochMs),
+        events.maxOfOrNull(RecordingEventUi::endedAtEpochMs)
+    ).maxOrNull()
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -1038,12 +1044,16 @@ private fun RecordingTimelineCard(
                         }
 
                         eventClusters.forEach { cluster ->
-                            val fraction = ((cluster.epochMs - rangeStart).toFloat() / totalRangeMs).coerceIn(0f, 1f)
-                            val markerWidth = if (cluster.count > 1) 30.dp else 14.dp
+                            val startFraction = ((cluster.epochMs - rangeStart).toFloat() / totalRangeMs).coerceIn(0f, 1f)
+                            val endFraction = ((cluster.endedAtEpochMs - rangeStart).toFloat() / totalRangeMs)
+                                .coerceIn(startFraction, 1f)
+                            val markerWidth = (timelineWidth * (endFraction - startFraction)).coerceAtLeast(
+                                if (cluster.count > 1) 30.dp else 14.dp
+                            )
                             Box(
                                 modifier = Modifier
                                     .align(Alignment.TopStart)
-                                    .offset(x = timelineWidth * fraction - (markerWidth / 2f), y = 18.dp)
+                                    .offset(x = timelineWidth * startFraction, y = 18.dp)
                                     .width(markerWidth)
                                     .height(if (cluster.count > 1) 24.dp else 34.dp)
                                     .background(
@@ -1236,6 +1246,7 @@ private data class HistoryTickUi(
 
 private data class HistoryEventClusterUi(
     val epochMs: Long,
+    val endedAtEpochMs: Long,
     val count: Int,
     val containsCameraTamper: Boolean
 )
@@ -1309,6 +1320,7 @@ private fun clusterHistoryEvents(
         ) ?: currentEvents.first()
         clusters += HistoryEventClusterUi(
             epochMs = representative.epochMs,
+            endedAtEpochMs = currentEvents.maxOf(RecordingEventUi::endedAtEpochMs),
             count = currentEvents.size,
             containsCameraTamper = currentEvents.any { it.type == "camera_tamper" }
         )

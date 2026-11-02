@@ -130,6 +130,10 @@ motion regions instead of whole-frame brightness sampling. Localized movement
 is reported as `object_motion`, while global scene displacement, lens covering,
 or a sudden loss of scene detail is reported as `camera_tamper`. Existing
 event index entries remain readable and are treated as object motion.
+Repeated detections of the same type separated by no more than 30 seconds are
+stored and returned as one timed event with start, end, duration, peak
+confidence, and one representative frame. Existing point events are coalesced
+when read, so older indexes do not need a migration step.
 
 The client can request a restart of a reachable server through the authenticated
 API. The server acknowledges the request, then restarts its runtime. If Android
@@ -145,6 +149,16 @@ one playlist, so the global time slider can seek between recordings without
 downloading complete files first. The separate Download command still saves a
 full copy to the client device. Seeking over a slow link can briefly buffer,
 but it requests only the required media range and keeps the timeline available.
+The browser panel uses the same range-enabled endpoints, typed event colors,
+timed event bars, global seek control, and automatic transition to the next
+recording segment.
+
+CameraX resolution selection follows the configured aspect ratio and requests
+the closest supported camera mode for preview, analysis, and recording. The
+client renders previews with preserved aspect ratio instead of cropping or
+stretching them. Recording rotation is derived from Android's inverse sensor-to-
+display mapping at every segment start, preventing opposite landscape mounting
+from producing upside-down files.
 
 ## Security Model
 

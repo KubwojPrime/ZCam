@@ -25,39 +25,42 @@ class LocalRecordingEventStore @Inject constructor(
     override suspend fun append(event: RecordingEvent, frameJpeg: ByteArray?) = withContext(dispatchers.io) {
         val normalized = RecordingEvent(
             epochMs = event.epochMs.coerceAtLeast(0L),
+            endedAtEpochMs = event.endedAtEpochMs.coerceAtLeast(event.epochMs.coerceAtLeast(0L)),
             confidencePercent = event.confidencePercent.coerceIn(1, 100),
             source = event.source.trim().ifBlank { DEFAULT_SOURCE }.take(MAX_SOURCE_LENGTH),
             type = event.type
         )
         mutex.withLock {
+            val events = loadEventsLocked().toMutableList()
+            val previous = events.lastOrNull()
+            val merged = previous?.takeIf { canMergeEvents(it, normalized) }?.let { current ->
+                current.copy(
+                    endedAtEpochMs = maxOf(current.endedAtEpochMs, normalized.endedAtEpochMs),
+                    confidencePercent = maxOf(current.confidencePercent, normalized.confidencePercent),
+                    source = if (normalized.confidencePercent >= current.confidencePercent) normalized.source else current.source
+                )
+            }
+            val frameEpochMs = merged?.epochMs ?: normalized.epochMs
+            val shouldReplaceFrame = merged == null ||
+                normalized.confidencePercent >= (previous?.confidencePercent ?: 0)
             if (frameJpeg != null && frameJpeg.size in 4..MAX_FRAME_BYTES &&
-                frameJpeg[0] == 0xff.toByte() && frameJpeg[1] == 0xd8.toByte()
+                frameJpeg[0] == 0xff.toByte() && frameJpeg[1] == 0xd8.toByte() && shouldReplaceFrame
             ) {
                 runCatching {
-                    val frameFile = eventFrameFile(normalized.epochMs)
+                    val frameFile = eventFrameFile(frameEpochMs)
                     frameFile.parentFile?.mkdirs()
                     val tempFile = File(frameFile.parentFile, "${frameFile.name}.tmp")
                     tempFile.writeBytes(frameJpeg)
+                    if (frameFile.exists()) frameFile.delete()
                     if (!tempFile.renameTo(frameFile)) {
+                        tempFile.copyTo(frameFile, overwrite = true)
                         tempFile.delete()
                     }
                     pruneExcessFramesLocked()
                 }
             }
-            val file = eventIndexFile()
-            file.parentFile?.mkdirs()
-            file.appendText(
-                buildString {
-                    append(normalized.epochMs)
-                    append('\t')
-                    append(normalized.confidencePercent)
-                    append('\t')
-                    append(normalized.source)
-                    append('\t')
-                    append(normalized.type.wireName)
-                    append('\n')
-                }
-            )
+            if (merged != null) events[events.lastIndex] = merged else events += normalized
+            writeEventsLocked(events)
         }
     }
 
@@ -81,7 +84,7 @@ class LocalRecordingEventStore @Inject constructor(
             loadEventsLocked()
                 .asSequence()
                 .filter { event ->
-                    val matchesFrom = normalizedFrom?.let { event.epochMs >= it } ?: true
+                    val matchesFrom = normalizedFrom?.let { event.endedAtEpochMs >= it } ?: true
                     val matchesTo = normalizedTo?.let { event.epochMs <= it } ?: true
                     matchesFrom && matchesTo
                 }
@@ -96,23 +99,14 @@ class LocalRecordingEventStore @Inject constructor(
             val file = eventIndexFile()
             if (!file.exists()) return@withLock
             val retained = loadEventsLocked()
-                .filter { it.epochMs >= cutoffEpochMs.coerceAtLeast(0L) }
-            if (retained.isEmpty()) {
-                file.writeText("")
-            } else {
-                file.writeText(
-                    retained.joinToString(separator = "\n") { event ->
-                        listOf(
-                            event.epochMs.toString(),
-                            event.confidencePercent.toString(),
-                            event.source,
-                            event.type.wireName
-                        ).joinToString("\t")
-                    } + "\n"
-                )
-            }
+                .filter { it.endedAtEpochMs >= cutoffEpochMs.coerceAtLeast(0L) }
+            writeEventsLocked(retained)
+            val retainedFrameEpochs = retained.mapTo(mutableSetOf(), RecordingEvent::epochMs)
             eventFramesDir().listFiles()?.forEach { frame ->
-                if (frame.extension == "jpg" && (frame.nameWithoutExtension.toLongOrNull() ?: Long.MAX_VALUE) < cutoffEpochMs) {
+                val frameEpochMs = frame.nameWithoutExtension.toLongOrNull()
+                if (frame.extension == "jpg" && frameEpochMs != null &&
+                    frameEpochMs !in retainedFrameEpochs && frameEpochMs < cutoffEpochMs
+                ) {
                     frame.delete()
                 }
             }
@@ -134,8 +128,25 @@ class LocalRecordingEventStore @Inject constructor(
     private fun loadEventsLocked(): List<RecordingEvent> {
         val file = eventIndexFile()
         if (!file.exists() || !file.isFile) return emptyList()
-        return file.readLines()
+        return coalesceRecordingEvents(file.readLines()
             .mapNotNull(::parseLine)
+            .sortedBy(RecordingEvent::epochMs))
+    }
+
+    private fun writeEventsLocked(events: List<RecordingEvent>) {
+        val file = eventIndexFile()
+        file.parentFile?.mkdirs()
+        file.writeText(
+            events.joinToString(separator = "\n") { event ->
+                listOf(
+                    event.epochMs.toString(),
+                    event.confidencePercent.toString(),
+                    event.source,
+                    event.type.wireName,
+                    event.endedAtEpochMs.toString()
+                ).joinToString("\t")
+            }.let { content -> if (content.isBlank()) "" else "$content\n" }
+        )
     }
 
     private fun parseLine(line: String): RecordingEvent? {
@@ -148,8 +159,10 @@ class LocalRecordingEventStore @Inject constructor(
         val type = parts.getOrNull(3)
             ?.let(RecordingEventType::fromWireName)
             ?: RecordingEventType.fromSource(source)
+        val endedAtEpochMs = parts.getOrNull(4)?.toLongOrNull()?.coerceAtLeast(epochMs) ?: epochMs
         return RecordingEvent(
             epochMs = epochMs.coerceAtLeast(0L),
+            endedAtEpochMs = endedAtEpochMs.coerceAtLeast(0L),
             confidencePercent = confidence.coerceIn(1, 100),
             source = source.take(MAX_SOURCE_LENGTH),
             type = type
@@ -175,3 +188,28 @@ class LocalRecordingEventStore @Inject constructor(
         const val MAX_STORED_FRAMES = 200
     }
 }
+
+internal fun coalesceRecordingEvents(events: List<RecordingEvent>): List<RecordingEvent> {
+    if (events.isEmpty()) return emptyList()
+    val merged = ArrayList<RecordingEvent>(events.size)
+    events.sortedBy(RecordingEvent::epochMs).forEach { event ->
+        val previous = merged.lastOrNull()
+        if (previous != null && canMergeEvents(previous, event)) {
+            merged[merged.lastIndex] = previous.copy(
+                endedAtEpochMs = maxOf(previous.endedAtEpochMs, event.endedAtEpochMs),
+                confidencePercent = maxOf(previous.confidencePercent, event.confidencePercent),
+                source = if (event.confidencePercent >= previous.confidencePercent) event.source else previous.source
+            )
+        } else {
+            merged += event
+        }
+    }
+    return merged
+}
+
+private fun canMergeEvents(previous: RecordingEvent, next: RecordingEvent): Boolean =
+    previous.type == next.type &&
+        next.epochMs >= previous.epochMs &&
+        next.epochMs - previous.endedAtEpochMs <= EVENT_MERGE_GAP_MS
+
+private const val EVENT_MERGE_GAP_MS = 30_000L

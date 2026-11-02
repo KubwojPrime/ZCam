@@ -2,10 +2,13 @@ package com.zcam.core.domain.recording
 
 data class RecordingEvent(
     val epochMs: Long,
+    val endedAtEpochMs: Long = epochMs,
     val confidencePercent: Int,
     val source: String,
     val type: RecordingEventType = RecordingEventType.fromSource(source)
-)
+) {
+    val durationMs: Long = (endedAtEpochMs - epochMs).coerceAtLeast(0L)
+}
 
 enum class RecordingEventType(val wireName: String) {
     OBJECT_MOTION("object_motion"),

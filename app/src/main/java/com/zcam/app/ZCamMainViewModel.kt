@@ -1643,6 +1643,8 @@ class ZCamMainViewModel @Inject constructor(
                 )?.coerceAtLeast(0L)
             RecordingEventUi(
                 epochMs = event.epochMs,
+                endedAtEpochMs = event.endedAtEpochMs,
+                durationMs = event.durationMs,
                 confidencePercent = event.confidencePercent,
                 source = event.source,
                 type = event.type,
