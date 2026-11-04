@@ -44,6 +44,7 @@ class ZCamApplication : Application() {
         }
         installCrashHandler()
         restoreRuntimeIfNeeded()
+        ClientEventMonitorService.restoreIfEnabled(this, logger)
     }
 
     private fun installCrashHandler() {

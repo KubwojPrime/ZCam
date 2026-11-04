@@ -5,6 +5,8 @@ import com.zcam.core.logging.ZCamLogger
 import com.zcam.core.logging.i
 import com.zcam.core.logging.w
 import java.io.File
+import java.io.RandomAccessFile
+import java.nio.charset.StandardCharsets
 
 internal data class RecordingSegmentEntry(
     val fileName: String,
@@ -33,6 +35,33 @@ internal class RecordingIndexRepository(
     private val indexFile: File
 ) {
 
+    fun recoverInterruptedSegments(recordingDir: File, logger: ZCamLogger) {
+        recordingDir.listFiles()
+            ?.filter { it.isFile && it.name.endsWith(PARTIAL_SEGMENT_SUFFIX) }
+            ?.forEach { partial ->
+                if (isFinalizedMp4(partial)) {
+                    val finalFile = File(recordingDir, partial.name.removeSuffix(PARTIAL_SEGMENT_SUFFIX) + ".mp4")
+                    promoteFile(partial, finalFile)
+                    logger.i(
+                        LogEventId.RECORDING_INDEX_REBUILT,
+                        "Recovered finalized recording segment ${finalFile.name} after interrupted indexing"
+                    )
+                } else {
+                    if (!partial.delete()) {
+                        logger.w(
+                            LogEventId.RECORDING_INDEX_CORRUPTED,
+                            "Unable to remove incomplete recording segment ${partial.name}"
+                        )
+                    } else {
+                        logger.w(
+                            LogEventId.RECORDING_INDEX_CORRUPTED,
+                            "Removed incomplete recording segment ${partial.name} after interrupted recording"
+                        )
+                    }
+                }
+            }
+    }
+
     fun loadOrRebuild(recordingDir: File, logger: ZCamLogger): RecordingCatalog {
         if (!indexFile.exists()) {
             val rebuilt = rebuildFromDirectory(recordingDir)
@@ -51,7 +80,7 @@ internal class RecordingIndexRepository(
             }
 
         val availableFiles = recordingDir.listFiles()
-            ?.filter { it.isFile && it.extension.equals("mp4", ignoreCase = true) }
+            ?.filter(::isFinalSegmentFile)
             ?.associateBy { it.name }
             .orEmpty()
 
@@ -62,10 +91,18 @@ internal class RecordingIndexRepository(
                 entry.copy(sizeBytes = file.length())
             }
 
-        return if (filtered.size != parsed.segments.size) {
-            val normalized = RecordingCatalog(filtered.sortedBy { it.startedAtEpochMs })
+        val indexedNames = filtered.mapTo(HashSet(), RecordingSegmentEntry::fileName)
+        val recovered = availableFiles.values
+            .filterNot { indexedNames.contains(it.name) }
+            .map(::entryFromFile)
+
+        return if (filtered.size != parsed.segments.size || recovered.isNotEmpty()) {
+            val normalized = RecordingCatalog((filtered + recovered).sortedBy { it.startedAtEpochMs })
             save(normalized)
-            logger.w(LogEventId.RECORDING_INDEX_CORRUPTED, "Recording index normalized to available segment files")
+            logger.w(
+                LogEventId.RECORDING_INDEX_CORRUPTED,
+                "Recording index reconciled with segment files; recovered=${recovered.size}"
+            )
             normalized
         } else {
             RecordingCatalog(filtered.sortedBy { it.startedAtEpochMs })
@@ -129,20 +166,9 @@ internal class RecordingIndexRepository(
 
     private fun rebuildFromDirectory(recordingDir: File): RecordingCatalog {
         val segments = recordingDir.listFiles()
-            ?.filter { it.isFile && it.extension.equals("mp4", ignoreCase = true) }
+            ?.filter(::isFinalSegmentFile)
             ?.sortedBy { it.lastModified() }
-            ?.map { file ->
-                val startedAt = parseStartEpochMs(file) ?: file.lastModified()
-                val endedAt = maxOf(startedAt + 1, file.lastModified())
-                RecordingSegmentEntry(
-                    fileName = file.name,
-                    startedAtEpochMs = startedAt,
-                    endedAtEpochMs = endedAt,
-                    sizeBytes = file.length(),
-                    container = "MP4",
-                    codec = "H264"
-                )
-            }
+            ?.map(::entryFromFile)
             ?.sortedBy { it.startedAtEpochMs }
             .orEmpty()
 
@@ -155,11 +181,84 @@ internal class RecordingIndexRepository(
         return name.removePrefix("segment_").toLongOrNull()
     }
 
+    private fun entryFromFile(file: File): RecordingSegmentEntry {
+        val startedAt = parseStartEpochMs(file) ?: file.lastModified()
+        val endedAt = maxOf(startedAt + 1, file.lastModified())
+        return RecordingSegmentEntry(
+            fileName = file.name,
+            startedAtEpochMs = startedAt,
+            endedAtEpochMs = endedAt,
+            sizeBytes = file.length(),
+            container = "MP4",
+            codec = "H264"
+        )
+    }
+
+    private fun isFinalSegmentFile(file: File): Boolean {
+        return file.isFile && FINAL_SEGMENT_FILE_REGEX.matches(file.name)
+    }
+
     private companion object {
         const val HEADER = "ZCAM_RECORDING_INDEX_V1"
         const val FIELD_DELIMITER = "\t"
+        const val PARTIAL_SEGMENT_SUFFIX = ".partial.mp4"
+        val FINAL_SEGMENT_FILE_REGEX = Regex("^segment_[0-9]+\\.mp4$")
     }
 }
+
+internal fun promoteFile(source: File, destination: File) {
+    destination.parentFile?.mkdirs()
+    if (destination.exists() && !destination.delete()) {
+        throw IllegalStateException("Failed to replace ${destination.absolutePath}")
+    }
+    if (!source.renameTo(destination)) {
+        source.copyTo(destination, overwrite = true)
+        RandomAccessFile(destination, "rw").use { it.fd.sync() }
+        if (!source.delete()) {
+            throw IllegalStateException("Failed to remove ${source.absolutePath} after copy")
+        }
+    }
+}
+
+internal fun isFinalizedMp4(file: File): Boolean = runCatching {
+    if (!file.isFile || file.length() < 16L) return@runCatching false
+    RandomAccessFile(file, "r").use { input ->
+        val fileLength = input.length()
+        var offset = 0L
+        var boxesRead = 0
+        var hasFileType = false
+        var hasMovieBox = false
+        while (offset + 8L <= fileLength && boxesRead < 10_000) {
+            input.seek(offset)
+            val size32 = input.readInt().toLong() and 0xffffffffL
+            val typeBytes = ByteArray(4)
+            input.readFully(typeBytes)
+            val type = String(typeBytes, StandardCharsets.US_ASCII)
+            val headerSize: Long
+            val boxSize = when (size32) {
+                0L -> {
+                    headerSize = 8L
+                    fileLength - offset
+                }
+                1L -> {
+                    if (offset + 16L > fileLength) return@use false
+                    headerSize = 16L
+                    input.readLong()
+                }
+                else -> {
+                    headerSize = 8L
+                    size32
+                }
+            }
+            if (boxSize < headerSize || boxSize > fileLength - offset) return@use false
+            if (type == "ftyp") hasFileType = true
+            if (type == "moov") hasMovieBox = true
+            offset += boxSize
+            boxesRead += 1
+        }
+        hasFileType && hasMovieBox && offset == fileLength
+    }
+}.getOrDefault(false)
 
 internal class RecordingRetentionPolicy {
 
@@ -210,3 +309,15 @@ internal class RecordingRetentionPolicy {
 }
 
 internal fun bytesFromGb(gb: Int): Long = gb.toLong() * 1024L * 1024L * 1024L
+
+internal fun estimatedNextSegmentReserveBytes(catalog: RecordingCatalog): Long {
+    val recentLargest = catalog.sortedOldestFirst()
+        .takeLast(3)
+        .maxOfOrNull(RecordingSegmentEntry::sizeBytes)
+        ?: return MIN_SEGMENT_RESERVE_BYTES
+    return (recentLargest + recentLargest / 4L)
+        .coerceIn(MIN_SEGMENT_RESERVE_BYTES, MAX_SEGMENT_RESERVE_BYTES)
+}
+
+private const val MIN_SEGMENT_RESERVE_BYTES = 256L * 1024L * 1024L
+private const val MAX_SEGMENT_RESERVE_BYTES = 1024L * 1024L * 1024L

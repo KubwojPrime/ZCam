@@ -33,7 +33,8 @@ class BootReceiver : BroadcastReceiver() {
     lateinit var logger: ZCamLogger
 
     override fun onReceive(context: Context, intent: Intent?) {
-        if (intent?.action != Intent.ACTION_BOOT_COMPLETED) return
+        val action = intent?.action
+        if (action != Intent.ACTION_BOOT_COMPLETED && action != Intent.ACTION_MY_PACKAGE_REPLACED) return
 
         val pendingResult = goAsync()
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
@@ -60,6 +61,7 @@ class BootReceiver : BroadcastReceiver() {
                     }
                     logger.i(LogEventId.STATE_RESTORE_SKIP, "Boot restore skipped (desired state off)")
                 }
+                ClientEventMonitorService.restoreIfEnabled(context, logger)
             } finally {
                 pendingResult.finish()
             }

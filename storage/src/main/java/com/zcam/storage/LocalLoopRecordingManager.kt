@@ -56,6 +56,7 @@ class LocalLoopRecordingManager @Inject constructor(
             directory.mkdirs()
             val repository = RecordingIndexRepository(indexFile(directory))
             indexRepository = repository
+            repository.recoverInterruptedSegments(directory, logger)
             currentCatalog = repository.loadOrRebuild(directory, logger)
             healthy.set(true)
 
@@ -214,7 +215,8 @@ class LocalLoopRecordingManager @Inject constructor(
                 ensureStorageHeadroom(recordingDir, catalog, config)
 
                 val startedAt = System.currentTimeMillis()
-                val outputFile = File(recordingDir, "segment_${startedAt}.mp4")
+                val outputFile = File(recordingDir, "segment_${startedAt}.partial.mp4")
+                val finalizedFile = File(recordingDir, "segment_${startedAt}.mp4")
                 logger.i(
                     LogEventId.RECORDING_SEGMENT_STARTED,
                     "Starting recording segment ${outputFile.name}"
@@ -229,12 +231,16 @@ class LocalLoopRecordingManager @Inject constructor(
                         "segment finalize failed code=${result.errorCode} message=${result.errorMessage}"
                     )
                 }
+                if (!isFinalizedMp4(result.file)) {
+                    throw IllegalStateException("segment finalize produced an invalid MP4 container")
+                }
+                promoteFile(result.file, finalizedFile)
 
                 val segment = RecordingSegmentEntry(
-                    fileName = result.file.name,
+                    fileName = finalizedFile.name,
                     startedAtEpochMs = startedAt,
                     endedAtEpochMs = result.finalizedAtEpochMs,
-                    sizeBytes = result.bytesWritten,
+                    sizeBytes = finalizedFile.length(),
                     container = "MP4",
                     codec = "H264"
                 )
@@ -332,7 +338,7 @@ class LocalLoopRecordingManager @Inject constructor(
             recordingDir = recordingDir,
             initialCatalog = catalog,
             maxStorageBytes = bytesFromGb(config.maxStorageGb),
-            minFreeBytes = bytesFromGb(config.minFreeStorageGb),
+            minFreeBytes = requiredFreeBytes(catalog, config),
             logger = logger
         )
         if (retentionOutcome.deletedSegments > 0) {
@@ -357,7 +363,7 @@ class LocalLoopRecordingManager @Inject constructor(
         val freeBytes = recordingDir.usableSpace
         val totalBytes = catalog.totalBytes
         val maxStorageBytes = bytesFromGb(config.maxStorageGb)
-        val minFreeBytes = bytesFromGb(config.minFreeStorageGb)
+        val minFreeBytes = requiredFreeBytes(catalog, config)
         throw StorageHeadroomException(
             "storage headroom insufficient total=$totalBytes max=$maxStorageBytes free=$freeBytes minFree=$minFreeBytes"
         )
@@ -371,10 +377,14 @@ class LocalLoopRecordingManager @Inject constructor(
         val freeBytes = recordingDir.usableSpace
         val totalBytes = catalog.totalBytes
         val maxStorageBytes = bytesFromGb(config.maxStorageGb)
-        val minFreeBytes = bytesFromGb(config.minFreeStorageGb)
+        val minFreeBytes = requiredFreeBytes(catalog, config)
         val withinQuota = totalBytes <= maxStorageBytes
         val enoughFree = freeBytes >= minFreeBytes
         return withinQuota && enoughFree
+    }
+
+    private fun requiredFreeBytes(catalog: RecordingCatalog, config: LoopRecordingConfig): Long {
+        return bytesFromGb(config.minFreeStorageGb) + estimatedNextSegmentReserveBytes(catalog)
     }
 
     private fun recordingDir(): File {

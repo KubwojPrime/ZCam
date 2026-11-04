@@ -68,6 +68,7 @@ class ClientEventMonitorService : Service() {
     }
 
     private suspend fun monitorEvents() {
+        var pollDelayMs = POLL_INTERVAL_MS
         while (scope.isActive) {
             try {
                 val session = sessions.session.first()
@@ -79,19 +80,27 @@ class ClientEventMonitorService : Service() {
                     }
                     val lastSeen = preferences.getLong(cursorKey, 0L)
                     when (val result = client.fetchRecordingEvents(target, fromEpochMs = lastSeen + 1L, limit = 100)) {
-                        is ClientCallResult.Success -> result.value.sortedBy(ClientRecordingEvent::epochMs).forEach { event ->
-                            if (event.epochMs > preferences.getLong(cursorKey, 0L)) {
-                                showEventNotification(target, event)
-                                preferences.edit().putLong(cursorKey, event.epochMs).apply()
+                        is ClientCallResult.Success -> {
+                            pollDelayMs = POLL_INTERVAL_MS
+                            result.value.sortedBy(ClientRecordingEvent::epochMs).forEach { event ->
+                                if (event.epochMs > preferences.getLong(cursorKey, 0L)) {
+                                    showEventNotification(target, event)
+                                    preferences.edit().putLong(cursorKey, event.epochMs).apply()
+                                }
                             }
                         }
-                        is ClientCallResult.Failure -> Unit
+                        is ClientCallResult.Failure -> {
+                            pollDelayMs = (pollDelayMs * 2L).coerceAtMost(MAX_POLL_BACKOFF_MS)
+                        }
                     }
+                } else {
+                    pollDelayMs = MISSING_SESSION_POLL_INTERVAL_MS
                 }
             } catch (error: Exception) {
                 logger.w("Client event monitor failed: ${error.message}")
+                pollDelayMs = (pollDelayMs * 2L).coerceAtMost(MAX_POLL_BACKOFF_MS)
             }
-            delay(POLL_INTERVAL_MS)
+            delay(pollDelayMs)
         }
     }
 
@@ -139,6 +148,8 @@ class ClientEventMonitorService : Service() {
         private const val EVENT_CHANNEL = "zcam_events"
         private const val MONITOR_NOTIFICATION_ID = 4102
         private const val POLL_INTERVAL_MS = 5_000L
+        private const val MISSING_SESSION_POLL_INTERVAL_MS = 30_000L
+        private const val MAX_POLL_BACKOFF_MS = 60_000L
 
         fun startIntent(context: Context): Intent = Intent(context, ClientEventMonitorService::class.java).setAction(ACTION_START)
         fun serviceIntent(context: Context): Intent = Intent(context, ClientEventMonitorService::class.java)
@@ -148,6 +159,17 @@ class ClientEventMonitorService : Service() {
                 .edit()
                 .putBoolean(ENABLED_KEY, enabled)
                 .apply()
+        }
+
+        fun restoreIfEnabled(context: Context, logger: ZCamLogger) {
+            val enabled = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
+                .getBoolean(ENABLED_KEY, false)
+            if (!enabled) return
+            runCatching {
+                ContextCompat.startForegroundService(context, startIntent(context))
+            }.onFailure { error ->
+                logger.w("Client event monitor restore failed: ${error.message}")
+            }
         }
     }
 }

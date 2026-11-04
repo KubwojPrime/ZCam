@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.zcam.core.logging.LogEventId
@@ -36,6 +37,7 @@ class ZCamForegroundService : Service() {
     lateinit var runtimeRestarter: ZCamRuntimeRestarter
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var wakeLock: PowerManager.WakeLock? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -67,6 +69,7 @@ class ZCamForegroundService : Service() {
                     }.onFailure { error ->
                         logger.e(LogEventId.COMPONENT_FAILED, error, "Runtime stop failed")
                     }
+                    releaseWakeLock()
                     stopSelf()
                 }
                 return START_NOT_STICKY
@@ -88,6 +91,7 @@ class ZCamForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        releaseWakeLock()
         CoroutineScope(Dispatchers.IO).launch {
             runCatching {
                 runtimeCoordinator.stop(persistDesiredState = false)
@@ -124,6 +128,27 @@ class ZCamForegroundService : Service() {
             notification,
             types
         )
+        acquireWakeLock()
+    }
+
+    private fun acquireWakeLock() {
+        if (wakeLock?.isHeld == true) return
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "ZCam:ServerRuntime"
+        ).apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+        logger.i(LogEventId.SERVICE_START_REQUESTED, "Server CPU wake lock acquired")
+    }
+
+    private fun releaseWakeLock() {
+        wakeLock?.let { lock ->
+            if (lock.isHeld) lock.release()
+        }
+        wakeLock = null
     }
 
     private fun ensureNotificationChannel() {

@@ -70,6 +70,18 @@ class RecordingRetentionPolicyTest {
         assertFalse(second.exists())
     }
 
+    @Test
+    fun estimates_headroom_from_recent_segment_size() {
+        val catalog = RecordingCatalog(
+            segments = listOf(
+                RecordingSegmentEntry("segment_1000.mp4", 1000L, 1010L, 300L * 1024L * 1024L),
+                RecordingSegmentEntry("segment_2000.mp4", 2000L, 2010L, 400L * 1024L * 1024L)
+            )
+        )
+
+        assertEquals(500L * 1024L * 1024L, estimatedNextSegmentReserveBytes(catalog))
+    }
+
     private fun createSegment(directory: File, fileName: String, sizeBytes: Int): File {
         return File(directory, fileName).apply {
             writeBytes(ByteArray(sizeBytes))

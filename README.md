@@ -3,7 +3,7 @@
 ZCam is a local-first Android camera and audio monitoring app designed for
 long-running LAN/VPN operation without a cloud backend.
 
-Current public release: `0.2.11`.
+Current public release: `0.2.12`.
 
 Project status: pre-1.0 hardening. The app already contains the core runtime
 architecture, local HTTP API, pairing, recording, watchdog/recovery, and client
@@ -118,12 +118,14 @@ Main endpoints:
 ## Client Event Alerts And Restart
 
 In Client mode, enable Motion alerts after pairing to run a foreground LAN/VPN
-monitor. The monitor checks for new events every five seconds and shows an
+monitor. The monitor checks for new events every five seconds while connected,
+uses bounded backoff during network outages, and shows an
 Android notification with the JPEG frame captured at detection time. Event
 frames stay in private app storage on the server, are served only through the
 authenticated API, and are capped at 200 retained frames. Notifications depend
 on network reachability, notification permission, and Android allowing the
-client monitor service to run.
+client monitor service to run. Enabled monitoring is restored after process
+recreation, device boot, and application replacement.
 
 Event detection uses an adaptive low-resolution background model and spatial
 motion regions instead of whole-frame brightness sampling. Localized movement
@@ -140,6 +142,11 @@ API. The server acknowledges the request, then restarts its runtime. If Android
 has killed the entire server process, no LAN listener remains to receive a
 request; the client reports that the server is unreachable. This local-only
 mode cannot guarantee remote wake after a full process kill or force-stop.
+While the server foreground service is active, it holds a partial CPU wake lock
+so recording and LAN handling can continue while the display is off. The
+desired server state is restored after process recreation, device boot, and
+application replacement, but Android still blocks automatic recovery after an
+explicit user force-stop.
 
 ## Recording Playback
 
@@ -150,8 +157,15 @@ downloading complete files first. The separate Download command still saves a
 full copy to the client device. Seeking over a slow link can briefly buffer,
 but it requests only the required media range and keeps the timeline available.
 The browser panel uses the same range-enabled endpoints, typed event colors,
-timed event bars, global seek control, and automatic transition to the next
-recording segment.
+timed event bars, and global seek control. It prepares the next recording in a
+standby player and swaps players at segment boundaries to minimize transition
+latency on slower links.
+
+Active recording segments use a `.partial.mp4` name and are published only
+after CameraX successfully finalizes a valid MP4 container. On startup, ZCam
+promotes a finalized segment left behind between file completion and index
+update, removes incomplete partial files, rebuilds a missing or corrupt index,
+and reconciles finalized files omitted by an interrupted index write.
 
 CameraX resolution selection follows the configured aspect ratio and requests
 the closest supported camera mode for preview, analysis, and recording. The

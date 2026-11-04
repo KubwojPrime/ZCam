@@ -1704,6 +1704,9 @@ class ZCamHttpServer @Inject constructor(
                 button.err { border-color: #8a2424; }
                 .codeInput { max-width: 180px; letter-spacing: 3px; }
                 img, video { width: 100%; height: auto; border-radius: 8px; background: #000; border: 1px solid var(--border); }
+                .recordingPlayerShell { position: relative; width: 100%; background: #000; border-radius: 8px; overflow: hidden; }
+                .recordingPlayerShell video { display: block; }
+                .recordingPlayerShell video.standby { position: absolute; inset: 0; visibility: hidden; pointer-events: none; }
                 pre { margin: 0; background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; max-height: 260px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 12px; }
                 .chip { display: inline-block; border-radius: 999px; border: 1px solid var(--border); padding: 3px 8px; font-size: 12px; color: var(--muted); }
                 .stack { display: grid; gap: 8px; }
@@ -1893,7 +1896,10 @@ class ZCamHttpServer @Inject constructor(
                   </div>
                   <div class="grid2" style="margin-top:10px;">
                     <div class="stack">
-                      <video id="recordingPlayer" controls preload="metadata" playsinline></video>
+                      <div class="recordingPlayerShell">
+                        <video id="recordingPlayer" controls preload="auto" playsinline></video>
+                        <video id="recordingStandbyPlayer" class="standby" preload="auto" playsinline></video>
+                      </div>
                       <div class="row">
                         <span class="chip mono" id="recordingsState">recordings: idle</span>
                         <span class="chip mono" id="recordingSelection">selected: none</span>
@@ -1978,7 +1984,8 @@ class ZCamHttpServer @Inject constructor(
                 const recordingSelection = document.getElementById('recordingSelection');
                 const recordingsList = document.getElementById('recordingsList');
                 const recordingsEvents = document.getElementById('recordingsEvents');
-                const recordingPlayer = document.getElementById('recordingPlayer');
+                let recordingPlayer = document.getElementById('recordingPlayer');
+                let standbyRecordingPlayer = document.getElementById('recordingStandbyPlayer');
                 const recordingPlaybackState = document.getElementById('recordingPlaybackState');
                 const recordingLoadPanel = document.getElementById('recordingLoadPanel');
                 const recordingLoadProgress = document.getElementById('recordingLoadProgress');
@@ -2596,6 +2603,7 @@ class ZCamHttpServer @Inject constructor(
                 function setPlaybackSpeed(speed) {
                   selectedPlaybackRate = speed;
                   recordingPlayer.playbackRate = speed;
+                  standbyRecordingPlayer.playbackRate = speed;
                   updateSpeedButtons();
                 }
 
@@ -2978,6 +2986,53 @@ class ZCamHttpServer @Inject constructor(
                   return started + ' | ' + seconds + 's | ' + sizeMb + ' MB';
                 }
 
+                function nextRecordingItem() {
+                  const currentIndex = recordingsCache.findIndex((item) => item.fileName === selectedRecordingName);
+                  return currentIndex >= 0 ? (recordingsCache[currentIndex + 1] || null) : null;
+                }
+
+                function prepareNextRecording() {
+                  const nextItem = nextRecordingItem();
+                  if (!nextItem) {
+                    standbyRecordingPlayer.pause();
+                    standbyRecordingPlayer.removeAttribute('src');
+                    standbyRecordingPlayer.removeAttribute('data-recording-name');
+                    standbyRecordingPlayer.load();
+                    return;
+                  }
+                  if (standbyRecordingPlayer.dataset.recordingName === nextItem.fileName) return;
+                  standbyRecordingPlayer.dataset.recordingName = nextItem.fileName;
+                  standbyRecordingPlayer.src = buildAuthorizedUrl('/api/recordings/' + encodeURIComponent(nextItem.fileName), {});
+                  standbyRecordingPlayer.playbackRate = selectedPlaybackRate;
+                  standbyRecordingPlayer.load();
+                }
+
+                function activatePreparedRecording(nextItem) {
+                  const previousPlayer = recordingPlayer;
+                  previousPlayer.pause();
+                  previousPlayer.controls = false;
+                  previousPlayer.classList.add('standby');
+
+                  recordingPlayer = standbyRecordingPlayer;
+                  standbyRecordingPlayer = previousPlayer;
+                  recordingPlayer.classList.remove('standby');
+                  recordingPlayer.controls = true;
+                  selectedRecordingName = nextItem.fileName;
+                  recordingSelection.textContent = 'selected: ' + nextItem.fileName;
+                  renderRecordingMeta(nextItem);
+                  renderRecordingTimeline();
+                  renderGlobalRecordingTimeline();
+                  renderRecordings();
+                  recordingPlayer.playbackRate = selectedPlaybackRate;
+                  recordingPlayer.play().catch(() => {});
+                  window.setTimeout(() => {
+                    standbyRecordingPlayer.removeAttribute('src');
+                    standbyRecordingPlayer.removeAttribute('data-recording-name');
+                    standbyRecordingPlayer.load();
+                    prepareNextRecording();
+                  }, 0);
+                }
+
                 function selectRecording(fileName, seekSeconds, autoplay) {
                   const item = recordingsCache.find((entry) => entry.fileName === fileName);
                   if (!item) return;
@@ -2992,6 +3047,7 @@ class ZCamHttpServer @Inject constructor(
                   setRecordingError('', '');
                   setRecordingLoadState(true, 'Loading video from server...', null);
                   updateRecordingPlaybackState('playback: loading', 'warnText');
+                  recordingPlayer.dataset.recordingName = fileName;
                   recordingPlayer.src = buildAuthorizedUrl('/api/recordings/' + encodeURIComponent(fileName), {});
                   recordingPlayer.load();
                   recordingsState.textContent = 'recordings: ' + recordingsCache.length + ' clip(s), ' + recordingEventsCache.length + ' event(s)';
@@ -3477,8 +3533,12 @@ class ZCamHttpServer @Inject constructor(
                   recordingEventsCache = [];
                   selectedRecordingName = '';
                   downloadSelectedRecordingBtn.disabled = true;
-                  recordingPlayer.removeAttribute('src');
-                  recordingPlayer.load();
+                  [recordingPlayer, standbyRecordingPlayer].forEach((player) => {
+                    player.pause();
+                    player.removeAttribute('src');
+                    player.removeAttribute('data-recording-name');
+                    player.load();
+                  });
                   renderRecordingMeta(null);
                   recordingTimeline.innerHTML = '';
                   globalRecordingTimeline.innerHTML = '';
@@ -3553,71 +3613,91 @@ class ZCamHttpServer @Inject constructor(
                   schedulePreviewReload('image_error');
                 });
 
-                recordingPlayer.addEventListener('loadstart', () => {
-                  setRecordingLoadState(true, 'Loading video from server...', null);
-                  updateRecordingPlaybackState('playback: loading', 'warnText');
-                  setRecordingError('', '');
-                });
-                recordingPlayer.addEventListener('loadedmetadata', () => {
-                  setPlaybackSpeed(selectedPlaybackRate);
-                  if (pendingSeekSeconds !== null) {
-                    try {
-                      recordingPlayer.currentTime = pendingSeekSeconds;
-                    } catch (_) {}
-                    pendingSeekSeconds = null;
-                  }
-                  if (pendingAutoplay) {
-                    pendingAutoplay = false;
-                    recordingPlayer.play().catch(() => {});
-                  }
-                  renderRecordingTimeline();
-                  updateTimelinePlayhead();
-                  updateGlobalTimelinePlayhead();
-                });
-                recordingPlayer.addEventListener('canplay', () => {
-                  setRecordingLoadState(false, '', null);
-                  updateRecordingPlaybackState('playback: ready', 'okText');
-                });
-                recordingPlayer.addEventListener('playing', () => {
-                  setRecordingLoadState(false, '', null);
-                  updateRecordingPlaybackState('playback: playing', 'okText');
-                });
-                recordingPlayer.addEventListener('pause', () => {
-                  if (recordingPlayer.readyState > 0 && !recordingPlayer.ended) {
-                    updateRecordingPlaybackState('playback: paused', 'warnText');
-                  }
-                });
-                recordingPlayer.addEventListener('waiting', () => {
-                  setRecordingLoadState(true, 'Buffering video from server...', null);
-                  updateRecordingPlaybackState('playback: buffering', 'warnText');
-                });
-                recordingPlayer.addEventListener('stalled', () => {
-                  setRecordingLoadState(true, 'Video stalled. Waiting for server...', null);
-                  updateRecordingPlaybackState('playback: stalled', 'warnText');
-                });
-                recordingPlayer.addEventListener('ended', () => {
-                  const currentIndex = recordingsCache.findIndex((item) => item.fileName === selectedRecordingName);
-                  const nextItem = currentIndex >= 0 ? recordingsCache[currentIndex + 1] : null;
-                  if (nextItem) {
-                    selectRecording(nextItem.fileName, 0, true);
-                    return;
-                  }
-                  updateRecordingPlaybackState('playback: ended', '');
-                  updateTimelinePlayhead();
-                  updateGlobalTimelinePlayhead();
-                });
-                recordingPlayer.addEventListener('ratechange', () => {
-                  selectedPlaybackRate = Number(recordingPlayer.playbackRate || 1);
-                  updateSpeedButtons();
-                });
-                recordingPlayer.addEventListener('timeupdate', () => {
-                  updateTimelinePlayhead();
-                  updateGlobalTimelinePlayhead();
-                });
-                recordingPlayer.addEventListener('error', () => {
-                  setRecordingLoadState(false, '', null);
-                  updateRecordingPlaybackState('playback: failed', 'errText');
-                  setRecordingError('Video playback failed. Reload the clip or check the server connection.', 'errText');
+                [recordingPlayer, standbyRecordingPlayer].forEach((player) => {
+                  player.addEventListener('loadstart', () => {
+                    if (player !== recordingPlayer) return;
+                    setRecordingLoadState(true, 'Loading video from server...', null);
+                    updateRecordingPlaybackState('playback: loading', 'warnText');
+                    setRecordingError('', '');
+                  });
+                  player.addEventListener('loadedmetadata', () => {
+                    player.playbackRate = selectedPlaybackRate;
+                    if (player !== recordingPlayer) return;
+                    if (pendingSeekSeconds !== null) {
+                      try {
+                        recordingPlayer.currentTime = pendingSeekSeconds;
+                      } catch (_) {}
+                      pendingSeekSeconds = null;
+                    }
+                    if (pendingAutoplay) {
+                      pendingAutoplay = false;
+                      recordingPlayer.play().catch(() => {});
+                    }
+                    renderRecordingTimeline();
+                    updateTimelinePlayhead();
+                    updateGlobalTimelinePlayhead();
+                  });
+                  player.addEventListener('canplay', () => {
+                    if (player !== recordingPlayer) return;
+                    setRecordingLoadState(false, '', null);
+                    updateRecordingPlaybackState('playback: ready', 'okText');
+                    prepareNextRecording();
+                  });
+                  player.addEventListener('playing', () => {
+                    if (player !== recordingPlayer) return;
+                    setRecordingLoadState(false, '', null);
+                    updateRecordingPlaybackState('playback: playing', 'okText');
+                  });
+                  player.addEventListener('pause', () => {
+                    if (player !== recordingPlayer) return;
+                    if (recordingPlayer.readyState > 0 && !recordingPlayer.ended) {
+                      updateRecordingPlaybackState('playback: paused', 'warnText');
+                    }
+                  });
+                  player.addEventListener('waiting', () => {
+                    if (player !== recordingPlayer) return;
+                    setRecordingLoadState(true, 'Buffering video from server...', null);
+                    updateRecordingPlaybackState('playback: buffering', 'warnText');
+                  });
+                  player.addEventListener('stalled', () => {
+                    if (player !== recordingPlayer) return;
+                    setRecordingLoadState(true, 'Video stalled. Waiting for server...', null);
+                    updateRecordingPlaybackState('playback: stalled', 'warnText');
+                  });
+                  player.addEventListener('ended', () => {
+                    if (player !== recordingPlayer) return;
+                    const nextItem = nextRecordingItem();
+                    if (nextItem) {
+                      if (
+                        standbyRecordingPlayer.dataset.recordingName === nextItem.fileName &&
+                        standbyRecordingPlayer.readyState >= HTMLMediaElement.HAVE_METADATA
+                      ) {
+                        activatePreparedRecording(nextItem);
+                      } else {
+                        selectRecording(nextItem.fileName, 0, true);
+                      }
+                      return;
+                    }
+                    updateRecordingPlaybackState('playback: ended', '');
+                    updateTimelinePlayhead();
+                    updateGlobalTimelinePlayhead();
+                  });
+                  player.addEventListener('ratechange', () => {
+                    if (player !== recordingPlayer) return;
+                    selectedPlaybackRate = Number(recordingPlayer.playbackRate || 1);
+                    updateSpeedButtons();
+                  });
+                  player.addEventListener('timeupdate', () => {
+                    if (player !== recordingPlayer) return;
+                    updateTimelinePlayhead();
+                    updateGlobalTimelinePlayhead();
+                  });
+                  player.addEventListener('error', () => {
+                    if (player !== recordingPlayer) return;
+                    setRecordingLoadState(false, '', null);
+                    updateRecordingPlaybackState('playback: failed', 'errText');
+                    setRecordingError('Video playback failed. Reload the clip or check the server connection.', 'errText');
+                  });
                 });
 
                 window.addEventListener('beforeunload', () => {
