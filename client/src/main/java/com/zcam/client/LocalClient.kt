@@ -108,6 +108,8 @@ sealed interface ClientCallResult<out T> {
 }
 
 interface LocalClient {
+    suspend fun fetchServerSettings(target: ClientTarget): ClientCallResult<com.zcam.core.domain.settings.RemoteServerSettings>
+    suspend fun saveServerSettings(target: ClientTarget, settings: com.zcam.core.domain.settings.RemoteServerSettings): ClientCallResult<Unit>
     suspend fun isServerAlive(target: ClientTarget): Boolean
     suspend fun fetchStatus(target: ClientTarget): ClientCallResult<ClientServerStatus>
     suspend fun fetchSnapshot(target: ClientTarget): ClientCallResult<ByteArray>

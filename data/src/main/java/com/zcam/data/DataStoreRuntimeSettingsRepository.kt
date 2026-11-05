@@ -77,6 +77,33 @@ class DataStoreRuntimeSettingsRepository @Inject constructor(
         RuntimeSettingsUpdateResult.Success(candidate)
     }
 
+    override suspend fun updateRemoteSettings(candidate: RuntimeSettings, expectedRevision: String): RuntimeSettingsUpdateResult = withContext(ioDispatcher) {
+        var result: RuntimeSettingsUpdateResult = RuntimeSettingsUpdateResult.Forbidden("settings_update_failed")
+        context.runtimeSettingsDataStore.edit { prefs ->
+            val current = prefs.toRuntimeSettings()
+            if (com.zcam.core.domain.settings.RemoteServerSettingsCodec.revision(current) != expectedRevision) {
+                result = RuntimeSettingsUpdateResult.Forbidden("settings_changed_reload_required")
+                return@edit
+            }
+            val merged = candidate.copy(security = current.security,
+                featureFlags = candidate.featureFlags.copy(trustedDevices = current.featureFlags.trustedDevices))
+            val forbidden = FeatureFlag.entries.any { flag ->
+                !featureFlagGuard.canUpdate(flag) && current.featureFlags.isEnabled(flag) != merged.featureFlags.isEnabled(flag)
+            }
+            val errors = RuntimeSettingsValidator.validate(merged)
+            result = when {
+                forbidden -> RuntimeSettingsUpdateResult.Forbidden("settings_forbidden")
+                errors.isNotEmpty() -> RuntimeSettingsUpdateResult.ValidationFailed(errors)
+                else -> {
+                    // Read, compare and merge inside one transaction, including current credentials/trust.
+                    prefs.writeRuntimeSettings(merged)
+                    RuntimeSettingsUpdateResult.Success(merged)
+                }
+            }
+        }
+        result
+    }
+
     override suspend fun setFeatureFlag(flag: FeatureFlag, enabled: Boolean): RuntimeSettingsUpdateResult = withContext(ioDispatcher) {
         if (!featureFlagGuard.canUpdate(flag)) {
             return@withContext RuntimeSettingsUpdateResult.Forbidden("Feature flag $flag cannot be changed at runtime.")

@@ -111,6 +111,8 @@ data class PendingPairingRequestUi(
 )
 
 data class SettingsUiState(
+    val remoteLoaded: Boolean = false,
+    val loading: Boolean = false,
     val serverPortInput: String = "8080",
     val streamWidthInput: String = "1280",
     val streamHeightInput: String = "720",
@@ -289,6 +291,7 @@ sealed interface ZCamUiAction {
     data class SettingsApiTokenChanged(val value: String) : ZCamUiAction
     data class SettingsFlagChanged(val flag: FeatureFlag, val enabled: Boolean) : ZCamUiAction
     data class RevokeTrustedDevice(val deviceId: String) : ZCamUiAction
+    data object ReloadServerSettings : ZCamUiAction
     data object SaveSettings : ZCamUiAction
 
     data object OpenPairingFromSuggestion : ZCamUiAction

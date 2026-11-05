@@ -42,6 +42,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -574,6 +575,11 @@ private fun SettingsScreen(
     onAction: (ZCamUiAction) -> Unit
 ) {
     val settings = state.settings
+    LaunchedEffect(state.mode) {
+        if (state.mode == ZCamMode.CLIENT && !settings.remoteLoaded && !settings.loading) {
+            onAction(ZCamUiAction.ReloadServerSettings)
+        }
+    }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -582,13 +588,17 @@ private fun SettingsScreen(
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         if (state.mode == ZCamMode.CLIENT) {
-            InfoCard(
-                title = "Client settings",
-                body = "Server runtime settings are editable only in Server mode. Client host, pairing and audio controls stay on the main and pairing screens."
-            )
+            InfoCard(title = "Server settings", body = "Changes apply to the paired server. Saving reconnects its runtime and keeps the camera on or off as selected.")
+            OutlinedButton(onClick = { onAction(ZCamUiAction.ReloadServerSettings) }, enabled = !settings.loading && !settings.saving) {
+                Text(if (settings.loading) "Loading..." else "Reload server settings")
+            }
+            if (!settings.remoteLoaded) {
+                Text(settings.resultMessage.ifBlank { "Loading server settings..." })
+                return@Column
+            }
         }
 
-        if (state.mode == ZCamMode.SERVER) {
+        run {
             SettingsSection(title = "Network & Security") {
                 OutlinedTextField(
                     modifier = Modifier.fillMaxWidth(),
@@ -598,6 +608,7 @@ private fun SettingsScreen(
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     singleLine = true
                 )
+                if (state.mode == ZCamMode.SERVER) {
                 OutlinedTextField(
                     modifier = Modifier.fillMaxWidth(),
                     value = settings.pinInput,
@@ -613,6 +624,7 @@ private fun SettingsScreen(
                     label = { Text("Bootstrap API token (advanced)") },
                     singleLine = true
                 )
+                }
             }
 
             SettingsSection(title = "Video stream") {
@@ -879,6 +891,7 @@ private fun SettingsScreen(
                 )
             }
 
+            if (state.mode == ZCamMode.SERVER) {
             SettingsSection(title = "Trusted devices") {
                 if (settings.trustedDevices.isEmpty()) {
                     Text("No trusted devices yet.", style = MaterialTheme.typography.bodySmall)
@@ -901,6 +914,8 @@ private fun SettingsScreen(
                 }
             }
 
+            }
+
             if (settings.resultMessage.isNotBlank()) {
                 StatusChip(
                     label = settings.resultMessage,
@@ -916,6 +931,7 @@ private fun SettingsScreen(
             ) {
                 Text(if (settings.saving) "Saving..." else "Save settings")
             }
+
         }
 
         if (!state.errorMessage.isNullOrBlank()) {

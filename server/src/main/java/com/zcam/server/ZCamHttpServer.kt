@@ -21,6 +21,12 @@ import com.zcam.core.device.PowerStatusSnapshot
 import com.zcam.core.dispatchers.DispatcherProvider
 import com.zcam.core.domain.recording.RuntimeRestartRequester
 import com.zcam.core.domain.recording.CameraCommandResult
+import com.zcam.core.domain.settings.RuntimeSettingsRepository
+import com.zcam.core.domain.settings.RuntimeSettingsUpdateResult
+import com.zcam.core.domain.settings.RemoteServerSettingsCodec
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import com.zcam.core.logging.LogEventId
 import com.zcam.core.logging.ZCamLogger
 import com.zcam.core.logging.e
@@ -72,7 +78,8 @@ class ZCamHttpServer @Inject constructor(
     private val dispatchers: DispatcherProvider,
     private val logger: ZCamLogger,
     private val lanAccessPolicy: LanAccessPolicy,
-    private val runtimeRestartRequester: RuntimeRestartRequester? = null
+    private val runtimeRestartRequester: RuntimeRestartRequester? = null,
+    private val runtimeSettingsRepository: RuntimeSettingsRepository? = null
 ) : LocalHttpServer {
 
     @Volatile
@@ -84,6 +91,7 @@ class ZCamHttpServer @Inject constructor(
     private val activeStreamClients = AtomicInteger(0)
     private val startedAtEpochMs = AtomicLong(0L)
     private val websocketScope = CoroutineScope(SupervisorJob() + dispatchers.io)
+    private val settingsUpdateLock = Mutex()
 
     override suspend fun start(port: Int) = withContext(dispatchers.io) {
         if (server != null) return@withContext
@@ -415,6 +423,7 @@ class ZCamHttpServer @Inject constructor(
             "/api/status" -> buildStatusResponse()
             "/api/runtime/restart" -> handleRuntimeRestartEndpoint(session)
             "/api/camera" -> handleCameraRuntimeEndpoint(session)
+            "/api/settings" -> handleSettingsEndpoint(session)
             "/api/recordings" -> handleRecordingsListEndpoint(session)
             "/video", "/mjpeg" -> buildVideoResponse()
             "/snapshot.jpg" -> buildSnapshotResponse()
@@ -443,6 +452,53 @@ class ZCamHttpServer @Inject constructor(
             return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.CONFLICT, JSON_UTF8, "{\"status\":\"error\",\"reason\":\"restart_in_progress\"}")
         }
         return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.ACCEPTED, JSON_UTF8, "{\"status\":\"accepted\"}")
+    }
+
+    private fun handleSettingsEndpoint(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
+        if (session.method != NanoHTTPD.Method.GET && session.method != NanoHTTPD.Method.POST) return methodNotAllowed("GET, POST")
+        val deviceId = extractDeviceId(session).orEmpty()
+        if (deviceId.isBlank() || !runBlocking { securityManager.isTrustedDevice(deviceId) }) {
+            return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.FORBIDDEN, JSON_UTF8,
+                "{\"reason\":\"paired_device_required\"}")
+        }
+        val repository = runtimeSettingsRepository ?: return NanoHTTPD.newFixedLengthResponse(
+            NanoHTTPD.Response.Status.SERVICE_UNAVAILABLE, JSON_UTF8, "{\"reason\":\"settings_unavailable\"}")
+        return runBlocking {
+            settingsUpdateLock.withLock {
+                val current = repository.settings.first()
+                if (session.method == NanoHTTPD.Method.GET) {
+                    val fields = RemoteServerSettingsCodec.encode(current) + ("revision" to RemoteServerSettingsCodec.revision(current))
+                    val json = fields.entries.joinToString(",", "{", "}") { jsonString(it.key) + ":" + jsonString(it.value) }
+                    return@withLock NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, JSON_UTF8, json)
+                        .apply { addHeader("Cache-Control", "no-store") }
+                }
+                val payload = parsePostPayload(session) ?: return@withLock badRequest("request body is required")
+                if (payload["revision"] != RemoteServerSettingsCodec.revision(current)) {
+                    return@withLock NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.CONFLICT, JSON_UTF8,
+                        "{\"reason\":\"settings_changed_reload_required\"}")
+                }
+                val candidate = try {
+                    RemoteServerSettingsCodec.decode(payload - "revision", current)
+                } catch (_: Exception) {
+                    return@withLock badRequest("invalid_settings")
+                }
+                when (val saved = repository.updateRemoteSettings(candidate, payload.getValue("revision"))) {
+                    is RuntimeSettingsUpdateResult.Success -> {
+                        val restart = runtimeRestartRequester?.requestRestart() == true
+                        NanoHTTPD.newFixedLengthResponse(
+                            if (restart) NanoHTTPD.Response.Status.OK else NanoHTTPD.Response.Status.SERVICE_UNAVAILABLE,
+                            JSON_UTF8, if (restart) "{\"status\":\"saved\",\"restartRequested\":true}"
+                            else "{\"reason\":\"settings_saved_restart_required\"}"
+                        )
+                    }
+                    is RuntimeSettingsUpdateResult.Forbidden -> NanoHTTPD.newFixedLengthResponse(
+                        if (saved.reason == "settings_changed_reload_required") NanoHTTPD.Response.Status.CONFLICT
+                        else NanoHTTPD.Response.Status.FORBIDDEN, JSON_UTF8,
+                        "{\"reason\":${jsonString(saved.reason)}}")
+                    is RuntimeSettingsUpdateResult.ValidationFailed -> badRequest("invalid_settings")
+                }
+            }
+        }
     }
 
     private fun handleCameraRuntimeEndpoint(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
@@ -1741,7 +1797,8 @@ class ZCamHttpServer @Inject constructor(
                 .controlRow > button { flex: 1 1 120px; }
                 .list { display: grid; gap: 6px; max-height: 320px; overflow: auto; }
                 .recordingsViewport { max-height: 374px; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
-                .recordingsViewport .recordingRow { min-height: 70px; }
+                .recordingsViewport .recordingRow { height: 70px; min-height: 70px; overflow: hidden; }
+                .recordingsViewport .recordingLabelButton { overflow: hidden; text-overflow: ellipsis; }
                 .seekControl { display: grid; gap: 4px; }
                 .seekReadout { color: var(--text); text-align: center; font-size: 13px; margin: 0; }
                 .recordingItem { width: 100%; text-align: left; }
@@ -1906,6 +1963,17 @@ class ZCamHttpServer @Inject constructor(
                       <button type="button" onclick="setVolumeNow()">Set volume</button>
                     </div>
                   </div>
+                </div>
+
+                <div class="card">
+                  <details id="serverSettingsDetails">
+                    <summary class="title">Server settings</summary>
+                    <p class="sub">Edit the paired server's video, recording and runtime settings. Saving briefly reconnects the server.</p>
+                    <button id="reloadServerSettingsBtn" type="button">Reload server settings</button>
+                    <div id="serverSettingsFields" class="grid2"></div>
+                    <button id="saveServerSettingsBtn" type="button" disabled>Save server settings</button>
+                    <p id="serverSettingsState" class="sub" role="status"></p>
+                  </details>
                 </div>
 
                 <div class="card">
@@ -2386,8 +2454,8 @@ class ZCamHttpServer @Inject constructor(
                       Number(b.epochMs || 0) - Number(a.epochMs || 0)
                     )[0];
                     clusters.push({
-                      epochMs: Math.min(...current.map((item) => Number(item.epochMs))),
-                      endedAtEpochMs: Math.max(...current.map((item) => Number(item.endedAtEpochMs || item.epochMs))),
+                      epochMs: current.reduce((value, item) => Math.min(value, Number(item.epochMs)), Infinity),
+                      endedAtEpochMs: current.reduce((value, item) => Math.max(value, Number(item.endedAtEpochMs || item.epochMs)), -Infinity),
                       count: current.length,
                       containsCameraTamper: current.some((item) => item.type === 'camera_tamper'),
                       item: representative
@@ -2488,8 +2556,8 @@ class ZCamHttpServer @Inject constructor(
                     Number(item.epochMs),
                     Number(item.endedAtEpochMs || item.epochMs)
                   ]).filter(Number.isFinite);
-                  const rangeStart = Math.min(...segmentStarts, ...eventTimes);
-                  const rangeEnd = Math.max(...segmentEnds, ...eventTimes);
+                  const rangeStart = segmentStarts.concat(eventTimes).reduce((a, b) => Math.min(a, b), Infinity);
+                  const rangeEnd = segmentEnds.concat(eventTimes).reduce((a, b) => Math.max(a, b), -Infinity);
                   if (!Number.isFinite(rangeStart) || !Number.isFinite(rangeEnd) || rangeEnd <= rangeStart) {
                     globalRecordingSeek.disabled = true;
                     globalRecordingSeekLabel.textContent = 'hour: unavailable';
@@ -3045,6 +3113,7 @@ class ZCamHttpServer @Inject constructor(
                 }
 
                 function renderRecordings() {
+                  const previousListScrollTop = recordingsList.scrollTop;
                   recordingsList.innerHTML = '';
                   if (recordingsCache.length === 0) {
                     recordingsList.innerHTML = '<div class="sub">No finalized recordings are available.</div>';
@@ -3080,7 +3149,8 @@ class ZCamHttpServer @Inject constructor(
                       row.appendChild(downloadButton);
                       recordingsList.appendChild(row);
                     });
-                    if (active) recordingsList.scrollTop = 0;
+                    recordingsList.scrollTop = active && pinnedRecordingName !== selectedRecordingName ? 0 : previousListScrollTop;
+                    pinnedRecordingName = selectedRecordingName;
                   }
 
                   recordingsEvents.innerHTML = '';
@@ -3101,28 +3171,41 @@ class ZCamHttpServer @Inject constructor(
                   }
                 }
 
+                let recordingsLoading = false;
+                let pinnedRecordingName = '';
+                async function fetchHistoryPages(path, key, timestamp, pageSize) {
+                  const all = [];
+                  let before = null;
+                  while (true) {
+                    const response = await fetch(buildAuthorizedUrl(path, { limit: pageSize, toEpochMs: before }),
+                      { headers: authHeaders(), cache: 'no-store' });
+                    if (!response.ok) throw new Error('History request failed: ' + response.status);
+                    const payload = await response.json();
+                    const page = Array.isArray(payload[key]) ? payload[key] : [];
+                    all.push(...page);
+                    if (page.length < pageSize) return all;
+                    const oldest = Math.min(...page.map(item => Number(item[timestamp])));
+                    if (oldest <= 0) return all;
+                    const next = oldest - 1;
+                    if (!Number.isFinite(next) || (before !== null && next >= before)) throw new Error('History pagination stalled');
+                    before = next;
+                  }
+                }
+
                 async function loadRecordings() {
+                  if (recordingsLoading || historySeekDragging) return;
+                  recordingsLoading = true;
+                  const authKey = JSON.stringify(readAuth());
                   recordingsState.textContent = 'recordings: loading';
                   setRecordingError('', '');
                   try {
-                    const recordingsUrl = buildAuthorizedUrl('/api/recordings', {
-                      limit: 10000
-                    });
-                    const eventsUrl = buildAuthorizedUrl('/api/recordings/events', {
-                      limit: 10000
-                    });
-                    const [recordingsResponse, eventsResponse] = await Promise.all([
-                      fetch(recordingsUrl, { headers: authHeaders(), cache: 'no-store' }),
-                      fetch(eventsUrl, { headers: authHeaders(), cache: 'no-store' })
+                    const [clips, events] = await Promise.all([
+                      fetchHistoryPages('/api/recordings', 'recordings', 'startedAtEpochMs', 500),
+                      fetchHistoryPages('/api/recordings/events', 'events', 'epochMs', 1000)
                     ]);
-                    if (!recordingsResponse.ok || !eventsResponse.ok) {
-                      throw new Error('Recording history request failed');
-                    }
-                    const recordingsPayload = await recordingsResponse.json();
-                    const eventsPayload = await eventsResponse.json();
-                    recordingsCache = (Array.isArray(recordingsPayload.recordings) ? recordingsPayload.recordings : [])
-                      .sort((a, b) => Number(a.startedAtEpochMs) - Number(b.startedAtEpochMs));
-                    recordingEventsCache = Array.isArray(eventsPayload.events) ? eventsPayload.events : [];
+                    if (authKey !== JSON.stringify(readAuth())) return;
+                    recordingsCache = clips.sort((a, b) => Number(a.startedAtEpochMs) - Number(b.startedAtEpochMs));
+                    recordingEventsCache = events;
                     if (selectedRecordingName && !recordingsCache.some((item) => item.fileName === selectedRecordingName)) {
                       selectedRecordingName = '';
                       downloadSelectedRecordingBtn.disabled = true;
@@ -3147,6 +3230,8 @@ class ZCamHttpServer @Inject constructor(
                     recordingsState.textContent = 'recordings: load failed';
                     setRecordingError('Recordings load failed. Check connection and authentication.', 'errText');
                     appendLog('recordings load failed: ' + error);
+                  } finally {
+                    recordingsLoading = false;
                   }
                 }
 
@@ -3420,6 +3505,86 @@ class ZCamHttpServer @Inject constructor(
                   }
                   await refreshStatus();
                 }
+
+                let serverSettingsRevision = '';
+                const serverSettingLabels = {
+                  serverPort: 'Server port', streamWidth: 'Video width', streamHeight: 'Video height', streamFps: 'Video FPS',
+                  rearLens: 'Rear camera lens', eventSensitivity: 'Event sensitivity', previewTransport: 'Preview transport',
+                  previewWidth: 'Preview width', previewHeight: 'Preview height', previewFps: 'Preview FPS',
+                  previewBitrateKbps: 'Preview bitrate (kbps)', segmentMinutes: 'Segment duration (minutes)',
+                  maxStorageGb: 'Maximum recording storage (GB)', minFreeStorageGb: 'Minimum free storage (GB)',
+                  mjpegStreaming: 'Camera streaming', loopRecording: 'Loop recording', audioPushToTalk: 'Push to talk',
+                  audioLive: 'Live audio', audioPlayback: 'Audio playback', watchdogRecovery: 'Watchdog recovery'
+                };
+                async function loadServerSettings() {
+                  const status = document.getElementById('serverSettingsState');
+                  const save = document.getElementById('saveServerSettingsBtn');
+                  save.disabled = true;
+                  serverSettingsRevision = '';
+                  status.textContent = 'Loading server settings...';
+                  const authKey = JSON.stringify(readAuth());
+                  try {
+                    const response = await fetch('/api/settings', { headers: authHeaders(), cache: 'no-store' });
+                    if (!response.ok) throw new Error('Settings unavailable');
+                    const settings = await response.json();
+                    if (authKey !== JSON.stringify(readAuth())) return;
+                    const fields = document.getElementById('serverSettingsFields');
+                    fields.replaceChildren();
+                    Object.entries(serverSettingLabels).forEach(([key, label]) => {
+                      const wrapper = document.createElement('label');
+                      wrapper.textContent = label;
+                      const choices = key === 'rearLens' ? ['main', 'ultra_wide']
+                        : key === 'eventSensitivity' ? ['low', 'balanced', 'high']
+                        : key === 'previewTransport' ? ['h264', 'mjpeg']
+                        : ['true', 'false'].includes(String(settings[key])) ? ['true', 'false'] : null;
+                      const input = document.createElement(choices ? 'select' : 'input');
+                      if (choices) choices.forEach(value => {
+                        const option = document.createElement('option');
+                        option.value = value;
+                        option.textContent = value === 'true' ? 'Enabled' : value === 'false' ? 'Disabled' : value;
+                        input.appendChild(option);
+                      });
+                      else { input.type = 'number'; input.step = '1'; }
+                      input.dataset.setting = key;
+                      input.value = String(settings[key]);
+                      wrapper.appendChild(input);
+                      fields.appendChild(wrapper);
+                    });
+                    serverSettingsRevision = settings.revision;
+                    save.disabled = false;
+                    status.textContent = 'Server settings loaded.';
+                  } catch (_) { status.textContent = 'Cannot load settings. Check connection and pairing.'; }
+                }
+                async function saveServerSettings() {
+                  if (!serverSettingsRevision) return;
+                  const status = document.getElementById('serverSettingsState');
+                  const save = document.getElementById('saveServerSettingsBtn');
+                  const payload = { revision: serverSettingsRevision };
+                  document.querySelectorAll('[data-setting]').forEach(input => { payload[input.dataset.setting] = input.value; });
+                  save.disabled = true;
+                  try {
+                    const { response, parsed } = await apiPost('/api/settings', payload);
+                    if (!response.ok) {
+                      status.textContent = parsed?.reason === 'settings_changed_reload_required'
+                        ? 'Settings changed on the server. Reload them before saving.'
+                        : 'Settings could not be applied. Reload settings and try again.';
+                      return;
+                    }
+                    serverSettingsRevision = '';
+                    status.textContent = 'Settings saved. Server reconnecting; camera state is preserved.';
+                    if (Number(payload.serverPort) !== Number(location.port || 80)) {
+                      const address = new URL(location.href); address.port = payload.serverPort;
+                      const link = document.createElement('a'); link.href = address.href; link.textContent = 'Open server on its new port';
+                      status.appendChild(document.createTextNode(' Enter your existing credentials at the new address. '));
+                      status.appendChild(link);
+                    }
+                  } catch (_) { status.textContent = 'Connection lost. Reload settings to check whether the change was saved.'; }
+                }
+                document.getElementById('reloadServerSettingsBtn').addEventListener('click', loadServerSettings);
+                document.getElementById('saveServerSettingsBtn').addEventListener('click', saveServerSettings);
+                document.getElementById('serverSettingsDetails').addEventListener('toggle', event => {
+                  if (event.target.open && !serverSettingsRevision) loadServerSettings();
+                });
 
                 async function setCameraEnabled(enabled) {
                   const commandState = document.getElementById('cameraCommandState');
@@ -3731,6 +3896,9 @@ class ZCamHttpServer @Inject constructor(
                 refreshStatus();
                 loadRecordings();
                 setInterval(refreshStatus, 3000);
+                setInterval(() => {
+                  if (!document.hidden && readAuth().token && lastStatusPayload?.server?.alive) loadRecordings();
+                }, 15000);
                 window.setTorch = setTorch;
                 window.setCameraEnabled = setCameraEnabled;
                 window.setNightMode = setNightMode;

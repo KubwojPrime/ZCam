@@ -13,6 +13,8 @@ import androidx.lifecycle.viewModelScope
 import com.zcam.camera.RearCameraLensCatalog
 import com.zcam.camera.RearCameraLensDetector
 import com.zcam.client.ClientCallResult
+import com.zcam.client.ClientRecordingSummary
+import com.zcam.client.ClientRecordingEvent
 import com.zcam.client.ClientTarget
 import com.zcam.client.LocalAudioTransport
 import com.zcam.client.LocalAudioTransportResult
@@ -97,6 +99,10 @@ class ZCamMainViewModel @Inject constructor(
     )
     val state = _state.asStateFlow()
 
+    private var remoteSettingsSnapshot: com.zcam.core.domain.settings.RemoteServerSettings? = null
+    private var remoteSettingsTarget: ClientTarget? = null
+    private var recordingsRefreshJob: Job? = null
+    private var lastRecordingsRefreshAt: Long = 0L
     private var settingsSnapshot: RuntimeSettings = RuntimeSettingsDefaults.value
     private var localRearLensCatalog: RearCameraLensCatalog = RearCameraLensCatalog()
     private var volumeSyncJob: Job? = null
@@ -121,11 +127,9 @@ class ZCamMainViewModel @Inject constructor(
         when (action) {
             is ZCamUiAction.ScreenChanged -> {
                 _state.update { it.copy(screen = action.screen) }
+                if (action.screen == ZCamScreen.SETTINGS && state.value.mode == ZCamMode.CLIENT) loadRemoteSettings()
                 if (action.screen == ZCamScreen.RECORDINGS && state.value.mode == ZCamMode.CLIENT) {
-                    ensureRecordingsDefaults()
-                    if (state.value.recordings.items.isEmpty()) {
-                        fetchRecordingsForRange()
-                    }
+                    fetchRecordingsForRange()
                 }
             }
             is ZCamUiAction.ModeChanged -> {
@@ -140,6 +144,7 @@ class ZCamMainViewModel @Inject constructor(
                 _state.update { current ->
                     current.copy(
                         mode = action.mode,
+                        settings = if (action.mode == ZCamMode.SERVER) settingsSnapshot.toUiSettings(current.settings, localRearLensCatalog.ultraWideAvailable) else SettingsUiState(),
                         showModePicker = false,
                         screen = if (current.showModePicker) ZCamScreen.MAIN else current.screen,
                         showPairingSuggestionDialog = false,
@@ -294,6 +299,7 @@ class ZCamMainViewModel @Inject constructor(
             is ZCamUiAction.SettingsApiTokenChanged -> updateSettingsDraft { copy(apiTokenInput = action.value.trim().take(128)) }
             is ZCamUiAction.SettingsFlagChanged -> updateSettingsFeatureFlag(action.flag, action.enabled)
             is ZCamUiAction.RevokeTrustedDevice -> revokeTrustedDevice(action.deviceId)
+            ZCamUiAction.ReloadServerSettings -> loadRemoteSettings()
             ZCamUiAction.SaveSettings -> saveSettings()
             ZCamUiAction.OpenPairingFromSuggestion -> _state.update {
                 it.copy(
@@ -335,10 +341,10 @@ class ZCamMainViewModel @Inject constructor(
                         } else {
                             state.clientPort
                         },
-                        settings = settings.toUiSettings(
+                        settings = if (state.mode == ZCamMode.SERVER) settings.toUiSettings(
                             previous = state.settings,
                             ultraWideLensAvailable = detectedCatalog.ultraWideAvailable
-                        ),
+                        ) else state.settings,
                         previewTransport = if (state.mode == ZCamMode.SERVER) {
                             settings.stream.preview.transport
                         } else {
@@ -520,6 +526,10 @@ class ZCamMainViewModel @Inject constructor(
         viewModelScope.launch(dispatchers.io) {
             while (isActive) {
                 refreshClientStatusNow()
+                if (state.value.mode == ZCamMode.CLIENT && state.value.screen == ZCamScreen.RECORDINGS &&
+                    System.currentTimeMillis() - lastRecordingsRefreshAt >= 15_000L) {
+                    fetchRecordingsForRange()
+                }
                 delay(CLIENT_STATUS_REFRESH_MS)
             }
         }
@@ -1113,22 +1123,10 @@ class ZCamMainViewModel @Inject constructor(
     }
 
     private fun fetchRecordingsForRange() {
-        viewModelScope.launch(dispatchers.io) {
+        if (recordingsRefreshJob?.isActive == true) return
+        lastRecordingsRefreshAt = System.currentTimeMillis()
+        recordingsRefreshJob = viewModelScope.launch(dispatchers.io) {
             val current = state.value
-            val fromParsed = parseRecordingTimeInput(current.recordings.fromInput)
-            val toParsed = parseRecordingTimeInput(current.recordings.toInput)
-
-            if (fromParsed == INVALID_TIME_INPUT || toParsed == INVALID_TIME_INPUT) {
-                _state.update {
-                    it.copy(errorMessage = "Invalid date format. Use YYYY-MM-DD HH:mm or epoch ms.")
-                }
-                return@launch
-            }
-            if (fromParsed != null && toParsed != null && fromParsed > toParsed) {
-                _state.update { it.copy(errorMessage = "Recordings range invalid: from must be <= to.") }
-                return@launch
-            }
-
             _state.update {
                 it.copy(
                     recordings = it.recordings.copy(
@@ -1143,12 +1141,9 @@ class ZCamMainViewModel @Inject constructor(
             val target = currentTargetForCommands()
 
             when (
-                val result = localClient.fetchRecordings(
-                    target = target,
-                    fromEpochMs = fromParsed,
-                    toEpochMs = toParsed,
-                    limit = 200
-                )
+                val result = com.zcam.client.fetchHistoryPages(500, ClientRecordingSummary::startedAtEpochMs) { before, size ->
+                    localClient.fetchRecordings(target, null, before, size)
+                }
             ) {
                 is ClientCallResult.Success -> {
                     val items = result.value.map { clip ->
@@ -1163,16 +1158,14 @@ class ZCamMainViewModel @Inject constructor(
                         )
                     }
                     val eventsResult = when (
-                        val eventsResult = localClient.fetchRecordingEvents(
-                            target = target,
-                            fromEpochMs = fromParsed,
-                            toEpochMs = toParsed,
-                            limit = 400
-                        )
+                        val eventsResult = com.zcam.client.fetchHistoryPages(1000, ClientRecordingEvent::epochMs) { before, size ->
+                            localClient.fetchRecordingEvents(target, null, before, size)
+                        }
                     ) {
                         is ClientCallResult.Success -> mapRecordingEvents(items, eventsResult.value) to null
                         is ClientCallResult.Failure -> emptyList<RecordingEventUi>() to eventsResult.reason
                     }
+                    if (target != currentTargetForCommands() || state.value.mode != ZCamMode.CLIENT) return@launch
                     val events = eventsResult.first
                     val eventsFailureReason = eventsResult.second
                     _state.update {
@@ -1825,6 +1818,31 @@ class ZCamMainViewModel @Inject constructor(
         return "$prefix: ${result.reason}"
     }
 
+    private fun loadRemoteSettings() {
+        if (state.value.mode != ZCamMode.CLIENT) return
+        if (state.value.clientHost.isBlank() || state.value.pairing.issuedToken.isBlank()) {
+            _state.update { it.copy(settings = it.settings.copy(remoteLoaded = false, loading = false,
+                resultMessage = "Set the server address and pair this client before opening server settings.")) }
+            return
+        }
+        val target = currentTargetForCommands()
+        _state.update { it.copy(settings = it.settings.copy(remoteLoaded = false, loading = true)) }
+        viewModelScope.launch(dispatchers.io) {
+            val result = localClient.fetchServerSettings(target)
+            if (target != currentTargetForCommands() || state.value.mode != ZCamMode.CLIENT) return@launch
+            when (result) {
+                is ClientCallResult.Success -> {
+                    remoteSettingsSnapshot = result.value
+                    remoteSettingsTarget = target
+                    _state.update { it.copy(settings = result.value.settings.toUiSettings(it.settings, it.ultraWideAvailable)
+                        .copy(remoteLoaded = true, loading = false, resultMessage = "", resultTone = StatusTone.NEUTRAL)) }
+                }
+                is ClientCallResult.Failure -> _state.update { it.copy(settings = it.settings.copy(
+                    loading = false, resultMessage = "Cannot load server settings. Check connection and pairing.", resultTone = StatusTone.ERROR)) }
+            }
+        }
+    }
+
     private fun updateSettingsDraft(transform: SettingsUiState.() -> SettingsUiState) {
         _state.update { current ->
             current.copy(
@@ -1855,8 +1873,14 @@ class ZCamMainViewModel @Inject constructor(
         viewModelScope.launch(dispatchers.io) {
             val current = state.value
             val draft = current.settings
-            val detectedCatalog = detectLocalRearLensCatalog()
-            localRearLensCatalog = detectedCatalog
+            val remote = current.mode == ZCamMode.CLIENT
+            if (remote && (remoteSettingsSnapshot == null || remoteSettingsTarget != currentTargetForCommands())) {
+                loadRemoteSettings()
+                return@launch
+            }
+            val baseSettings = if (remote) remoteSettingsSnapshot!!.settings else settingsSnapshot
+            val detectedCatalog = if (remote) localRearLensCatalog else detectLocalRearLensCatalog()
+            if (!remote) localRearLensCatalog = detectedCatalog
             val serverPort = draft.serverPortInput.toIntOrNull()
             val streamWidth = draft.streamWidthInput.toIntOrNull()
             val streamHeight = draft.streamHeightInput.toIntOrNull()
@@ -1871,19 +1895,19 @@ class ZCamMainViewModel @Inject constructor(
 
             val invalidFieldMessage = when {
                 serverPort == null -> "Invalid server port"
-                streamWidth == null -> "Invalid stream width"
-                streamHeight == null -> "Invalid stream height"
+                streamWidth == null || streamWidth <= 0 -> "Invalid stream width"
+                streamHeight == null || streamHeight <= 0 -> "Invalid stream height"
                 streamFps == null -> "Invalid stream FPS"
-                previewWidth == null -> "Invalid preview width"
-                previewHeight == null -> "Invalid preview height"
+                previewWidth == null || previewWidth <= 0 -> "Invalid preview width"
+                previewHeight == null || previewHeight <= 0 -> "Invalid preview height"
                 previewFps == null -> "Invalid preview FPS"
                 previewBitrate == null -> "Invalid preview bitrate"
                 segmentMinutes == null -> "Invalid segment duration"
                 maxStorage == null -> "Invalid max storage value"
                 minFree == null -> "Invalid min free storage value"
-                draft.pinInput.isBlank() -> "PIN is required"
-                draft.apiTokenInput.isBlank() -> "API token is required"
-                draft.rearLensSelection == RearCameraLens.ULTRA_WIDE && !detectedCatalog.ultraWideAvailable ->
+                !remote && draft.pinInput.isBlank() -> "PIN is required"
+                !remote && draft.apiTokenInput.isBlank() -> "API token is required"
+                !remote && draft.rearLensSelection == RearCameraLens.ULTRA_WIDE && !detectedCatalog.ultraWideAvailable ->
                     "Ultra-wide camera not detected on this device"
                 else -> null
             }
@@ -1913,19 +1937,19 @@ class ZCamMainViewModel @Inject constructor(
                 )
             }
 
-            val candidate = settingsSnapshot.copy(
+            val candidate = baseSettings.copy(
                 serverPort = serverPort!!,
-                stream = settingsSnapshot.stream.copy(
-                    resolution = settingsSnapshot.stream.resolution.copy(
+                stream = baseSettings.stream.copy(
+                    resolution = baseSettings.stream.resolution.copy(
                         width = streamWidth!!,
                         height = streamHeight!!
                     ),
                     fps = streamFps!!,
                     rearLens = draft.rearLensSelection,
                     eventSensitivity = draft.eventSensitivitySelection,
-                    preview = settingsSnapshot.stream.preview.copy(
+                    preview = baseSettings.stream.preview.copy(
                         transport = draft.previewTransportSelection,
-                        resolution = settingsSnapshot.stream.preview.resolution.copy(
+                        resolution = baseSettings.stream.preview.resolution.copy(
                             width = previewWidth!!,
                             height = previewHeight!!
                         ),
@@ -1933,16 +1957,16 @@ class ZCamMainViewModel @Inject constructor(
                         bitrateKbps = previewBitrate!!
                     )
                 ),
-                recording = settingsSnapshot.recording.copy(
+                recording = baseSettings.recording.copy(
                     segmentMinutes = segmentMinutes!!,
                     maxStorageGb = maxStorage!!,
                     minFreeStorageGb = minFree!!
                 ),
-                security = settingsSnapshot.security.copy(
+                security = baseSettings.security.copy(
                     pinCode = draft.pinInput,
                     apiToken = draft.apiTokenInput
                 ),
-                featureFlags = settingsSnapshot.featureFlags.copy(
+                featureFlags = baseSettings.featureFlags.copy(
                     mjpegStreaming = draft.mjpegStreamingEnabled,
                     loopRecording = draft.loopRecordingEnabled,
                     audioPushToTalk = draft.audioPushToTalkEnabled,
@@ -1952,6 +1976,29 @@ class ZCamMainViewModel @Inject constructor(
                     watchdogRecovery = draft.watchdogRecoveryEnabled
                 )
             )
+
+            if (remote) {
+                val target = currentTargetForCommands()
+                val snapshot = remoteSettingsSnapshot!!
+                val result = localClient.saveServerSettings(target, snapshot.copy(settings = candidate))
+                if (target != currentTargetForCommands()) return@launch
+                val saved = result is ClientCallResult.Success
+                if (saved) {
+                    remoteSettingsSnapshot = snapshot.copy(settings = candidate,
+                        revision = com.zcam.core.domain.settings.RemoteServerSettingsCodec.revision(candidate))
+                    remoteSettingsTarget = target.copy(port = candidate.serverPort)
+                    _state.update { it.copy(clientPort = candidate.serverPort.toString()) }
+                    scheduleClientSessionPersist()
+                    refreshPreviewTarget()
+                }
+                _state.update { it.copy(settings = it.settings.copy(saving = false,
+                    resultMessage = if (result is ClientCallResult.Success) "Server settings saved; reconnecting..."
+                        else if (result is ClientCallResult.Failure && result.reason == "settings_changed_reload_required")
+                            "Server settings changed. Reload them before saving."
+                        else "Server update could not be applied. Reload settings and try again.",
+                    resultTone = if (result is ClientCallResult.Success) StatusTone.HEALTHY else StatusTone.ERROR)) }
+                return@launch
+            }
 
             when (val result = runtimeSettingsRepository.updateSettings(candidate)) {
                 is RuntimeSettingsUpdateResult.Success -> {

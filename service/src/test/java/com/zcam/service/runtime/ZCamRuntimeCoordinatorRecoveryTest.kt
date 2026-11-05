@@ -52,6 +52,48 @@ class ZCamRuntimeCoordinatorRecoveryTest {
 
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test
+    fun settings_restart_preserves_camera_off_and_applies_the_new_stream_configuration() = runTest(timeout = 20.seconds) {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val runtimeState = FakeRuntimeStateRepository()
+        runtimeState.setCameraEnabled(false)
+        val server = FlakyServer(failuresBeforeSuccess = 0)
+        val camera = TrackingCameraRuntime()
+        val runtimeSettings = FakeRuntimeSettingsRepository(RuntimeSettingsDefaults.value)
+        val coordinator = ZCamRuntimeCoordinator(
+            cameraRuntime = camera,
+            localHttpServer = server,
+            pushToTalkManager = NoopAudioManager(),
+            loopRecordingManager = NoopLoopRecordingManager(),
+            watchdogManager = FakeWatchdogManager(),
+            runtimeEnvironmentMonitor = FakeRuntimeEnvironmentMonitor(),
+            runtimeSettingsRepository = runtimeSettings,
+            runtimeCrashRepository = FakeRuntimeCrashRepository(),
+            runtimeStateRepository = runtimeState,
+            runtimeHealthRepository = InMemoryRuntimeHealthRepository(),
+            recoveryPolicy = RecoveryPolicy(baseDelayMs = 5, maxDelayMs = 40, maxAttemptsBeforeCooldown = 4, cooldownMs = 100),
+            retryBackoffScheduler = RecordingBackoffScheduler(),
+            dispatchers = TestDispatcherProvider(dispatcher),
+            logger = NoopLogger()
+        )
+
+        coordinator.start()
+        runCurrent()
+        coordinator.stop(persistDesiredState = false)
+        runtimeSettings.updateSettings(RuntimeSettingsDefaults.value.copy(stream = RuntimeSettingsDefaults.value.stream.copy(fps = 20)))
+        coordinator.start()
+        runCurrent()
+        assertTrue(server.isHealthy())
+        assertTrue(camera.startConfigs.isEmpty())
+        assertFalse(runtimeState.desiredState.value.cameraEnabled)
+        assertTrue(coordinator.setCameraEnabled(true))
+        runCurrent()
+        assertEquals(20, camera.startConfigs.last().fps)
+        coordinator.stop(persistDesiredState = false)
+        advanceUntilIdle()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
     fun camera_can_be_disabled_without_stopping_server() = runTest(timeout = 20.seconds) {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val runtimeState = FakeRuntimeStateRepository()

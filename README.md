@@ -96,6 +96,7 @@ Main endpoints:
 - `GET /snapshot.jpg`
 - `GET /api/status`
 - `POST /api/camera`
+- `GET /api/settings` and `POST /api/settings` (paired clients)
 - `POST /api/camera/torch`
 - `POST /api/camera/night-mode`
 - `POST /api/camera/zoom`
@@ -179,11 +180,36 @@ The browser panel uses the same range-enabled endpoints, typed event colors,
 timed event bars, and two-level global seek control. The coarse slider navigates
 the complete recording range by time, while a detailed slider covers a ten
 minute window with one-second steps. All available finalized recordings load
-automatically. Use Refresh recordings to fetch newly finalized segments and
-events without resetting playback of the selected clip. The active segment is pinned to the top of a separately
+automatically, fetching successive pages until the retained history is complete.
+Both clients check for newly finalized segments and events every 15 seconds
+while the history is visible, preserving playback and its current position.
+The active segment is pinned to the top of a separately
 scrollable five-row list, and clip metadata appears directly below the history
 controls. The panel prepares the next recording in a standby player and swaps
 players at segment boundaries to minimize transition latency on slower links.
+
+The Android player uses the same layout: two time controls immediately below
+the player, clip information below the history, and an independently scrolling
+list with at most five segment rows. The coarse control covers the entire
+history; the fine control covers a ten-minute window in one-second increments.
+The selected hour is shown above the coarse control, and minutes/seconds above
+the fine control. Newly appended segments do not recreate the Android player.
+
+## Remote Server Settings
+
+Open Settings in the paired Android client, or expand Server settings in the
+authenticated browser panel. The form loads the remote server's port, video,
+preview, event sensitivity, recording limits, and runtime feature flags.
+Saving validates the whole candidate and requests a short runtime restart to
+apply it, preserving the camera's on/off choice and all existing recordings.
+The Android client reconnects on the new port if it changes. The browser shows
+the new address; enter existing credentials there because browser storage is
+separate for each port.
+
+Only authenticated trusted devices can access this API. Responses exclude PINs,
+API tokens and the trust list; pairing administration remains on the server.
+A revision value prevents stale forms from overwriting newer operational
+settings. If settings changed elsewhere, reload them before saving again.
 
 Active recording segments use a `.partial.mp4` name and are published only
 after CameraX successfully finalizes a valid MP4 container. On startup, ZCam

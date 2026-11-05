@@ -23,6 +23,9 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
@@ -51,6 +54,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.graphics.Color as ComposeColor
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
@@ -444,31 +452,8 @@ internal fun RecordingsStudioScreen(
                     fontWeight = FontWeight.SemiBold
                 )
                 Text(
-                    text = "Load a time range, tap a segment or event marker, then scrub the selected recording below.",
+                    text = "All available recordings load automatically. Choose a segment or use the two time controls.",
                     style = MaterialTheme.typography.bodySmall
-                )
-                OutlinedTextField(
-                    modifier = Modifier.fillMaxWidth(),
-                    value = state.recordings.fromInput,
-                    onValueChange = { onAction(ZCamUiAction.RecordingsFromChanged(it)) },
-                    label = { Text("From") },
-                    singleLine = true
-                )
-                OutlinedTextField(
-                    modifier = Modifier.fillMaxWidth(),
-                    value = state.recordings.toInput,
-                    onValueChange = { onAction(ZCamUiAction.RecordingsToChanged(it)) },
-                    label = { Text("To") },
-                    singleLine = true
-                )
-                ActiveActionButton(
-                    text = if (state.recordings.loading) "Loading..." else "Load recordings",
-                    active = state.recordings.items.isNotEmpty(),
-                    onClick = { onAction(ZCamUiAction.FetchRecordings) },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(52.dp),
-                    enabled = !state.recordings.loading
                 )
                 if (state.recordings.resultMessage.isNotBlank()) {
                     Text(
@@ -487,7 +472,6 @@ internal fun RecordingsStudioScreen(
         }
 
         RecordingPlayerCard(state = state, onAction = onAction)
-        RecordingTimelineCard(state = state, onAction = onAction)
         RecordingSegmentsList(state = state, onAction = onAction)
     }
 }
@@ -507,7 +491,7 @@ private fun RecordingPlayerCard(
     val playlistKey = remember(playbackItems, playbackHeaders) {
         playbackItems.joinToString("|") { "${it.fileName}:${it.url}" } + playbackHeaders.hashCode()
     }
-    val player = remember(playlistKey) {
+    val player = remember(playbackHeaders, state.recordings.selectedPlaybackSourceLabel) {
         val dataSourceFactory = OkHttpDataSource.Factory(httpClient)
             .setDefaultRequestProperties(playbackHeaders)
         ExoPlayer.Builder(context)
@@ -520,14 +504,42 @@ private fun RecordingPlayerCard(
             .build()
             .apply {
                 setSeekParameters(SeekParameters.CLOSEST_SYNC)
-                setMediaItems(playbackItems.map { item ->
+                val initialItems = playbackItems.map { item ->
                     MediaItem.Builder()
                         .setMediaId(item.fileName)
                         .setUri(item.url)
                         .build()
-                })
+                }
+                if (initialItems.isNotEmpty()) {
+                    setMediaItems(initialItems, playbackItems.indexOfFirst { it.fileName == state.recordings.selectedFileName }.coerceAtLeast(0), selectedOffsetMs)
+                } else clearMediaItems()
                 prepare()
             }
+    }
+    LaunchedEffect(player, playlistKey) {
+        val oldIds = (0 until player.mediaItemCount).map { player.getMediaItemAt(it).mediaId }
+        val newItems = playbackItems.map { MediaItem.Builder().setMediaId(it.fileName).setUri(it.url).build() }
+        val newIds = newItems.map { it.mediaId }
+        if (oldIds != newIds) {
+            if (newIds.take(oldIds.size) == oldIds) {
+                player.addMediaItems(newItems.drop(oldIds.size))
+                if (oldIds.isEmpty()) {
+                    player.seekTo(newIds.indexOf(state.recordings.selectedFileName).coerceAtLeast(0), selectedOffsetMs)
+                    player.prepare()
+                }
+            } else {
+                val activeId = player.currentMediaItem?.mediaId
+                val index = newIds.indexOf(activeId).coerceAtLeast(0)
+                val position = if (activeId in newIds) player.currentPosition.coerceAtLeast(0L) else 0L
+                val resume = player.playWhenReady
+                if (newItems.isEmpty()) player.clearMediaItems()
+                else {
+                    player.setMediaItems(newItems, index, position)
+                    player.prepare()
+                }
+                player.playWhenReady = resume
+            }
+        }
     }
     var durationMs by remember(player) { mutableLongStateOf(0L) }
     var positionMs by remember(player) { mutableLongStateOf(selectedOffsetMs) }
@@ -748,35 +760,9 @@ private fun RecordingPlayerCard(
                     }
                 }
 
-                if (selectedEvents.isNotEmpty() && effectiveDurationMs > 0L && selectedItem != null) {
-                    RecordingEventMarkerStrip(
-                        selectedItem = selectedItem,
-                        events = selectedEvents,
-                        onAction = onAction
-                    )
-                }
-                Slider(
-                    value = (if (scrubbing) scrubPositionMs else positionMs).coerceAtMost(effectiveDurationMs).toFloat(),
-                    onValueChange = { value ->
-                        scrubbing = true
-                        scrubPositionMs = value.toLong()
-                    },
-                    onValueChangeFinished = {
-                        val target = scrubPositionMs.coerceAtMost(effectiveDurationMs)
-                        player.seekTo(target)
-                        positionMs = target
-                        scrubbing = false
-                    },
-                    valueRange = 0f..sliderMax
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text(formatDuration(positionMs), style = MaterialTheme.typography.bodySmall)
-                    Text(formatDuration(effectiveDurationMs), style = MaterialTheme.typography.bodySmall)
-                }
             }
+
+            RecordingTimelineCard(state = state, onAction = onAction)
 
             if (selectedItem != null) {
                 Text(
@@ -829,54 +815,6 @@ private fun RecordingMetadataRow(
 }
 
 @Composable
-private fun RecordingEventMarkerStrip(
-    selectedItem: RecordingItemUi,
-    events: List<RecordingEventUi>,
-    onAction: (ZCamUiAction) -> Unit
-) {
-    val durationMs = selectedItem.durationMs.coerceAtLeast(1L).toFloat()
-    BoxWithConstraints(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(28.dp)
-    ) {
-        val barWidth = maxWidth
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(8.dp)
-                .align(Alignment.Center)
-                .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(8.dp))
-        )
-        events.forEach { event ->
-            val offsetMs = event.recordingOffsetMs ?: return@forEach
-            val startFraction = (offsetMs / durationMs).coerceIn(0f, 1f)
-            val endFraction = ((offsetMs + event.durationMs) / durationMs).coerceIn(startFraction, 1f)
-            val eventWidth = (barWidth * (endFraction - startFraction)).coerceAtLeast(6.dp)
-            Box(
-                modifier = Modifier
-                    .width(eventWidth)
-                    .height(20.dp)
-                    .background(
-                        if (event.type == "camera_tamper") MaterialTheme.colorScheme.error
-                        else MaterialTheme.colorScheme.primary,
-                        RoundedCornerShape(6.dp)
-                    )
-                    .align(Alignment.CenterStart)
-                    .offset(x = barWidth * startFraction)
-                    .clickable {
-                        onAction(ZCamUiAction.PlayRecording(selectedItem.fileName, event.epochMs))
-                    }
-            )
-        }
-    }
-    Text(
-        text = "Current Clip Timeline. Event bars show their duration. Tap a bar to jump to its beginning.",
-        style = MaterialTheme.typography.bodySmall
-    )
-}
-
-@Composable
 private fun RecordingTimelineCard(
     state: ZCamUiState,
     onAction: (ZCamUiAction) -> Unit
@@ -907,7 +845,7 @@ private fun RecordingTimelineCard(
             )
             if (rangeStart == null || rangeEnd == null || rangeEnd <= rangeStart) {
                 Text(
-                    text = "Load recordings to build the timeline.",
+                    text = "No finalized recordings are available yet.",
                     style = MaterialTheme.typography.bodySmall
                 )
                 return@Column
@@ -924,7 +862,7 @@ private fun RecordingTimelineCard(
                     item.startedAtEpochMs + state.recordings.selectedPlaybackOffsetMs
                         .coerceIn(0L, item.durationMs.coerceAtLeast(0L))
                 }
-            var timelineScrubEpochMs by remember(rangeStart, rangeEnd) {
+            var timelineScrubEpochMs by remember(rangeStart) {
                 mutableLongStateOf(selectedEpochMs ?: rangeStart)
             }
             var timelineScrubbing by remember { mutableStateOf(false) }
@@ -933,6 +871,44 @@ private fun RecordingTimelineCard(
                     timelineScrubEpochMs = selectedEpochMs.coerceIn(rangeStart, rangeEnd)
                 }
             }
+            var detailCenterMs by remember(rangeStart) { mutableLongStateOf(selectedEpochMs ?: rangeStart) }
+            val detailWindow = remember(rangeStart, detailCenterMs) {
+                val start = maxOf(rangeStart, detailCenterMs - 5 * MINUTE_MS)
+                start to minOf(rangeEnd, detailCenterMs + 5 * MINUTE_MS).coerceAtLeast(start + 1)
+            }
+            val detailStart = detailWindow.first
+            val detailEnd = detailWindow.second
+            LaunchedEffect(selectedEpochMs, timelineScrubbing) {
+                if (!timelineScrubbing && selectedEpochMs != null && selectedEpochMs !in detailStart..detailEnd) {
+                    detailCenterMs = selectedEpochMs
+                }
+            }
+            Text("Hour: " + formatDateTime(timelineScrubEpochMs), style = MaterialTheme.typography.labelMedium)
+            Slider(
+                value = ((timelineScrubEpochMs.coerceIn(rangeStart, rangeEnd) - rangeStart).toDouble() / totalRangeMs).toFloat(),
+                onValueChange = { value ->
+                    timelineScrubbing = true
+                    timelineScrubEpochMs = (rangeStart + ((totalRangeMs * value.toDouble()) / MINUTE_MS).toLong() * MINUTE_MS).coerceIn(rangeStart, rangeEnd)
+                    detailCenterMs = timelineScrubEpochMs
+                },
+                onValueChangeFinished = {
+                    timelineScrubbing = false
+                    onAction(ZCamUiAction.PlayRecordingAtEpoch(timelineScrubEpochMs))
+                }, valueRange = 0f..1f
+            )
+            Text("Minute: " + java.text.SimpleDateFormat("mm:ss", java.util.Locale.getDefault()).format(java.util.Date(timelineScrubEpochMs)),
+                style = MaterialTheme.typography.labelMedium)
+            Slider(
+                value = ((timelineScrubEpochMs.coerceIn(detailStart, detailEnd) - detailStart).toDouble() / (detailEnd - detailStart)).toFloat(),
+                onValueChange = { value ->
+                    timelineScrubbing = true
+                    timelineScrubEpochMs = (detailStart + (((detailEnd - detailStart) * value.toDouble()) / 1000).toLong() * 1000).coerceIn(detailStart, detailEnd)
+                },
+                onValueChangeFinished = {
+                    timelineScrubbing = false
+                    onAction(ZCamUiAction.PlayRecordingAtEpoch(timelineScrubEpochMs))
+                }, valueRange = 0f..1f
+            )
             val scrollState = rememberScrollState()
             val coroutineScope = rememberCoroutineScope()
 
@@ -1094,24 +1070,6 @@ private fun RecordingTimelineCard(
                 }
             }
 
-            Text("Time", style = MaterialTheme.typography.labelMedium)
-            Slider(
-                value = (
-                    (timelineScrubEpochMs.coerceIn(rangeStart, rangeEnd) - rangeStart).toDouble() /
-                        totalRangeMs.toDouble()
-                    ).toFloat().coerceIn(0f, 1f),
-                onValueChange = { value ->
-                    timelineScrubbing = true
-                    timelineScrubEpochMs = (
-                        rangeStart + (totalRangeMs.toDouble() * value.coerceIn(0f, 1f)).toLong()
-                        ).coerceIn(rangeStart, rangeEnd)
-                },
-                onValueChangeFinished = {
-                    timelineScrubbing = false
-                    onAction(ZCamUiAction.PlayRecordingAtEpoch(timelineScrubEpochMs))
-                },
-                valueRange = 0f..1f
-            )
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween
@@ -1154,83 +1112,30 @@ private fun RecordingSegmentsList(
                 Text("No recordings in the selected range.", style = MaterialTheme.typography.bodySmall)
                 return@Column
             }
-            state.recordings.items.forEach { item ->
-                val downloadActive = state.recordings.downloadLoading &&
-                    state.recordings.activeDownloadFileName == item.fileName
-                val downloadFraction = if (downloadActive) {
-                    val totalBytes = state.recordings.downloadTotalBytes
-                    if (totalBytes != null && totalBytes > 0L) {
-                        (state.recordings.downloadDownloadedBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f)
-                    } else {
-                        null
-                    }
-                } else {
-                    null
+            val ordered = state.recordings.items.sortedWith(compareBy<RecordingItemUi> { it.fileName != state.recordings.selectedFileName }
+                .thenBy { it.startedAtEpochMs })
+            val listState = rememberLazyListState()
+            LaunchedEffect(state.recordings.selectedFileName) { listState.scrollToItem(0) }
+            val containScroll = remember {
+                object : NestedScrollConnection {
+                    override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset =
+                        Offset(0f, available.y)
+                    override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity =
+                        Velocity(0f, available.y)
                 }
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = if (state.recordings.selectedFileName == item.fileName) {
-                            MaterialTheme.colorScheme.secondaryContainer
-                        } else {
-                            MaterialTheme.colorScheme.surface
+            }
+            LazyColumn(state = listState, modifier = Modifier.fillMaxWidth()
+                .height((minOf(5, ordered.size) * 80).dp).nestedScroll(containScroll)) {
+                items(ordered, key = { it.fileName }) { item ->
+                    Row(modifier = Modifier.fillMaxWidth().height(80.dp).padding(6.dp)
+                        .background(if (item.fileName == state.recordings.selectedFileName) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surface),
+                        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Column(modifier = Modifier.weight(1f).clickable { onAction(ZCamUiAction.PlayRecording(item.fileName)) }) {
+                            Text(formatDateTime(item.startedAtEpochMs), style = MaterialTheme.typography.labelMedium, maxLines = 1)
+                            Text(formatDuration(item.durationMs) + " / " + formatSize(item.sizeBytes), style = MaterialTheme.typography.bodySmall, maxLines = 1)
                         }
-                    )
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(10.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Text(item.fileName, fontWeight = FontWeight.SemiBold)
-                        Text(
-                            text = "Date ${formatDateTime(item.startedAtEpochMs)}",
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                        Text(
-                            text = "Duration ${formatDuration(item.durationMs)}  Size ${formatSize(item.sizeBytes)}",
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                        Text(
-                            text = "Format ${item.container} / ${item.codec}",
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                        if (downloadActive) {
-                            if (downloadFraction != null) {
-                                LinearProgressIndicator(
-                                    progress = downloadFraction,
-                                    modifier = Modifier.fillMaxWidth()
-                                )
-                            } else {
-                                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                            }
-                        }
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            OutlinedButton(
-                                onClick = { onAction(ZCamUiAction.PlayRecording(item.fileName)) },
-                                modifier = Modifier.weight(1f)
-                            ) {
-                                Text("Play")
-                            }
-                            Button(
-                                onClick = { onAction(ZCamUiAction.DownloadRecording(item.fileName)) },
-                                modifier = Modifier.weight(1f),
-                                enabled = !state.recordings.downloadLoading || downloadActive
-                            ) {
-                                Text(
-                                    if (downloadActive) {
-                                        downloadFraction?.let { fraction -> "Download ${(fraction * 100f).toInt()}%" }
-                                            ?: "Downloading..."
-                                    } else {
-                                        "Download"
-                                    }
-                                )
-                            }
-                        }
+                        OutlinedButton(onClick = { onAction(ZCamUiAction.PlayRecording(item.fileName)) }) { Text("Play") }
+                        OutlinedButton(onClick = { onAction(ZCamUiAction.DownloadRecording(item.fileName)) }, enabled = !state.recordings.downloadLoading) { Text("Save") }
                     }
                 }
             }

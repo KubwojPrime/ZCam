@@ -20,6 +20,10 @@ import com.zcam.core.domain.config.FeatureFlag
 import com.zcam.core.domain.config.RuntimeSettings
 import com.zcam.core.domain.config.RuntimeSettingsDefaults
 import com.zcam.core.domain.config.TrustedDevice
+import com.zcam.core.domain.settings.RemoteServerSettingsCodec
+import com.zcam.core.domain.recording.RuntimeRestartRequester
+import com.zcam.core.domain.recording.CameraCommandResult
+import org.junit.Assert.assertFalse
 import com.zcam.core.domain.settings.RuntimeSettingsRepository
 import com.zcam.core.domain.settings.RuntimeSettingsUpdateResult
 import com.zcam.core.logging.ZCamLogger
@@ -57,6 +61,7 @@ class ZCamSecurityEndpointsIntegrationTest {
     private lateinit var securityManager: LocalSecurityManager
     private lateinit var httpServer: ZCamHttpServer
     private var port: Int = 0
+    private var settingsRestartRequested = false
 
     @Before
     fun setUp() {
@@ -75,7 +80,12 @@ class ZCamSecurityEndpointsIntegrationTest {
             powerStatusProvider = FakePowerStatusProvider(),
             dispatchers = dispatchers,
             logger = logger,
-            lanAccessPolicy = LanAccessPolicy()
+            lanAccessPolicy = LanAccessPolicy(),
+            runtimeSettingsRepository = runtimeSettingsRepository,
+            runtimeRestartRequester = object : RuntimeRestartRequester {
+                override fun requestRestart(): Boolean { settingsRestartRequested = true; return true }
+                override suspend fun requestCameraEnabled(enabled: Boolean) = CameraCommandResult.APPLIED
+            }
         )
         port = findFreePort()
         runBlocking {
@@ -268,6 +278,62 @@ class ZCamSecurityEndpointsIntegrationTest {
         client.newCall(statusRequest).execute().use {
             assertEquals(200, it.code)
         }
+    }
+
+    @Test
+    fun server_settings_require_authentication_and_a_paired_device() {
+        client.newCall(Request.Builder().url("http://127.0.0.1:$port/api/settings").build()).execute().use {
+            assertEquals(401, it.code)
+        }
+        postJson("/api/settings", "{}").use { assertEquals(401, it.code) }
+        client.newCall(Request.Builder().url("http://127.0.0.1:$port/api/settings")
+            .header("X-ZCam-Token", RuntimeSettingsDefaults.value.security.apiToken).build()).execute().use {
+            assertEquals(403, it.code)
+        }
+    }
+
+    @Test
+    fun paired_client_can_read_and_save_operational_settings_without_receiving_secrets() {
+        registerSettingsClient()
+        client.newCall(settingsRequest().get().build()).execute().use {
+            assertEquals(200, it.code)
+            val body = it.body!!.string()
+            assertFalse(body.contains("apiToken"))
+            assertFalse(body.contains("pinCode"))
+            assertFalse(body.contains(RuntimeSettingsDefaults.value.security.apiToken))
+        }
+        val original = runBlocking { runtimeSettingsRepository.settings.first() }
+        saveSettingsRequest(mapOf("streamFps" to "20")).use { assertEquals(200, it.code) }
+        val saved = runBlocking { runtimeSettingsRepository.settings.first() }
+        assertEquals(20, saved.stream.fps)
+        assertEquals(original.security, saved.security)
+        assertTrue(settingsRestartRequested)
+    }
+
+    @Test
+    fun stale_or_invalid_remote_settings_do_not_modify_the_server() {
+        registerSettingsClient()
+        val original = runBlocking { runtimeSettingsRepository.settings.first() }
+        saveSettingsRequest(mapOf("streamFps" to "0")).use { assertEquals(400, it.code) }
+        saveSettingsRequest(mapOf("apiToken" to "unwanted-token")).use { assertEquals(400, it.code) }
+        saveSettingsRequest(mapOf("revision" to "stale")).use { assertEquals(409, it.code) }
+        assertEquals(original, runBlocking { runtimeSettingsRepository.settings.first() })
+        assertFalse(settingsRestartRequested)
+    }
+
+    private fun registerSettingsClient() = runBlocking {
+        runtimeSettingsRepository.upsertTrustedDevice(TrustedDevice("settings-client", "Paired client", 1L))
+    }
+
+    private fun settingsRequest() = Request.Builder().url("http://127.0.0.1:$port/api/settings")
+        .header("X-ZCam-Token", RuntimeSettingsDefaults.value.security.apiToken)
+        .header("X-ZCam-Device-Id", "settings-client")
+
+    private fun saveSettingsRequest(changes: Map<String, String>): okhttp3.Response {
+        val current = runBlocking { runtimeSettingsRepository.settings.first() }
+        val fields = RemoteServerSettingsCodec.encode(current) + ("revision" to RemoteServerSettingsCodec.revision(current)) + changes
+        val payload = fields.entries.joinToString(",", "{", "}") { "\"" + it.key + "\":\"" + it.value + "\"" }
+        return client.newCall(settingsRequest().post(payload.toRequestBody(JSON_MEDIA_TYPE)).build()).execute()
     }
 
     private fun postJson(path: String, body: String) = client.newCall(

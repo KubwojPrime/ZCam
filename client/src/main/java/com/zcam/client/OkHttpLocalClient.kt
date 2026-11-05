@@ -169,6 +169,23 @@ class OkHttpLocalClient @Inject constructor(
     override suspend fun restartRuntime(target: ClientTarget): ClientCallResult<Unit> =
         executeAction(target, "/api/runtime/restart", "{}")
 
+    override suspend fun fetchServerSettings(target: ClientTarget) = executeJsonRequest(
+        target, "/api/settings", HttpMethod.GET
+    ) { json ->
+        val fields = json.keys().asSequence().filter { it != "revision" }.associateWith { json.getString(it) }
+        com.zcam.core.domain.settings.RemoteServerSettings(
+            com.zcam.core.domain.settings.RemoteServerSettingsCodec.decode(fields), json.getString("revision")
+        )
+    }
+
+    override suspend fun saveServerSettings(
+        target: ClientTarget, settings: com.zcam.core.domain.settings.RemoteServerSettings
+    ): ClientCallResult<Unit> {
+        val fields = com.zcam.core.domain.settings.RemoteServerSettingsCodec.encode(settings.settings)
+        val payload = JSONObject(fields).put("revision", settings.revision).toString()
+        return executeAction(target, "/api/settings", payload)
+    }
+
     override suspend fun setCameraEnabled(target: ClientTarget, enabled: Boolean): ClientCallResult<Unit> {
         val payload = JSONObject().put("enabled", enabled).toString()
         return executeAction(target, "/api/camera", payload)
@@ -342,7 +359,7 @@ class OkHttpLocalClient @Inject constructor(
         val urlBuilder = httpUrl.newBuilder()
         fromEpochMs?.let { urlBuilder.addQueryParameter("fromEpochMs", it.toString()) }
         toEpochMs?.let { urlBuilder.addQueryParameter("toEpochMs", it.toString()) }
-        urlBuilder.addQueryParameter("limit", limit.coerceIn(1, 500).toString())
+        urlBuilder.addQueryParameter("limit", limit.coerceIn(1, 10000).toString())
 
         val requestBuilder = Request.Builder()
             .url(urlBuilder.build())
@@ -407,7 +424,7 @@ class OkHttpLocalClient @Inject constructor(
         val urlBuilder = httpUrl.newBuilder()
         fromEpochMs?.let { urlBuilder.addQueryParameter("fromEpochMs", it.toString()) }
         toEpochMs?.let { urlBuilder.addQueryParameter("toEpochMs", it.toString()) }
-        urlBuilder.addQueryParameter("limit", limit.coerceIn(1, 1000).toString())
+        urlBuilder.addQueryParameter("limit", limit.coerceIn(1, 20000).toString())
 
         val requestBuilder = Request.Builder()
             .url(urlBuilder.build())
@@ -546,14 +563,13 @@ class OkHttpLocalClient @Inject constructor(
         payload: String? = null,
         mapper: (JSONObject) -> T
     ): ClientCallResult<T> = withContext(dispatchers.io) {
-        val builder = requestBuilder(target, path, includeAuth = includeAuth)
-        when (method) {
-            HttpMethod.GET -> builder.get()
-            HttpMethod.POST -> builder.post((payload ?: "{}").toRequestBody(JSON_MEDIA))
-        }
-        val request = builder.build()
-
         runCatching {
+            val builder = requestBuilder(target, path, includeAuth = includeAuth)
+            when (method) {
+                HttpMethod.GET -> builder.get()
+                HttpMethod.POST -> builder.post((payload ?: "{}").toRequestBody(JSON_MEDIA))
+            }
+            val request = builder.build()
             client.newCall(request).execute().use { response ->
                 val bodyString = response.body?.string().orEmpty()
                 if (!response.isSuccessful) {
@@ -570,6 +586,7 @@ class OkHttpLocalClient @Inject constructor(
         }.getOrElse { error ->
             logger.w("HTTP call failed path=$path error=${error.message}")
             val reason = when (error) {
+                is IllegalArgumentException -> "invalid_target"
                 is java.net.UnknownHostException -> "host_not_found"
                 is java.net.ConnectException -> "connect_error"
                 is java.net.SocketTimeoutException -> "timeout"
