@@ -12,6 +12,22 @@ release.
 - Added trademark and brand policy reserving the ZCam name, logos, icons, and
   visual brand identifiers.
 
+## 0.2.14 - 2026-11-05
+
+- Completed the Android recording history layout with coarse/fine time controls
+  below the player, clip metadata below the history, and a five-row segment list.
+- Added complete paginated history loading and automatic refresh without
+  resetting active playback or manual segment-list scrolling.
+- Added paired-client server settings in Android and the browser, with validated
+  transactional updates, stale-form protection, and preserved credentials/trust.
+- Applied remote server settings through a runtime restart that preserves the
+  camera's enabled/disabled choice and reconnects Android clients on port changes.
+- Reported camera command execution results and local activation requirements
+  instead of accepting commands that Android cannot execute in the background.
+- Added user-action recovery notifications when Android blocks an automatic
+  server start, and made sticky restarts restore only the server.
+- Removed recovery backoff locks that could indefinitely block camera shutdown.
+
 ## 0.2.13 - 2026-11-05
 
 - Replaced the clip-local browser timeline with coarse and detailed controls

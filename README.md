@@ -3,7 +3,7 @@
 ZCam is a local-first Android camera and audio monitoring app designed for
 long-running LAN/VPN operation without a cloud backend.
 
-Current public release: `0.2.13`.
+Current public release: `0.2.14`.
 
 Project status: pre-1.0 hardening. The app already contains the core runtime
 architecture, local HTTP API, pairing, recording, watchdog/recovery, and client
