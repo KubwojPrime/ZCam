@@ -413,6 +413,7 @@ class ZCamHttpServer @Inject constructor(
             "/health" -> NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.OK, NanoHTTPD.MIME_PLAINTEXT, "ok")
             "/api/status" -> buildStatusResponse()
             "/api/runtime/restart" -> handleRuntimeRestartEndpoint(session)
+            "/api/camera" -> handleCameraRuntimeEndpoint(session)
             "/api/recordings" -> handleRecordingsListEndpoint(session)
             "/video", "/mjpeg" -> buildVideoResponse()
             "/snapshot.jpg" -> buildSnapshotResponse()
@@ -441,6 +442,31 @@ class ZCamHttpServer @Inject constructor(
             return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.CONFLICT, JSON_UTF8, "{\"status\":\"error\",\"reason\":\"restart_in_progress\"}")
         }
         return NanoHTTPD.newFixedLengthResponse(NanoHTTPD.Response.Status.ACCEPTED, JSON_UTF8, "{\"status\":\"accepted\"}")
+    }
+
+    private fun handleCameraRuntimeEndpoint(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
+        if (session.method != NanoHTTPD.Method.POST) return methodNotAllowed("POST")
+        val payload = parsePostPayload(session) ?: return badRequest("request body is required")
+        val enabled = parseBoolean(valueOf(payload, "enabled"))
+            ?: return badRequest("missing enabled. expected boolean value")
+        val requester = runtimeRestartRequester
+            ?: return NanoHTTPD.newFixedLengthResponse(
+                NanoHTTPD.Response.Status.SERVICE_UNAVAILABLE,
+                JSON_UTF8,
+                "{\"status\":\"error\",\"reason\":\"camera_control_unavailable\"}"
+            )
+        if (!requester.requestCameraEnabled(enabled)) {
+            return NanoHTTPD.newFixedLengthResponse(
+                NanoHTTPD.Response.Status.SERVICE_UNAVAILABLE,
+                JSON_UTF8,
+                "{\"status\":\"error\",\"reason\":\"camera_control_queue_unavailable\"}"
+            )
+        }
+        return NanoHTTPD.newFixedLengthResponse(
+            NanoHTTPD.Response.Status.ACCEPTED,
+            JSON_UTF8,
+            "{\"status\":\"accepted\",\"cameraEnabled\":$enabled}"
+        )
     }
 
     private fun handleEventFrameEndpoint(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
@@ -1713,6 +1739,10 @@ class ZCamHttpServer @Inject constructor(
                 .controlRow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
                 .controlRow > button { flex: 1 1 120px; }
                 .list { display: grid; gap: 6px; max-height: 320px; overflow: auto; }
+                .recordingsViewport { max-height: 374px; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+                .recordingsViewport .recordingRow { min-height: 70px; }
+                .seekControl { display: grid; gap: 4px; }
+                .seekReadout { color: var(--text); text-align: center; font-size: 13px; margin: 0; }
                 .recordingItem { width: 100%; text-align: left; }
                 .recordingRow { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 6px; align-items: center; background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 8px; }
                 .recordingRow button { white-space: nowrap; }
@@ -1814,6 +1844,8 @@ class ZCamHttpServer @Inject constructor(
                     <p class="sub">Preview stream uses query auth. For best stability keep one viewer open.</p>
                     <div class="row" style="margin-bottom:8px;">
                       <button id="reloadPreviewBtn" type="button">Reload preview</button>
+                      <button class="ok" type="button" onclick="setCameraEnabled(true)">Camera ON</button>
+                      <button type="button" onclick="setCameraEnabled(false)">Camera OFF</button>
                       <a id="snapshotLink" class="chip" href="/snapshot.jpg" target="_blank">Open snapshot</a>
                       <span class="chip mono" id="previewState">preview: idle</span>
                       <span class="chip mono" id="previewTransportState">transport: browser MJPEG fallback</span>
@@ -1876,30 +1908,25 @@ class ZCamHttpServer @Inject constructor(
 
                 <div class="card">
                   <h2 class="title">Recordings</h2>
-                  <p class="sub">Browse loop recordings directly in the browser. Event markers jump to the closest clip timestamp when metadata is available.</p>
-                  <div class="grid3">
-                    <div>
-                      <label for="recordingsFromInput">From</label>
-                      <input id="recordingsFromInput" type="datetime-local" />
-                    </div>
-                    <div>
-                      <label for="recordingsToInput">To</label>
-                      <input id="recordingsToInput" type="datetime-local" />
-                    </div>
-                    <div>
-                      <label>&nbsp;</label>
-                      <div class="row">
-                        <button id="loadRecordingsBtn" type="button">Load recordings</button>
-                        <button id="loadRecentRecordingsBtn" type="button">Last 12h</button>
-                      </div>
-                    </div>
-                  </div>
-                  <div class="grid2" style="margin-top:10px;">
+                  <p class="sub">All available recordings load automatically. Use the coarse hour control, then refine the position with the minute control.</p>
+                  <div class="grid2">
                     <div class="stack">
                       <div class="recordingPlayerShell">
                         <video id="recordingPlayer" controls preload="auto" playsinline></video>
                         <video id="recordingStandbyPlayer" class="standby" preload="auto" playsinline></video>
                       </div>
+                      <div class="sub">Recording History Timeline</div>
+                      <div class="seekControl">
+                        <div class="seekReadout mono" id="globalRecordingSeekLabel">hour: unavailable</div>
+                        <input id="globalRecordingSeek" type="range" min="0" max="1" value="0" step="60000" disabled />
+                      </div>
+                      <div class="seekControl">
+                        <div class="seekReadout mono" id="detailedRecordingSeekLabel">minute: unavailable</div>
+                        <input id="detailedRecordingSeek" type="range" min="0" max="1" value="0" step="1000" disabled />
+                      </div>
+                      <div id="globalRecordingTimeline" class="timelineShell"></div>
+                      <div class="sub" id="globalRecordingTimelineHint">Recording history loads automatically.</div>
+                      <div id="recordingMeta" class="metaGrid"></div>
                       <div class="row">
                         <span class="chip mono" id="recordingsState">recordings: idle</span>
                         <span class="chip mono" id="recordingSelection">selected: none</span>
@@ -1920,21 +1947,12 @@ class ZCamHttpServer @Inject constructor(
                         <progress id="recordingDownloadProgress" max="1"></progress>
                         <div id="recordingDownloadLabel" class="sub">Preparing download...</div>
                       </div>
-                      <div id="recordingMeta" class="metaGrid"></div>
-                      <div class="sub">Recording History Timeline</div>
-                      <input id="globalRecordingSeek" type="range" min="0" max="1" value="0" step="1" disabled />
-                      <div class="sub mono" id="globalRecordingSeekLabel">time: unavailable</div>
-                      <div id="globalRecordingTimeline" class="timelineShell"></div>
-                      <div class="sub" id="globalRecordingTimelineHint">Load recordings to show event history.</div>
-                      <div class="sub">Current Clip Timeline</div>
-                      <div id="recordingTimeline" class="timelineShell"></div>
-                      <div class="sub" id="recordingTimelineHint">Select a recording to show clip-local event markers.</div>
                       <div class="sub" id="recordingErrorLabel"></div>
                     </div>
                     <div class="stack">
                       <div>
                         <label>Recording list</label>
-                        <div id="recordingsList" class="list"></div>
+                        <div id="recordingsList" class="list recordingsViewport"></div>
                       </div>
                       <div>
                         <label>Event markers</label>
@@ -1976,10 +1994,6 @@ class ZCamHttpServer @Inject constructor(
                 const eventSensitivityState = document.getElementById('eventSensitivityState');
                 const audioRuntimeState = document.getElementById('audioRuntimeState');
                 const audioSocketState = document.getElementById('audioSocketState');
-                const recordingsFromInput = document.getElementById('recordingsFromInput');
-                const recordingsToInput = document.getElementById('recordingsToInput');
-                const loadRecordingsBtn = document.getElementById('loadRecordingsBtn');
-                const loadRecentRecordingsBtn = document.getElementById('loadRecentRecordingsBtn');
                 const recordingsState = document.getElementById('recordingsState');
                 const recordingSelection = document.getElementById('recordingSelection');
                 const recordingsList = document.getElementById('recordingsList');
@@ -1999,8 +2013,8 @@ class ZCamHttpServer @Inject constructor(
                 const globalRecordingTimelineHint = document.getElementById('globalRecordingTimelineHint');
                 const globalRecordingSeek = document.getElementById('globalRecordingSeek');
                 const globalRecordingSeekLabel = document.getElementById('globalRecordingSeekLabel');
-                const recordingTimeline = document.getElementById('recordingTimeline');
-                const recordingTimelineHint = document.getElementById('recordingTimelineHint');
+                const detailedRecordingSeek = document.getElementById('detailedRecordingSeek');
+                const detailedRecordingSeekLabel = document.getElementById('detailedRecordingSeekLabel');
                 const recordingErrorLabel = document.getElementById('recordingErrorLabel');
                 const speed05Btn = document.getElementById('speed05Btn');
                 const speed10Btn = document.getElementById('speed10Btn');
@@ -2045,10 +2059,10 @@ class ZCamHttpServer @Inject constructor(
                 let liveSocketOpening = false;
                 let pttSocketOpening = false;
                 let lastStatusPayload = null;
-                let recordingTimelinePlayhead = null;
                 let globalTimelinePlayhead = null;
                 let globalTimelineRange = null;
                 let globalTimelineWidthPx = 1;
+                let historySeekDragging = false;
                 let previewReloadTimer = null;
 
                 function readAuth() {
@@ -2300,66 +2314,11 @@ class ZCamHttpServer @Inject constructor(
                 }
 
                 function updateTimelinePlayhead() {
-                  if (!recordingTimelinePlayhead) return;
-                  const duration = Number(recordingPlayer.duration);
-                  const currentTime = Number(recordingPlayer.currentTime || 0);
-                  if (!Number.isFinite(duration) || duration <= 0) {
-                    recordingTimelinePlayhead.style.left = '0%';
-                    return;
-                  }
-                  recordingTimelinePlayhead.style.left = (Math.max(0, Math.min(1, currentTime / duration)) * 100).toFixed(2) + '%';
+                  updateGlobalTimelinePlayhead();
                 }
 
                 function renderRecordingTimeline() {
-                  const item = selectedRecordingItem();
-                  const events = selectedRecordingEvents();
-                  recordingTimeline.innerHTML = '';
-                  recordingTimelinePlayhead = null;
-                  if (!item) {
-                    recordingTimelineHint.textContent = 'Select a recording to show clip-local event markers.';
-                    return;
-                  }
-
-                  const durationMs = Math.max(1, Number(item.durationMs || (item.endedAtEpochMs - item.startedAtEpochMs) || 1));
-                  const bar = document.createElement('div');
-                  bar.className = 'timelineBar';
-                  const track = document.createElement('div');
-                  track.className = 'timelineTrack';
-                  bar.appendChild(track);
-
-                  const playhead = document.createElement('div');
-                  playhead.className = 'timelinePlayhead';
-                  playhead.style.left = '0%';
-                  bar.appendChild(playhead);
-                  recordingTimelinePlayhead = playhead;
-
-                  events.forEach((eventItem) => {
-                    const marker = document.createElement('button');
-                    marker.type = 'button';
-                    marker.className = 'timelineMarker' + (eventItem.type === 'camera_tamper' ? '' : ' objectMotion');
-                    const startFraction = Math.max(0, Math.min(1, Number(eventItem.resolvedOffsetMs) / durationMs));
-                    const eventDurationMs = Math.max(0, Number(eventItem.durationMs || 0));
-                    const endFraction = Math.max(startFraction, Math.min(1, (Number(eventItem.resolvedOffsetMs) + eventDurationMs) / durationMs));
-                    marker.style.left = (startFraction * 100).toFixed(2) + '%';
-                    marker.style.width = Math.max(8, (endFraction - startFraction) * Math.max(1, recordingTimeline.clientWidth || 320)).toFixed(1) + 'px';
-                    marker.style.transform = 'none';
-                    marker.title = new Date(eventItem.epochMs).toLocaleString() + ' | ' + formatDurationSeconds(eventDurationMs / 1000) + ' | ' + eventItem.confidencePercent + '% | ' + eventItem.source;
-                    marker.addEventListener('click', () => jumpToRecordingEvent(eventItem));
-                    bar.appendChild(marker);
-                  });
-
-                  const labels = document.createElement('div');
-                  labels.className = 'row';
-                  labels.innerHTML = '<span class="sub">' + new Date(item.startedAtEpochMs).toLocaleTimeString() + '</span>' +
-                    '<span class="sub">' + formatDurationSeconds(durationMs / 1000) + '</span>' +
-                    '<span class="sub">' + new Date(item.endedAtEpochMs).toLocaleTimeString() + '</span>';
-
-                  recordingTimeline.appendChild(bar);
-                  recordingTimeline.appendChild(labels);
-                  recordingTimelineHint.textContent = events.length > 0
-                    ? 'Clip event markers stay aligned to this recording timeline.'
-                    : 'No event markers for this recording.';
-                  updateTimelinePlayhead();
+                  updateGlobalTimelinePlayhead();
                 }
 
                 function historyTickIntervalMs(rangeMs) {
@@ -2454,6 +2413,30 @@ class ZCamHttpServer @Inject constructor(
                   selectRecording(targetClip.fileName, seekSeconds);
                 }
 
+                function formatCoarseSeekTime(epochMs) {
+                  return 'hour: ' + new Date(epochMs).toLocaleString([], {
+                    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'
+                  });
+                }
+
+                function formatDetailedSeekTime(epochMs) {
+                  return 'minute: ' + new Date(epochMs).toLocaleTimeString([], {
+                    hour: '2-digit', minute: '2-digit', second: '2-digit'
+                  });
+                }
+
+                function configureDetailedSeek(centerEpochMs) {
+                  if (!globalTimelineRange) return;
+                  const halfWindowMs = 5 * 60 * 1000;
+                  const start = Math.max(globalTimelineRange.start, centerEpochMs - halfWindowMs);
+                  const end = Math.min(globalTimelineRange.end, centerEpochMs + halfWindowMs);
+                  detailedRecordingSeek.disabled = false;
+                  detailedRecordingSeek.min = String(start);
+                  detailedRecordingSeek.max = String(Math.max(start + 1, end));
+                  detailedRecordingSeek.value = String(Math.max(start, Math.min(end, centerEpochMs)));
+                  detailedRecordingSeekLabel.textContent = formatDetailedSeekTime(centerEpochMs);
+                }
+
                 function updateGlobalTimelinePlayhead() {
                   if (!globalTimelinePlayhead || !globalTimelineRange) return;
                   const item = selectedRecordingItem();
@@ -2466,8 +2449,17 @@ class ZCamHttpServer @Inject constructor(
                   const fraction = Math.max(0, Math.min(1, (selectedEpoch - globalTimelineRange.start) / durationMs));
                   globalTimelinePlayhead.style.display = 'block';
                   globalTimelinePlayhead.style.left = (fraction * globalTimelineWidthPx).toFixed(1) + 'px';
+                  if (historySeekDragging) return;
                   globalRecordingSeek.value = String(Math.round(selectedEpoch));
-                  globalRecordingSeekLabel.textContent = 'time: ' + new Date(selectedEpoch).toLocaleString();
+                  globalRecordingSeekLabel.textContent = formatCoarseSeekTime(selectedEpoch);
+                  const detailMin = Number(detailedRecordingSeek.min);
+                  const detailMax = Number(detailedRecordingSeek.max);
+                  if (detailedRecordingSeek.disabled || selectedEpoch < detailMin || selectedEpoch > detailMax) {
+                    configureDetailedSeek(selectedEpoch);
+                  } else {
+                    detailedRecordingSeek.value = String(Math.round(selectedEpoch));
+                    detailedRecordingSeekLabel.textContent = formatDetailedSeekTime(selectedEpoch);
+                  }
                 }
 
                 function renderGlobalRecordingTimeline() {
@@ -2475,13 +2467,16 @@ class ZCamHttpServer @Inject constructor(
                   const previousScrollLeft = previousViewport ? previousViewport.scrollLeft : null;
                   globalRecordingTimeline.innerHTML = '';
                   globalRecordingSeek.disabled = true;
-                  globalRecordingSeekLabel.textContent = 'time: unavailable';
+                  detailedRecordingSeek.disabled = true;
+                  globalRecordingSeekLabel.textContent = 'hour: unavailable';
+                  detailedRecordingSeekLabel.textContent = 'minute: unavailable';
                   globalTimelinePlayhead = null;
                   globalTimelineRange = null;
                   if (recordingsCache.length === 0 && recordingEventsCache.length === 0) {
                     globalRecordingSeek.disabled = true;
-                    globalRecordingSeekLabel.textContent = 'time: unavailable';
-                    globalRecordingTimelineHint.textContent = 'Load recordings to show event history.';
+                    globalRecordingSeekLabel.textContent = 'hour: unavailable';
+                    detailedRecordingSeekLabel.textContent = 'minute: unavailable';
+                    globalRecordingTimelineHint.textContent = 'No finalized recordings are available yet.';
                     return;
                   }
                   const segmentStarts = recordingsCache.map((item) => Number(item.startedAtEpochMs)).filter(Number.isFinite);
@@ -2494,7 +2489,8 @@ class ZCamHttpServer @Inject constructor(
                   const rangeEnd = Math.max(...segmentEnds, ...eventTimes);
                   if (!Number.isFinite(rangeStart) || !Number.isFinite(rangeEnd) || rangeEnd <= rangeStart) {
                     globalRecordingSeek.disabled = true;
-                    globalRecordingSeekLabel.textContent = 'time: unavailable';
+                    globalRecordingSeekLabel.textContent = 'hour: unavailable';
+                    detailedRecordingSeekLabel.textContent = 'minute: unavailable';
                     globalRecordingTimelineHint.textContent = 'Global timeline unavailable for this range.';
                     return;
                   }
@@ -2510,6 +2506,8 @@ class ZCamHttpServer @Inject constructor(
                   globalRecordingSeek.min = String(rangeStart);
                   globalRecordingSeek.max = String(rangeEnd);
                   globalRecordingSeek.value = String(rangeStart);
+                  globalRecordingSeek.step = '60000';
+                  configureDetailedSeek(rangeStart);
 
                   const viewport = document.createElement('div');
                   viewport.className = 'historyViewport';
@@ -2942,29 +2940,6 @@ class ZCamHttpServer @Inject constructor(
                   });
                 }
 
-                function localDateTimeValue(epochMs) {
-                  const date = new Date(epochMs);
-                  const pad = (value) => String(value).padStart(2, '0');
-                  return date.getFullYear() + '-' +
-                    pad(date.getMonth() + 1) + '-' +
-                    pad(date.getDate()) + 'T' +
-                    pad(date.getHours()) + ':' +
-                    pad(date.getMinutes());
-                }
-
-                function parseLocalDateTimeInput(value) {
-                  if (!value) return null;
-                  const parsed = new Date(value);
-                  const epochMs = parsed.getTime();
-                  return Number.isFinite(epochMs) ? epochMs : null;
-                }
-
-                function setRecentRecordingsRange(hoursBack) {
-                  const now = Date.now();
-                  recordingsFromInput.value = localDateTimeValue(now - (hoursBack * 60 * 60 * 1000));
-                  recordingsToInput.value = localDateTimeValue(now);
-                }
-
                 function buildAuthorizedUrl(path, extraParams) {
                   const params = new URLSearchParams();
                   const auth = readAuth();
@@ -3069,9 +3044,13 @@ class ZCamHttpServer @Inject constructor(
                 function renderRecordings() {
                   recordingsList.innerHTML = '';
                   if (recordingsCache.length === 0) {
-                    recordingsList.innerHTML = '<div class="sub">No recordings in the selected range.</div>';
+                    recordingsList.innerHTML = '<div class="sub">No finalized recordings are available.</div>';
                   } else {
-                    recordingsCache.forEach((item) => {
+                    const active = recordingsCache.find((item) => item.fileName === selectedRecordingName);
+                    const visibleOrder = active
+                      ? [active, ...recordingsCache.filter((item) => item.fileName !== selectedRecordingName)]
+                      : recordingsCache;
+                    visibleOrder.forEach((item) => {
                       const row = document.createElement('div');
                       row.className = 'recordingRow';
 
@@ -3098,6 +3077,7 @@ class ZCamHttpServer @Inject constructor(
                       row.appendChild(downloadButton);
                       recordingsList.appendChild(row);
                     });
+                    if (active) recordingsList.scrollTop = 0;
                   }
 
                   recordingsEvents.innerHTML = '';
@@ -3119,20 +3099,14 @@ class ZCamHttpServer @Inject constructor(
                 }
 
                 async function loadRecordings() {
-                  const fromEpochMs = parseLocalDateTimeInput(recordingsFromInput.value);
-                  const toEpochMs = parseLocalDateTimeInput(recordingsToInput.value);
                   recordingsState.textContent = 'recordings: loading';
                   setRecordingError('', '');
                   try {
                     const recordingsUrl = buildAuthorizedUrl('/api/recordings', {
-                      fromEpochMs,
-                      toEpochMs,
-                      limit: 240
+                      limit: 10000
                     });
                     const eventsUrl = buildAuthorizedUrl('/api/recordings/events', {
-                      fromEpochMs,
-                      toEpochMs,
-                      limit: 500
+                      limit: 10000
                     });
                     const [recordingsResponse, eventsResponse] = await Promise.all([
                       fetch(recordingsUrl, { headers: authHeaders(), cache: 'no-store' }),
@@ -3148,10 +3122,8 @@ class ZCamHttpServer @Inject constructor(
                       downloadSelectedRecordingBtn.disabled = true;
                       recordingSelection.textContent = 'selected: none';
                       renderRecordingMeta(null);
-                      recordingTimeline.innerHTML = '';
                       globalRecordingTimeline.innerHTML = '';
-                      recordingTimelineHint.textContent = 'Select a recording to show clip-local event markers.';
-                      globalRecordingTimelineHint.textContent = 'Load recordings to show event history.';
+                      globalRecordingTimelineHint.textContent = 'No finalized recordings are available yet.';
                       updateRecordingPlaybackState('playback: idle', '');
                       setRecordingLoadState(false, '', null);
                       setRecordingError('', '');
@@ -3443,6 +3415,17 @@ class ZCamHttpServer @Inject constructor(
                   await refreshStatus();
                 }
 
+                async function setCameraEnabled(enabled) {
+                  const { response } = await apiPost('/api/camera', { enabled });
+                  if (response.ok) {
+                    updatePreviewState(enabled ? 'preview: starting' : 'preview: stopped', enabled ? 'warnText' : '');
+                    window.setTimeout(() => {
+                      applyPreviewSources();
+                      refreshStatus();
+                    }, 1000);
+                  }
+                }
+
                 async function setNightMode(enabled) {
                   const { response, parsed } = await apiPost('/api/nightmode', { enabled });
                   if (!response.ok) return;
@@ -3540,12 +3523,12 @@ class ZCamHttpServer @Inject constructor(
                     player.load();
                   });
                   renderRecordingMeta(null);
-                  recordingTimeline.innerHTML = '';
                   globalRecordingTimeline.innerHTML = '';
                   globalRecordingSeek.disabled = true;
-                  globalRecordingSeekLabel.textContent = 'time: unavailable';
-                  recordingTimelineHint.textContent = 'Select a recording to show clip-local event markers.';
-                  globalRecordingTimelineHint.textContent = 'Load recordings to show event history.';
+                  detailedRecordingSeek.disabled = true;
+                  globalRecordingSeekLabel.textContent = 'hour: unavailable';
+                  detailedRecordingSeekLabel.textContent = 'minute: unavailable';
+                  globalRecordingTimelineHint.textContent = 'Recording history loads automatically after authentication.';
                   updateRecordingPlaybackState('playback: idle', '');
                   setRecordingLoadState(false, '', null);
                   setRecordingDownloadState(false, '', null);
@@ -3566,23 +3549,30 @@ class ZCamHttpServer @Inject constructor(
                   applyPreviewSources();
                 });
 
-                loadRecordingsBtn.addEventListener('click', () => {
-                  loadRecordings();
-                });
-
-                loadRecentRecordingsBtn.addEventListener('click', () => {
-                  setRecentRecordingsRange(12);
-                  loadRecordings();
-                });
-
                 globalRecordingSeek.addEventListener('input', () => {
+                  historySeekDragging = true;
                   const epochMs = Number(globalRecordingSeek.value);
                   if (Number.isFinite(epochMs)) {
-                    globalRecordingSeekLabel.textContent = 'time: ' + new Date(epochMs).toLocaleString();
+                    globalRecordingSeekLabel.textContent = formatCoarseSeekTime(epochMs);
+                    configureDetailedSeek(epochMs);
                   }
                 });
                 globalRecordingSeek.addEventListener('change', () => {
-                  jumpToHistoryTimestamp(Number(globalRecordingSeek.value));
+                  const epochMs = Number(globalRecordingSeek.value);
+                  historySeekDragging = false;
+                  jumpToHistoryTimestamp(epochMs);
+                });
+                detailedRecordingSeek.addEventListener('input', () => {
+                  historySeekDragging = true;
+                  const epochMs = Number(detailedRecordingSeek.value);
+                  if (Number.isFinite(epochMs)) {
+                    detailedRecordingSeekLabel.textContent = formatDetailedSeekTime(epochMs);
+                  }
+                });
+                detailedRecordingSeek.addEventListener('change', () => {
+                  const epochMs = Number(detailedRecordingSeek.value);
+                  historySeekDragging = false;
+                  jumpToHistoryTimestamp(epochMs);
                 });
 
                 volumeRange.addEventListener('input', () => {
@@ -3708,7 +3698,6 @@ class ZCamHttpServer @Inject constructor(
                 tokenInput.value = localStorage.getItem(STORAGE.token) || '';
                 deviceIdInput.value = localStorage.getItem(STORAGE.deviceId) || '';
                 browserNameInput.value = localStorage.getItem(STORAGE.browserName) || '';
-                setRecentRecordingsRange(12);
                 ensureBrowserIdentity();
                 updateAuthState();
                 updatePairingState();
@@ -3723,6 +3712,7 @@ class ZCamHttpServer @Inject constructor(
                 loadRecordings();
                 setInterval(refreshStatus, 3000);
                 window.setTorch = setTorch;
+                window.setCameraEnabled = setCameraEnabled;
                 window.setNightMode = setNightMode;
                 window.adjustZoom = adjustZoom;
                 window.resetZoom = resetZoom;
@@ -3759,7 +3749,7 @@ class ZCamHttpServer @Inject constructor(
         const val PREVIEW_SOCKET_PATH = "/ws/preview"
         const val JSON_UTF8 = "application/json; charset=utf-8"
         const val DEFAULT_RECORDINGS_LIST_LIMIT = 120
-        const val MAX_RECORDINGS_LIST_LIMIT = 500
+        const val MAX_RECORDINGS_LIST_LIMIT = 10_000
         const val AUDIO_SOCKET_QUEUE_CAPACITY = 48
         const val PREVIEW_SOCKET_QUEUE_CAPACITY = 12
         const val HTTP_SOCKET_READ_TIMEOUT_MS = 0

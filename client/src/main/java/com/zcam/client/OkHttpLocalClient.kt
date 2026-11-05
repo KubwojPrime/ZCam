@@ -169,6 +169,11 @@ class OkHttpLocalClient @Inject constructor(
     override suspend fun restartRuntime(target: ClientTarget): ClientCallResult<Unit> =
         executeAction(target, "/api/runtime/restart", "{}")
 
+    override suspend fun setCameraEnabled(target: ClientTarget, enabled: Boolean): ClientCallResult<Unit> {
+        val payload = JSONObject().put("enabled", enabled).toString()
+        return executeAction(target, "/api/camera", payload)
+    }
+
     override suspend fun setPushToTalk(target: ClientTarget, enabled: Boolean): ClientCallResult<Unit> {
         val payload = JSONObject()
             .put("mode", "ptt")

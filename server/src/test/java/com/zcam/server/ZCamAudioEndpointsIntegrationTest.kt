@@ -54,6 +54,7 @@ import java.util.concurrent.atomic.AtomicReference
 class ZCamAudioEndpointsIntegrationTest {
 
     private var restartRequested = false
+    private var cameraEnabledRequested: Boolean? = null
 
     private val client = OkHttpClient()
     private val logger = NoopLogger()
@@ -91,6 +92,11 @@ class ZCamAudioEndpointsIntegrationTest {
                     restartRequested = true
                     return true
                 }
+
+                override fun requestCameraEnabled(enabled: Boolean): Boolean {
+                    cameraEnabledRequested = enabled
+                    return true
+                }
             }
         )
         port = findFreePort()
@@ -113,6 +119,29 @@ class ZCamAudioEndpointsIntegrationTest {
         postJson("/api/runtime/restart", "{}").use {
             assertEquals(202, it.code)
             assertTrue(restartRequested)
+        }
+    }
+
+    @Test
+    fun camera_endpoint_accepts_remote_disable_request() {
+        postJson("/api/camera", """{"enabled":false}""").use {
+            assertEquals(202, it.code)
+            assertEquals(false, cameraEnabledRequested)
+        }
+    }
+
+    @Test
+    fun browser_panel_uses_automatic_dual_scale_recording_history() {
+        client.newCall(
+            Request.Builder().url("http://127.0.0.1:$port/").get().build()
+        ).execute().use {
+            val html = it.body?.string().orEmpty()
+            assertEquals(200, it.code)
+            assertTrue(html.contains("id=\"globalRecordingSeek\""))
+            assertTrue(html.contains("id=\"detailedRecordingSeek\""))
+            assertTrue(html.contains("recordingsViewport"))
+            assertFalse(html.contains("id=\"loadRecordingsBtn\""))
+            assertFalse(html.contains("Current Clip Timeline"))
         }
     }
 

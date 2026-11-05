@@ -427,8 +427,8 @@ class LocalLoopRecordingManager @Inject constructor(
     private companion object {
         const val MAX_OUT_OF_SPACE_RECOVERY_ATTEMPTS = 6
         const val BASE_OUT_OF_SPACE_BACKOFF_MS = 1_500L
-        const val MAX_RECORDINGS_QUERY_LIMIT = 500
-        const val MAX_RECORDING_EVENTS_QUERY_LIMIT = 1_000
+        const val MAX_RECORDINGS_QUERY_LIMIT = 10_000
+        const val MAX_RECORDING_EVENTS_QUERY_LIMIT = 20_000
         const val EVENT_SEGMENT_GRACE_MS = 2_000L
         val RECORDING_FILE_NAME_REGEX = Regex("^[A-Za-z0-9._-]{1,128}\\.mp4$")
     }

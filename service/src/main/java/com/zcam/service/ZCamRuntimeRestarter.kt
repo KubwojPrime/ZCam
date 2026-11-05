@@ -10,19 +10,28 @@ import javax.inject.Singleton
 @Singleton
 class ZCamRuntimeRestarter @Inject constructor() : RuntimeRestartRequester {
     private val restarting = AtomicBoolean(false)
-    private val queue = Channel<Unit>(Channel.CONFLATED)
+    private val queue = Channel<RuntimeControlCommand>(Channel.BUFFERED)
     val requests = queue.receiveAsFlow()
 
     override fun requestRestart(): Boolean {
         if (!restarting.compareAndSet(false, true)) return false
-        if (queue.trySend(Unit).isFailure) {
+        if (queue.trySend(RuntimeControlCommand.Restart).isFailure) {
             restarting.set(false)
             return false
         }
         return true
     }
 
+
+    override fun requestCameraEnabled(enabled: Boolean): Boolean =
+        queue.trySend(RuntimeControlCommand.SetCameraEnabled(enabled)).isSuccess
+
     fun finishRestart() {
         restarting.set(false)
     }
+}
+
+sealed interface RuntimeControlCommand {
+    data object Restart : RuntimeControlCommand
+    data class SetCameraEnabled(val enabled: Boolean) : RuntimeControlCommand
 }

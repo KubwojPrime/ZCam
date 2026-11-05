@@ -95,6 +95,7 @@ Main endpoints:
 - `GET /mjpeg`
 - `GET /snapshot.jpg`
 - `GET /api/status`
+- `POST /api/camera`
 - `POST /api/camera/torch`
 - `POST /api/camera/night-mode`
 - `POST /api/camera/zoom`
@@ -148,6 +149,15 @@ desired server state is restored after process recreation, device boot, and
 application replacement, but Android still blocks automatic recovery after an
 explicit user force-stop.
 
+The HTTP server is treated as the persistent base runtime. Camera capture and
+loop recording can be switched on or off independently from a paired Android
+client or the authenticated browser panel through `POST /api/camera`. Turning
+the camera off keeps HTTP and audio services reachable. A five-minute inexact
+Android alarm checks whether the foreground service process is absent and, when
+needed, restores the server with camera and recording disabled. Android may
+batch this alarm, and an explicit user Force stop cancels application alarms
+until the user launches ZCam again.
+
 ## Recording Playback
 
 Client playback uses Media3 and streams finalized MP4 segments directly from
@@ -157,9 +167,13 @@ downloading complete files first. The separate Download command still saves a
 full copy to the client device. Seeking over a slow link can briefly buffer,
 but it requests only the required media range and keeps the timeline available.
 The browser panel uses the same range-enabled endpoints, typed event colors,
-timed event bars, and global seek control. It prepares the next recording in a
-standby player and swaps players at segment boundaries to minimize transition
-latency on slower links.
+timed event bars, and two-level global seek control. The coarse slider navigates
+the complete recording range by time, while a detailed slider covers a ten
+minute window with one-second steps. All available finalized recordings load
+automatically. The active segment is pinned to the top of a separately
+scrollable five-row list, and clip metadata appears directly below the history
+controls. The panel prepares the next recording in a standby player and swaps
+players at segment boundaries to minimize transition latency on slower links.
 
 Active recording segments use a `.partial.mp4` name and are published only
 after CameraX successfully finalizes a valid MP4 container. On startup, ZCam

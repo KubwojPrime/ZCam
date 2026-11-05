@@ -43,6 +43,7 @@ class ZCamApplication : Application() {
             Timber.plant(ReleaseTree(this))
         }
         installCrashHandler()
+        RuntimeRecoveryScheduler.schedule(this)
         restoreRuntimeIfNeeded()
         ClientEventMonitorService.restoreIfEnabled(this, logger)
     }
@@ -66,6 +67,8 @@ class ZCamApplication : Application() {
     private fun restoreRuntimeIfNeeded() {
         appScope.launch {
             logger.i(LogEventId.STATE_RESTORE_CHECK, "Process restore check")
+            runtimeStateRepository.setDesiredRunning(true)
+            runtimeStateRepository.setCameraEnabled(false)
             val desiredState = runtimeStateRepository.desiredState.first()
             val crashState = runtimeCrashRepository.state.first()
             val plan = RuntimeRestorePolicy.plan(desiredState.shouldRun, crashState)
@@ -79,7 +82,7 @@ class ZCamApplication : Application() {
                 runCatching {
                     ContextCompat.startForegroundService(
                         this@ZCamApplication,
-                        ZCamForegroundService.startIntent(this@ZCamApplication)
+                        ZCamForegroundService.recoveryIntent(this@ZCamApplication)
                     )
                 }.onFailure { error ->
                     logger.e(LogEventId.COMPONENT_FAILED, error, "Process restore failed")

@@ -183,7 +183,7 @@ class LocalRecordingEventStore @Inject constructor(
         const val EVENT_INDEX_FILE_NAME = "recording_events_v1.tsv"
         const val DEFAULT_SOURCE = "motion"
         const val MAX_SOURCE_LENGTH = 32
-        const val MAX_QUERY_LIMIT = 1_000
+        const val MAX_QUERY_LIMIT = 20_000
         const val MAX_FRAME_BYTES = 1_500_000
         const val MAX_STORED_FRAMES = 200
     }

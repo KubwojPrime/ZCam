@@ -39,7 +39,10 @@ class BootReceiver : BroadcastReceiver() {
         val pendingResult = goAsync()
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             try {
+                RuntimeRecoveryScheduler.schedule(context)
                 logger.i(LogEventId.STATE_RESTORE_CHECK, "Boot restore check")
+                runtimeStateRepository.setDesiredRunning(true)
+                runtimeStateRepository.setCameraEnabled(false)
                 val desiredState = runtimeStateRepository.desiredState.first()
                 val crashState = runtimeCrashRepository.state.first()
                 val plan = RuntimeRestorePolicy.plan(desiredState.shouldRun, crashState)
@@ -50,7 +53,7 @@ class BootReceiver : BroadcastReceiver() {
                     }
                     logger.i(LogEventId.STATE_RESTORE_START, "Restoring runtime after boot")
                     runCatching {
-                        ContextCompat.startForegroundService(context, ZCamForegroundService.startIntent(context))
+                        ContextCompat.startForegroundService(context, ZCamForegroundService.recoveryIntent(context))
                     }.onFailure { error ->
                         logger.e(LogEventId.COMPONENT_FAILED, error, "Boot restore failed")
                     }

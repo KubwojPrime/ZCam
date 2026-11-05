@@ -113,6 +113,7 @@ interface LocalClient {
     suspend fun fetchSnapshot(target: ClientTarget): ClientCallResult<ByteArray>
     suspend fun fetchEventFrame(target: ClientTarget, epochMs: Long): ClientCallResult<ByteArray>
     suspend fun restartRuntime(target: ClientTarget): ClientCallResult<Unit>
+    suspend fun setCameraEnabled(target: ClientTarget, enabled: Boolean): ClientCallResult<Unit>
     fun buildPreviewStreamUrl(target: ClientTarget): String
     fun buildPreviewH264SocketUrl(target: ClientTarget): String
     suspend fun setPushToTalk(target: ClientTarget, enabled: Boolean): ClientCallResult<Unit>

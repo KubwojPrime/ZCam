@@ -94,6 +94,8 @@ class ZCamRuntimeCoordinator @Inject constructor(
     private var lastNetworkConnectivity: NetworkConnectivity = NetworkConnectivity(connected = true)
     @Volatile
     private var storageSuspendedByThermal: Boolean = false
+    @Volatile
+    private var cameraEnabled: Boolean = true
 
     suspend fun start() = withContext(dispatchers.io) {
         if (!isRunning.compareAndSet(false, true)) {
@@ -102,6 +104,7 @@ class ZCamRuntimeCoordinator @Inject constructor(
         }
 
         runCatching {
+            cameraEnabled = runtimeStateRepository.desiredState.first().cameraEnabled
             runtimeStateRepository.setDesiredRunning(true)
             runtimeCrashRepository.markRuntimeDirty()
             runtimeHealthRepository.reset()
@@ -129,7 +132,11 @@ class ZCamRuntimeCoordinator @Inject constructor(
             startEnvironmentCollectors()
 
             for (component in startOrder()) {
-                startComponent(component)
+                if (!cameraEnabled && component in CAMERA_PIPELINE_COMPONENTS) {
+                    markComponentIntentionallyStopped(component)
+                } else {
+                    startComponent(component)
+                }
             }
 
             applyThermalPolicy(activeThermalBand)
@@ -155,6 +162,36 @@ class ZCamRuntimeCoordinator @Inject constructor(
         }
 
         stopInternal(persistDesiredState)
+    }
+
+    suspend fun setCameraEnabled(enabled: Boolean): Boolean = withContext(dispatchers.io) {
+        runtimeStateRepository.setCameraEnabled(enabled)
+        if (!isRunning.get()) {
+            cameraEnabled = enabled
+            return@withContext false
+        }
+        if (cameraEnabled == enabled) return@withContext true
+
+        val storageLock = componentLocks.getValue(RuntimeComponent.STORAGE)
+        val cameraLock = componentLocks.getValue(RuntimeComponent.CAMERA)
+        storageLock.withLock {
+            cameraLock.withLock {
+                cameraEnabled = enabled
+                if (enabled) {
+                    startComponent(RuntimeComponent.CAMERA)
+                    val cameraHealthy = health.value.components[RuntimeComponent.CAMERA]?.status == ComponentHealthStatus.HEALTHY
+                    if (cameraHealthy && !storageSuspendedByThermal) {
+                        startComponent(RuntimeComponent.STORAGE)
+                    }
+                } else {
+                    stopComponent(RuntimeComponent.STORAGE)
+                    stopComponent(RuntimeComponent.CAMERA)
+                    recoveryAttempts.remove(RuntimeComponent.STORAGE)
+                    recoveryAttempts.remove(RuntimeComponent.CAMERA)
+                }
+            }
+        }
+        true
     }
 
     private suspend fun stopInternal(persistDesiredState: Boolean) {
@@ -231,6 +268,7 @@ class ZCamRuntimeCoordinator @Inject constructor(
             watchdogManager.recoveryEvents.collect { request ->
                 if (!watchdogRecoveryEnabled) return@collect
                 val component = componentByKey[request.component] ?: return@collect
+                if (!cameraEnabled && component in CAMERA_PIPELINE_COMPONENTS) return@collect
                 if (component == RuntimeComponent.STORAGE && storageSuspendedByThermal) {
                     return@collect
                 }
@@ -351,7 +389,7 @@ class ZCamRuntimeCoordinator @Inject constructor(
     }
 
     private suspend fun handleRearLensSelectionChanged(desiredStream: StreamConfig) {
-        if (!activeComponents.containsKey(RuntimeComponent.CAMERA)) return
+        if (!cameraEnabled || !activeComponents.containsKey(RuntimeComponent.CAMERA)) return
 
         val storageLock = componentLocks[RuntimeComponent.STORAGE]
         val cameraLock = componentLocks.getValue(RuntimeComponent.CAMERA)
@@ -396,7 +434,7 @@ class ZCamRuntimeCoordinator @Inject constructor(
     private suspend fun applyThermalPolicy(band: ThermalBand) {
         val desiredStream = thermalAdjustedStream(activeRuntimeSettings.stream, band)
         val shouldSuspendStorage = band == ThermalBand.CRITICAL
-        val hasCamera = activeComponents.containsKey(RuntimeComponent.CAMERA)
+        val hasCamera = cameraEnabled && activeComponents.containsKey(RuntimeComponent.CAMERA)
 
         val streamChanged = desiredStream != activeStreamConfig
         if (hasCamera && streamChanged) {
@@ -427,9 +465,14 @@ class ZCamRuntimeCoordinator @Inject constructor(
             }
             storageSuspendedByThermal = true
         } else if (storageSuspendedByThermal) {
-            startComponent(RuntimeComponent.STORAGE)
+            if (cameraEnabled) {
+                startComponent(RuntimeComponent.STORAGE)
+            }
             storageSuspendedByThermal = false
-            logger.i(LogEventId.THERMAL_RECORDING_RESUMED, "Recording resumed after thermal recovery")
+            logger.i(
+                LogEventId.THERMAL_RECORDING_RESUMED,
+                if (cameraEnabled) "Recording resumed after thermal recovery" else "Thermal recording suspension cleared while camera is off"
+            )
         }
     }
 
@@ -645,6 +688,21 @@ class ZCamRuntimeCoordinator @Inject constructor(
         )
     }
 
+    private suspend fun markComponentIntentionallyStopped(component: RuntimeComponent) {
+        val managed = activeComponents[component] ?: return
+        runtimeHealthRepository.mark(
+            component = component,
+            status = ComponentHealthStatus.STOPPED,
+            eventId = LogEventId.COMPONENT_STOPPED,
+            message = "${component.name.lowercase()} disabled by user"
+        )
+        watchdogManager.updateComponentStatus(
+            component = managed.watchdogKey,
+            status = WatchdogComponentStatus.STOPPED,
+            details = "disabled by user"
+        )
+    }
+
     private suspend fun recoverComponent(component: RuntimeComponent, request: RecoveryRequest) {
         val managed = activeComponents[component] ?: return
         val mutex = componentLocks.getValue(component)
@@ -806,5 +864,6 @@ class ZCamRuntimeCoordinator @Inject constructor(
         const val CAMERA_KEY = "camera"
         const val AUDIO_KEY = "audio"
         const val STORAGE_KEY = "storage"
+        val CAMERA_PIPELINE_COMPONENTS = setOf(RuntimeComponent.CAMERA, RuntimeComponent.STORAGE)
     }
 }

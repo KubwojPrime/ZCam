@@ -164,6 +164,7 @@ data class ZCamUiState(
     val mode: ZCamMode = ZCamMode.SERVER,
     val showModePicker: Boolean = true,
     val runtimeOn: Boolean = false,
+    val cameraOn: Boolean = false,
     val runtimeLabel: String = "Stopped",
     val runtimeTone: StatusTone = StatusTone.NEUTRAL,
     val previewFrameJpeg: ByteArray? = null,
@@ -197,6 +198,7 @@ data class ZCamUiState(
     val clientHost: String = "192.168.1.10",
     val clientPort: String = "8080",
     val clientReachable: Boolean = false,
+    val clientCameraEnabled: Boolean = false,
     val eventAlertsEnabled: Boolean = false,
     val clientStatusLabel: String = "Client disconnected",
     val audioRuntimeLabel: String = "Audio idle",
@@ -233,6 +235,7 @@ sealed interface ZCamUiAction {
     data object StopRuntime : ZCamUiAction
     data object RefreshClientStatus : ZCamUiAction
     data object RestartRemoteRuntime : ZCamUiAction
+    data class SetRemoteCameraEnabled(val enabled: Boolean) : ZCamUiAction
     data object ToggleEventAlerts : ZCamUiAction
     data class ClientHostChanged(val host: String) : ZCamUiAction
     data class ClientPortChanged(val port: String) : ZCamUiAction

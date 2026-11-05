@@ -52,6 +52,51 @@ class ZCamRuntimeCoordinatorRecoveryTest {
 
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test
+    fun camera_can_be_disabled_without_stopping_server() = runTest(timeout = 20.seconds) {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val runtimeState = FakeRuntimeStateRepository()
+        runtimeState.setCameraEnabled(false)
+        val server = FlakyServer(failuresBeforeSuccess = 0)
+        val camera = TrackingCameraRuntime()
+        val coordinator = ZCamRuntimeCoordinator(
+            cameraRuntime = camera,
+            localHttpServer = server,
+            pushToTalkManager = NoopAudioManager(),
+            loopRecordingManager = NoopLoopRecordingManager(),
+            watchdogManager = FakeWatchdogManager(),
+            runtimeEnvironmentMonitor = FakeRuntimeEnvironmentMonitor(),
+            runtimeSettingsRepository = FakeRuntimeSettingsRepository(RuntimeSettingsDefaults.value),
+            runtimeCrashRepository = FakeRuntimeCrashRepository(),
+            runtimeStateRepository = runtimeState,
+            runtimeHealthRepository = InMemoryRuntimeHealthRepository(),
+            recoveryPolicy = RecoveryPolicy(baseDelayMs = 5, maxDelayMs = 40, maxAttemptsBeforeCooldown = 4, cooldownMs = 100),
+            retryBackoffScheduler = RecordingBackoffScheduler(),
+            dispatchers = TestDispatcherProvider(dispatcher),
+            logger = NoopLogger()
+        )
+
+        coordinator.start()
+        runCurrent()
+        assertTrue(server.isHealthy())
+        assertTrue(camera.startConfigs.isEmpty())
+
+        assertTrue(coordinator.setCameraEnabled(true))
+        runCurrent()
+        assertEquals(1, camera.startConfigs.size)
+        assertTrue(server.isHealthy())
+
+        assertTrue(coordinator.setCameraEnabled(false))
+        runCurrent()
+        assertTrue(camera.stopCalls >= 1)
+        assertTrue(server.isHealthy())
+        assertFalse(runtimeState.desiredState.value.cameraEnabled)
+
+        coordinator.stop(persistDesiredState = false)
+        advanceUntilIdle()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
     fun recovers_failed_component_with_retry_backoff() = runTest(timeout = 20.seconds) {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val dispatchers = TestDispatcherProvider(dispatcher)
@@ -627,7 +672,17 @@ class ZCamRuntimeCoordinatorRecoveryTest {
         )
 
         override suspend fun setDesiredRunning(shouldRun: Boolean) {
-            desiredState.value = RuntimeDesiredState(shouldRun, System.currentTimeMillis())
+            desiredState.value = desiredState.value.copy(
+                shouldRun = shouldRun,
+                lastChangedAtEpochMs = System.currentTimeMillis()
+            )
+        }
+
+        override suspend fun setCameraEnabled(enabled: Boolean) {
+            desiredState.value = desiredState.value.copy(
+                cameraEnabled = enabled,
+                lastChangedAtEpochMs = System.currentTimeMillis()
+            )
         }
     }
 

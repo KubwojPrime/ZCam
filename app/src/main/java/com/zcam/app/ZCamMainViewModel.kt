@@ -165,6 +165,7 @@ class ZCamMainViewModel @Inject constructor(
             ZCamUiAction.StopRuntime -> stopRuntime()
             ZCamUiAction.RefreshClientStatus -> refreshClientStatusNow()
             ZCamUiAction.RestartRemoteRuntime -> restartRemoteRuntime()
+            is ZCamUiAction.SetRemoteCameraEnabled -> setRemoteCameraEnabled(action.enabled)
             ZCamUiAction.ToggleEventAlerts -> toggleEventAlerts()
             is ZCamUiAction.ClientHostChanged -> {
                 _state.update { it.copy(clientHost = action.host.trim()) }
@@ -376,12 +377,12 @@ class ZCamMainViewModel @Inject constructor(
                         } else {
                             state.ultraWideAvailable
                         },
-                        cameraLensLabel = if (state.mode == ZCamMode.SERVER && !state.runtimeOn) {
+                        cameraLensLabel = if (state.mode == ZCamMode.SERVER && !state.cameraOn) {
                             "Lens: ${settings.stream.rearLens.label} selected"
                         } else {
                             state.cameraLensLabel
                         },
-                        cameraLensTone = if (state.mode == ZCamMode.SERVER && !state.runtimeOn) {
+                        cameraLensTone = if (state.mode == ZCamMode.SERVER && !state.cameraOn) {
                             StatusTone.NEUTRAL
                         } else {
                             state.cameraLensTone
@@ -460,7 +461,7 @@ class ZCamMainViewModel @Inject constructor(
     private fun observeDesiredState() {
         viewModelScope.launch(dispatchers.io) {
             runtimeStateRepository.desiredState.collectLatest { desired ->
-                _state.update { it.copy(runtimeOn = desired.shouldRun) }
+                _state.update { it.copy(runtimeOn = desired.shouldRun, cameraOn = desired.cameraEnabled) }
                 refreshPreviewTarget()
             }
         }
@@ -470,7 +471,7 @@ class ZCamMainViewModel @Inject constructor(
         val current = state.value
         val target = currentTargetForCommands()
         val mjpegUrl = when (current.mode) {
-            ZCamMode.SERVER -> if (current.runtimeOn) {
+            ZCamMode.SERVER -> if (current.cameraOn) {
                 localClient.buildPreviewStreamUrl(target)
             } else {
                 ""
@@ -482,7 +483,7 @@ class ZCamMainViewModel @Inject constructor(
             }
         }
         val h264Url = when (current.mode) {
-            ZCamMode.SERVER -> if (current.runtimeOn) {
+            ZCamMode.SERVER -> if (current.cameraOn) {
                 localClient.buildPreviewH264SocketUrl(target)
             } else {
                 ""
@@ -500,7 +501,7 @@ class ZCamMainViewModel @Inject constructor(
         val previewLabel = when {
             streamUrl.isNotBlank() && current.previewStateTone == StatusTone.WARNING -> "Preview reconnecting..."
             streamUrl.isNotBlank() && current.previewStateTone == StatusTone.ERROR -> "Preview unavailable"
-            streamUrl.isBlank() && current.mode == ZCamMode.SERVER && !current.runtimeOn -> "Start runtime to see live preview."
+            streamUrl.isBlank() && current.mode == ZCamMode.SERVER && !current.cameraOn -> "Turn on the camera to see live preview."
             streamUrl.isBlank() && current.mode == ZCamMode.CLIENT && current.clientHost.isBlank() -> "Set server host to see preview."
             streamUrl.isBlank() && current.mode == ZCamMode.CLIENT -> "Preview unavailable"
             else -> ""
@@ -636,6 +637,7 @@ class ZCamMainViewModel @Inject constructor(
                         )
                         current.copy(
                             clientReachable = status.alive,
+                            clientCameraEnabled = status.videoRunning,
                             clientStatusLabel = if (status.alive) "Connected" else "Unavailable",
                             audioRuntimeLabel = audioUi.first,
                             audioRuntimeTone = audioUi.second,
@@ -708,12 +710,12 @@ class ZCamMainViewModel @Inject constructor(
                         current.copy(
                             clientReachable = false,
                             clientStatusLabel = "Unavailable",
-                            previewStateLabel = if (current.mode == ZCamMode.SERVER && !current.runtimeOn) {
+                            previewStateLabel = if (current.mode == ZCamMode.SERVER && !current.cameraOn) {
                                 "Preview stopped"
                             } else {
                                 "Preview offline"
                             },
-                            previewStateTone = if (current.mode == ZCamMode.SERVER && !current.runtimeOn) {
+                            previewStateTone = if (current.mode == ZCamMode.SERVER && !current.cameraOn) {
                                 StatusTone.NEUTRAL
                             } else {
                                 StatusTone.ERROR
@@ -730,14 +732,14 @@ class ZCamMainViewModel @Inject constructor(
                             previewMjpegFallbackUrl = localClient.buildPreviewStreamUrl(target),
                             audioRuntimeLabel = "Audio unavailable",
                             audioRuntimeTone = StatusTone.ERROR,
-                            cameraLensLabel = if (current.mode == ZCamMode.SERVER && !current.runtimeOn) {
+                            cameraLensLabel = if (current.mode == ZCamMode.SERVER && !current.cameraOn) {
                                 "Lens: ${settingsSnapshot.stream.rearLens.label} selected"
                             } else if (current.mode == ZCamMode.SERVER) {
                                 "Lens: unavailable"
                             } else {
                                 current.cameraLensLabel
                             },
-                            cameraLensTone = if (current.mode == ZCamMode.SERVER && !current.runtimeOn) {
+                            cameraLensTone = if (current.mode == ZCamMode.SERVER && !current.cameraOn) {
                                 StatusTone.NEUTRAL
                             } else if (current.mode == ZCamMode.SERVER) {
                                 StatusTone.WARNING
@@ -817,7 +819,7 @@ class ZCamMainViewModel @Inject constructor(
             runCatching {
                 ContextCompat.startForegroundService(
                     appContext,
-                    ZCamForegroundService.startIntent(appContext)
+                    ZCamForegroundService.cameraIntent(appContext, enabled = true)
                 )
                 started = true
             }.onFailure { error ->
@@ -839,7 +841,7 @@ class ZCamMainViewModel @Inject constructor(
         viewModelScope.launch(dispatchers.io) {
             _state.update { it.copy(working = true, errorMessage = null) }
             runCatching {
-                appContext.startService(ZCamForegroundService.stopIntent(appContext))
+                appContext.startService(ZCamForegroundService.cameraIntent(appContext, enabled = false))
             }.onFailure { error ->
                 logger.w("Stop runtime failed: ${error.message}")
                 _state.update { it.copy(errorMessage = "Failed to stop runtime: ${error.message}") }
@@ -1009,6 +1011,28 @@ class ZCamMainViewModel @Inject constructor(
                     } else {
                         "Restart failed: ${result.reason}"
                     })
+                }
+            }
+        }
+    }
+
+    private fun setRemoteCameraEnabled(enabled: Boolean) {
+        if (state.value.mode != ZCamMode.CLIENT) return
+        viewModelScope.launch(dispatchers.io) {
+            when (val result = localClient.setCameraEnabled(currentTargetForCommands(), enabled)) {
+                is ClientCallResult.Success -> {
+                    _state.update {
+                        it.copy(
+                            clientCameraEnabled = enabled,
+                            clientStatusLabel = if (enabled) "Camera start requested" else "Camera stopped; server online",
+                            errorMessage = null
+                        )
+                    }
+                    delay(1_000L)
+                    refreshClientStatusNow()
+                }
+                is ClientCallResult.Failure -> _state.update {
+                    it.copy(errorMessage = "Camera update failed: ${result.reason}")
                 }
             }
         }

@@ -1183,8 +1183,8 @@ private fun PreviewCard(state: ZCamUiState) {
                 previewStreamUrl = state.previewStreamUrl,
                 previewMjpegFallbackUrl = state.previewMjpegFallbackUrl,
                 previewLabel = state.previewLabel.ifBlank {
-                    if (state.mode == ZCamMode.SERVER && !state.runtimeOn) {
-                        "Start runtime to see live preview."
+                    if (state.mode == ZCamMode.SERVER && !state.cameraOn) {
+                        "Camera is off; the server remains available."
                     } else {
                         "Preview unavailable"
                     }
@@ -1270,7 +1270,11 @@ private fun RuntimeControls(
             modifier = Modifier.padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            StatusChip(label = "Runtime: ${state.runtimeLabel}", tone = state.runtimeTone)
+            StatusChip(label = "Server: ${state.runtimeLabel}", tone = state.runtimeTone)
+            StatusChip(
+                label = if (state.cameraOn) "Camera: On" else "Camera: Off",
+                tone = if (state.cameraOn) StatusTone.HEALTHY else StatusTone.NEUTRAL
+            )
             StatusChip(label = state.cameraLensLabel, tone = state.cameraLensTone)
             StatusChip(label = state.eventSensitivityLabel, tone = StatusTone.NEUTRAL)
             StatusChip(label = state.serverBatteryLabel, tone = state.serverBatteryTone)
@@ -1279,8 +1283,8 @@ private fun RuntimeControls(
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 ActiveActionButton(
-                    text = "Start",
-                    active = state.runtimeOn,
+                    text = "Camera on",
+                    active = state.cameraOn,
                     onClick = { onAction(ZCamUiAction.StartRuntime) },
                     modifier = Modifier
                         .weight(1f)
@@ -1288,8 +1292,8 @@ private fun RuntimeControls(
                     enabled = !state.working
                 )
                 ActiveActionButton(
-                    text = "Stop",
-                    active = !state.runtimeOn,
+                    text = "Camera off",
+                    active = !state.cameraOn,
                     onClick = { onAction(ZCamUiAction.StopRuntime) },
                     modifier = Modifier
                         .weight(1f)
@@ -1501,6 +1505,17 @@ private fun ClientSection(
                 onClick = { onAction(ZCamUiAction.RestartRemoteRuntime) }
             ) {
                 Text("Restart server")
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Remote camera", modifier = Modifier.weight(1f))
+                Switch(
+                    checked = state.clientCameraEnabled,
+                    onCheckedChange = { onAction(ZCamUiAction.SetRemoteCameraEnabled(it)) },
+                    enabled = state.clientReachable
+                )
             }
             Row(
                 modifier = Modifier.fillMaxWidth(),

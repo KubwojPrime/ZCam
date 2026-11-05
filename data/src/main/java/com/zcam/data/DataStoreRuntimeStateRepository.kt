@@ -28,7 +28,8 @@ class DataStoreRuntimeStateRepository @Inject constructor(
     override val desiredState: Flow<RuntimeDesiredState> = context.runtimeStateDataStore.data
         .map { prefs ->
             RuntimeDesiredState(
-                shouldRun = prefs[DESIRED_RUNNING] ?: false,
+                shouldRun = prefs[DESIRED_RUNNING] ?: true,
+                cameraEnabled = prefs[CAMERA_ENABLED] ?: true,
                 lastChangedAtEpochMs = prefs[LAST_CHANGED] ?: 0L
             )
         }
@@ -43,8 +44,18 @@ class DataStoreRuntimeStateRepository @Inject constructor(
         }
     }
 
+    override suspend fun setCameraEnabled(enabled: Boolean) {
+        withContext(ioDispatcher) {
+            context.runtimeStateDataStore.edit { prefs ->
+                prefs[CAMERA_ENABLED] = enabled
+                prefs[LAST_CHANGED] = System.currentTimeMillis()
+            }
+        }
+    }
+
     private companion object {
         val DESIRED_RUNNING = booleanPreferencesKey("desired_running")
+        val CAMERA_ENABLED = booleanPreferencesKey("camera_enabled")
         val LAST_CHANGED = longPreferencesKey("last_changed_epoch_ms")
     }
 }

@@ -44,42 +44,62 @@ class ZCamForegroundService : Service() {
         logger.i(LogEventId.SERVICE_CREATED, "Foreground service created")
         ensureNotificationChannel()
         serviceScope.launch {
-            runtimeRestarter.requests.collect {
-                try {
-                    delay(700L)
-                    runtimeCoordinator.stop(persistDesiredState = false)
-                    runtimeCoordinator.start()
-                } catch (error: Throwable) {
-                    logger.e(LogEventId.COMPONENT_FAILED, error, "Remote runtime restart failed")
-                } finally {
-                    runtimeRestarter.finishRestart()
+            runtimeRestarter.requests.collect { command ->
+                when (command) {
+                    RuntimeControlCommand.Restart -> {
+                        try {
+                            delay(700L)
+                            runtimeCoordinator.stop(persistDesiredState = false)
+                            runtimeCoordinator.start()
+                        } catch (error: Throwable) {
+                            logger.e(LogEventId.COMPONENT_FAILED, error, "Remote runtime restart failed")
+                        } finally {
+                            runtimeRestarter.finishRestart()
+                        }
+                    }
+                    is RuntimeControlCommand.SetCameraEnabled -> applyCameraEnabled(command.enabled)
                 }
             }
         }
+        active = true
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action ?: ServiceCommands.ACTION_START
         when (action) {
             ServiceCommands.ACTION_STOP -> {
-                logger.i(LogEventId.SERVICE_STOP_REQUESTED, "Foreground service stop requested")
+                logger.i(LogEventId.SERVICE_STOP_REQUESTED, "Camera stop requested; server remains active")
+                startForegroundRuntime(cameraEnabled = false)
                 serviceScope.launch {
-                    runCatching {
-                        runtimeCoordinator.stop(persistDesiredState = true)
-                    }.onFailure { error ->
-                        logger.e(LogEventId.COMPONENT_FAILED, error, "Runtime stop failed")
-                    }
-                    releaseWakeLock()
-                    stopSelf()
+                    applyCameraEnabled(false)
+                    runtimeCoordinator.start()
                 }
-                return START_NOT_STICKY
+                return START_STICKY
+            }
+            ServiceCommands.ACTION_CAMERA_ON -> {
+                startForegroundRuntime(cameraEnabled = true)
+                serviceScope.launch {
+                    applyCameraEnabled(true)
+                    runtimeCoordinator.start()
+                }
+                return START_STICKY
+            }
+            ServiceCommands.ACTION_CAMERA_OFF -> {
+                startForegroundRuntime(cameraEnabled = false)
+                serviceScope.launch {
+                    applyCameraEnabled(false)
+                    runtimeCoordinator.start()
+                }
+                return START_STICKY
             }
 
             else -> {
                 logger.i(LogEventId.SERVICE_START_REQUESTED, "Foreground service start requested")
-                startForegroundRuntime()
+                val recoveryOnly = action == ServiceCommands.ACTION_RECOVER_SERVER
+                startForegroundRuntime(cameraEnabled = !recoveryOnly)
                 serviceScope.launch {
                     runCatching {
+                        if (recoveryOnly) runtimeCoordinator.setCameraEnabled(false)
                         runtimeCoordinator.start()
                     }.onFailure { error ->
                         logger.e(LogEventId.COMPONENT_FAILED, error, "Runtime start failed")
@@ -91,6 +111,7 @@ class ZCamForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        active = false
         releaseWakeLock()
         CoroutineScope(Dispatchers.IO).launch {
             runCatching {
@@ -106,18 +127,33 @@ class ZCamForegroundService : Service() {
 
     override fun onBind(intent: Intent?) = null
 
-    private fun startForegroundRuntime() {
+    private suspend fun applyCameraEnabled(enabled: Boolean) {
+        runCatching {
+            if (enabled) startForegroundRuntime(cameraEnabled = true)
+            runtimeCoordinator.setCameraEnabled(enabled)
+            if (!enabled) startForegroundRuntime(cameraEnabled = false)
+        }.onFailure { error ->
+            logger.e(LogEventId.COMPONENT_FAILED, error, "Camera state update failed")
+        }
+    }
+
+    private fun startForegroundRuntime(cameraEnabled: Boolean) {
         val notification = NotificationCompat.Builder(this, ServiceCommands.NOTIFICATION_CHANNEL_ID)
             .setContentTitle("ZCam active")
-            .setContentText("Camera + MJPEG + loop recording")
+            .setContentText(if (cameraEnabled) "Server + camera + loop recording" else "Server active, camera off")
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setOngoing(true)
             .build()
 
         val types = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+            if (cameraEnabled) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            } else {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            }
         } else {
             0
         }
@@ -169,5 +205,16 @@ class ZCamForegroundService : Service() {
 
         fun stopIntent(context: Context): Intent = Intent(context, ZCamForegroundService::class.java)
             .setAction(ServiceCommands.ACTION_STOP)
+
+        fun cameraIntent(context: Context, enabled: Boolean): Intent = Intent(context, ZCamForegroundService::class.java)
+            .setAction(if (enabled) ServiceCommands.ACTION_CAMERA_ON else ServiceCommands.ACTION_CAMERA_OFF)
+
+        fun recoveryIntent(context: Context): Intent = Intent(context, ZCamForegroundService::class.java)
+            .setAction(ServiceCommands.ACTION_RECOVER_SERVER)
+
+        fun isActive(): Boolean = active
+
+        @Volatile
+        private var active: Boolean = false
     }
 }
