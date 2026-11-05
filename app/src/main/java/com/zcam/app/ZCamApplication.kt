@@ -1,7 +1,6 @@
 package com.zcam.app
 
 import android.app.Application
-import androidx.core.content.ContextCompat
 import com.zcam.core.domain.settings.RuntimeCrashRepository
 import com.zcam.core.domain.settings.RuntimeStateRepository
 import com.zcam.core.logging.LogEventId
@@ -10,7 +9,6 @@ import com.zcam.core.logging.ZCamLogger
 import com.zcam.core.logging.e
 import com.zcam.core.logging.i
 import com.zcam.core.logging.w
-import com.zcam.service.ZCamForegroundService
 import dagger.hilt.android.HiltAndroidApp
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -80,10 +78,7 @@ class ZCamApplication : Application() {
                 }
                 logger.i(LogEventId.STATE_RESTORE_START, "Restoring runtime after process restart")
                 runCatching {
-                    ContextCompat.startForegroundService(
-                        this@ZCamApplication,
-                        ZCamForegroundService.recoveryIntent(this@ZCamApplication)
-                    )
+                    RuntimeRecoveryStarter.request(this@ZCamApplication)
                 }.onFailure { error ->
                     logger.e(LogEventId.COMPONENT_FAILED, error, "Process restore failed")
                 }

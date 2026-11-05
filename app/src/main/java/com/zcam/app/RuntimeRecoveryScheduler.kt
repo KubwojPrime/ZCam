@@ -1,6 +1,7 @@
 package com.zcam.app
 
 import android.app.AlarmManager
+import android.app.ForegroundServiceStartNotAllowedException
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -13,6 +14,9 @@ import com.zcam.core.logging.ZCamLogger
 import com.zcam.core.logging.e
 import com.zcam.core.logging.i
 import com.zcam.service.ZCamForegroundService
+import com.zcam.service.RuntimeActionNotification
+import com.zcam.service.executeServerRecovery
+import android.os.Build
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -41,6 +45,14 @@ object RuntimeRecoveryScheduler {
     }
 }
 
+object RuntimeRecoveryStarter {
+    fun request(context: Context): Boolean = executeServerRecovery(
+        startServer = { ContextCompat.startForegroundService(context, ZCamForegroundService.recoveryIntent(context)) },
+        isBackgroundStartRestricted = { Build.VERSION.SDK_INT >= 31 && it is ForegroundServiceStartNotAllowedException },
+        requestUserAction = { RuntimeActionNotification.show(context, cameraActivation = false) }
+    )
+}
+
 @AndroidEntryPoint
 class RuntimeRecoveryReceiver : BroadcastReceiver() {
     @Inject lateinit var runtimeStateRepository: RuntimeStateRepository
@@ -53,8 +65,11 @@ class RuntimeRecoveryReceiver : BroadcastReceiver() {
             try {
                 runtimeStateRepository.setDesiredRunning(true)
                 runtimeStateRepository.setCameraEnabled(false)
-                ContextCompat.startForegroundService(context, ZCamForegroundService.recoveryIntent(context))
-                logger.i(LogEventId.STATE_RESTORE_START, "Five-minute recovery restored server with camera off")
+                if (RuntimeRecoveryStarter.request(context)) {
+                    logger.i(LogEventId.STATE_RESTORE_START, "Five-minute recovery requested server with camera off")
+                } else {
+                    logger.i(LogEventId.STATE_RESTORE_SKIP, "Server recovery needs user interaction")
+                }
             } catch (error: Throwable) {
                 logger.e(LogEventId.COMPONENT_FAILED, error, "Five-minute server recovery failed")
             } finally {

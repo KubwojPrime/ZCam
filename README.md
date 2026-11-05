@@ -152,11 +152,20 @@ explicit user force-stop.
 The HTTP server is treated as the persistent base runtime. Camera capture and
 loop recording can be switched on or off independently from a paired Android
 client or the authenticated browser panel through `POST /api/camera`. Turning
-the camera off keeps HTTP and audio services reachable. A five-minute inexact
-Android alarm checks whether the foreground service process is absent and, when
-needed, restores the server with camera and recording disabled. Android may
-batch this alarm, and an explicit user Force stop cancels application alarms
-until the user launches ZCam again.
+the camera off keeps HTTP and audio services reachable. The endpoint returns
+HTTP 200 after execution, HTTP 409 with `local_camera_activation_required` if
+Android requires local activation, or HTTP 503 when execution fails or times out.
+For local activation, open ZCam on the server device and press Camera on; a
+notification on that device also explains the required action.
+
+A five-minute inexact Android alarm checks whether the foreground service is
+absent and attempts to restore the server with camera and recording disabled.
+The alarm itself does not grant permission to start a foreground service from
+the background on Android 12+. If Android denies the start, ZCam posts a
+notification that opens the app to restore the server through user interaction.
+Allow notifications to receive this recovery prompt. Android may batch the
+alarm, and Force stop cancels application alarms until ZCam is launched again.
+Sticky service restarts also restore only the server, without camera capture.
 
 ## Recording Playback
 
@@ -170,7 +179,8 @@ The browser panel uses the same range-enabled endpoints, typed event colors,
 timed event bars, and two-level global seek control. The coarse slider navigates
 the complete recording range by time, while a detailed slider covers a ten
 minute window with one-second steps. All available finalized recordings load
-automatically. The active segment is pinned to the top of a separately
+automatically. Use Refresh recordings to fetch newly finalized segments and
+events without resetting playback of the selected clip. The active segment is pinned to the top of a separately
 scrollable five-row list, and clip metadata appears directly below the history
 controls. The panel prepares the next recording in a standby player and swaps
 players at segment boundaries to minimize transition latency on slower links.

@@ -113,6 +113,7 @@ interface LocalClient {
     suspend fun fetchSnapshot(target: ClientTarget): ClientCallResult<ByteArray>
     suspend fun fetchEventFrame(target: ClientTarget, epochMs: Long): ClientCallResult<ByteArray>
     suspend fun restartRuntime(target: ClientTarget): ClientCallResult<Unit>
+    /** Success confirms execution; local_camera_activation_required asks for action on the server device. */
     suspend fun setCameraEnabled(target: ClientTarget, enabled: Boolean): ClientCallResult<Unit>
     fun buildPreviewStreamUrl(target: ClientTarget): String
     fun buildPreviewH264SocketUrl(target: ClientTarget): String

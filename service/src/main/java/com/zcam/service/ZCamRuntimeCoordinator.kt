@@ -70,6 +70,8 @@ class ZCamRuntimeCoordinator @Inject constructor(
     private val runtimeScope = CoroutineScope(SupervisorJob() + dispatchers.default)
     private val isRunning = AtomicBoolean(false)
     private val componentLocks = RuntimeComponent.entries.associateWith { Mutex() }
+    private val cameraControlMutex = Mutex()
+    private val recoveryInProgress = ConcurrentHashMap.newKeySet<RuntimeComponent>()
     private val recoveryAttempts = ConcurrentHashMap<RuntimeComponent, Int>()
 
     private val componentByKey = ConcurrentHashMap<String, RuntimeComponent>()
@@ -165,33 +167,37 @@ class ZCamRuntimeCoordinator @Inject constructor(
     }
 
     suspend fun setCameraEnabled(enabled: Boolean): Boolean = withContext(dispatchers.io) {
-        runtimeStateRepository.setCameraEnabled(enabled)
-        if (!isRunning.get()) {
-            cameraEnabled = enabled
-            return@withContext false
-        }
-        if (cameraEnabled == enabled) return@withContext true
-
-        val storageLock = componentLocks.getValue(RuntimeComponent.STORAGE)
-        val cameraLock = componentLocks.getValue(RuntimeComponent.CAMERA)
-        storageLock.withLock {
-            cameraLock.withLock {
+        cameraControlMutex.withLock {
+            runtimeStateRepository.setCameraEnabled(enabled)
+            if (!isRunning.get()) {
                 cameraEnabled = enabled
-                if (enabled) {
-                    startComponent(RuntimeComponent.CAMERA)
-                    val cameraHealthy = health.value.components[RuntimeComponent.CAMERA]?.status == ComponentHealthStatus.HEALTHY
-                    if (cameraHealthy && !storageSuspendedByThermal) {
-                        startComponent(RuntimeComponent.STORAGE)
+                return@withContext false
+            }
+            if (cameraEnabled == enabled) return@withContext !enabled ||
+                health.value.components[RuntimeComponent.CAMERA]?.status == ComponentHealthStatus.HEALTHY
+
+            // Recovery sees OFF before this command waits for an active hardware operation.
+            cameraEnabled = enabled
+            val storageLock = componentLocks.getValue(RuntimeComponent.STORAGE)
+            val cameraLock = componentLocks.getValue(RuntimeComponent.CAMERA)
+            storageLock.withLock {
+                cameraLock.withLock {
+                    if (enabled) {
+                        startComponent(RuntimeComponent.CAMERA)
+                        val cameraHealthy = health.value.components[RuntimeComponent.CAMERA]?.status == ComponentHealthStatus.HEALTHY
+                        if (cameraHealthy && !storageSuspendedByThermal) {
+                            startComponent(RuntimeComponent.STORAGE)
+                        }
+                    } else {
+                        stopComponent(RuntimeComponent.STORAGE)
+                        stopComponent(RuntimeComponent.CAMERA)
+                        recoveryAttempts.remove(RuntimeComponent.STORAGE)
+                        recoveryAttempts.remove(RuntimeComponent.CAMERA)
                     }
-                } else {
-                    stopComponent(RuntimeComponent.STORAGE)
-                    stopComponent(RuntimeComponent.CAMERA)
-                    recoveryAttempts.remove(RuntimeComponent.STORAGE)
-                    recoveryAttempts.remove(RuntimeComponent.CAMERA)
                 }
             }
+            !enabled || health.value.components[RuntimeComponent.CAMERA]?.status == ComponentHealthStatus.HEALTHY
         }
-        true
     }
 
     private suspend fun stopInternal(persistDesiredState: Boolean) {
@@ -707,12 +713,14 @@ class ZCamRuntimeCoordinator @Inject constructor(
         val managed = activeComponents[component] ?: return
         val mutex = componentLocks.getValue(component)
 
-        mutex.withLock {
+        if (!recoveryInProgress.add(component)) return
+        try {
             if (!isRunning.get()) return
 
             var attempt = (recoveryAttempts[component] ?: 0)
 
             while (isRunning.get()) {
+                if (!isComponentWanted(component)) return
                 attempt += 1
                 recoveryAttempts[component] = attempt
 
@@ -740,51 +748,61 @@ class ZCamRuntimeCoordinator @Inject constructor(
                 }
 
                 retryBackoffScheduler.pause(delayMs)
-                if (!isRunning.get()) return
+                // Do not hold a component lock during backoff: OFF must be able to stop it.
+                mutex.withLock {
+                    if (!isComponentWanted(component)) return
 
-                logger.i(LogEventId.RECOVERY_ATTEMPT, "Recovery attempt for ${component.name}, attempt=$attempt")
+                    logger.i(LogEventId.RECOVERY_ATTEMPT, "Recovery attempt for ${component.name}, attempt=$attempt")
 
-                val recovered = runCatching {
-                    managed.stop.invoke()
-                    managed.start.invoke()
-                }.fold(
-                    onSuccess = { true },
-                    onFailure = { error ->
-                        logger.e(
-                            LogEventId.RECOVERY_FAILED,
-                            error,
-                            "Recovery attempt failed for ${component.name}, attempt=$attempt"
+                    val recovered = runCatching {
+                        managed.stop.invoke()
+                        managed.start.invoke()
+                    }.fold(
+                        onSuccess = { true },
+                        onFailure = { error ->
+                            logger.e(
+                                LogEventId.RECOVERY_FAILED,
+                                error,
+                                "Recovery attempt failed for ${component.name}, attempt=$attempt"
+                            )
+                            false
+                        }
+                    )
+
+                    if (recovered) {
+                        recoveryAttempts[component] = 0
+                        runtimeHealthRepository.mark(
+                            component = component,
+                            status = ComponentHealthStatus.HEALTHY,
+                            eventId = LogEventId.RECOVERY_SUCCEEDED,
+                            message = "recovery succeeded",
+                            recoveryAttempts = attempt
                         )
-                        false
+                        watchdogManager.updateComponentStatus(
+                            component = managed.watchdogKey,
+                            status = WatchdogComponentStatus.HEALTHY,
+                            details = "recovered"
+                        )
+                        watchdogManager.heartbeat(managed.watchdogKey)
+                        logger.i(LogEventId.RECOVERY_SUCCEEDED, "Recovery succeeded for ${component.name}")
+                        return
                     }
-                )
 
-                if (recovered) {
-                    recoveryAttempts[component] = 0
-                    runtimeHealthRepository.mark(
-                        component = component,
-                        status = ComponentHealthStatus.HEALTHY,
-                        eventId = LogEventId.RECOVERY_SUCCEEDED,
-                        message = "recovery succeeded",
-                        recoveryAttempts = attempt
-                    )
-                    watchdogManager.updateComponentStatus(
-                        component = managed.watchdogKey,
-                        status = WatchdogComponentStatus.HEALTHY,
-                        details = "recovered"
-                    )
-                    watchdogManager.heartbeat(managed.watchdogKey)
-                    logger.i(LogEventId.RECOVERY_SUCCEEDED, "Recovery succeeded for ${component.name}")
-                    return
-                }
-
-                if (useCooldown) {
-                    attempt = 0
-                    recoveryAttempts[component] = 0
+                    if (useCooldown) {
+                        attempt = 0
+                        recoveryAttempts[component] = 0
+                    }
                 }
             }
+        } finally {
+            recoveryInProgress.remove(component)
         }
     }
+
+    private fun isComponentWanted(component: RuntimeComponent): Boolean =
+        isRunning.get() &&
+            (cameraEnabled || component !in CAMERA_PIPELINE_COMPONENTS) &&
+            (component != RuntimeComponent.STORAGE || !storageSuspendedByThermal)
 
     private fun buildActiveComponents(
         settings: RuntimeSettings

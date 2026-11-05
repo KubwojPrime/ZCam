@@ -32,6 +32,7 @@ import androidx.core.content.ContextCompat
 import com.zcam.ui.ZCamHomeScreen
 import com.zcam.ui.ZCamMode
 import com.zcam.ui.ZCamUiAction
+import com.zcam.service.ZCamForegroundService
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.delay
 
@@ -172,6 +173,14 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         handlePairingIntent(intent)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // Opening the notification supplies the user interaction needed for recovery.
+        if (!ZCamForegroundService.isActive()) {
+            ContextCompat.startForegroundService(this, ZCamForegroundService.recoveryIntent(this))
+        }
     }
 
     override fun onUserInteraction() {

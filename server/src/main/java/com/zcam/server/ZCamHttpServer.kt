@@ -20,6 +20,7 @@ import com.zcam.core.device.PowerStatusProvider
 import com.zcam.core.device.PowerStatusSnapshot
 import com.zcam.core.dispatchers.DispatcherProvider
 import com.zcam.core.domain.recording.RuntimeRestartRequester
+import com.zcam.core.domain.recording.CameraCommandResult
 import com.zcam.core.logging.LogEventId
 import com.zcam.core.logging.ZCamLogger
 import com.zcam.core.logging.e
@@ -455,17 +456,17 @@ class ZCamHttpServer @Inject constructor(
                 JSON_UTF8,
                 "{\"status\":\"error\",\"reason\":\"camera_control_unavailable\"}"
             )
-        if (!requester.requestCameraEnabled(enabled)) {
-            return NanoHTTPD.newFixedLengthResponse(
-                NanoHTTPD.Response.Status.SERVICE_UNAVAILABLE,
-                JSON_UTF8,
-                "{\"status\":\"error\",\"reason\":\"camera_control_queue_unavailable\"}"
-            )
+        val result = runBlocking { requester.requestCameraEnabled(enabled) }
+        if (result != CameraCommandResult.APPLIED) {
+            val status = if (result == CameraCommandResult.LOCAL_ACTIVATION_REQUIRED)
+                NanoHTTPD.Response.Status.CONFLICT else NanoHTTPD.Response.Status.SERVICE_UNAVAILABLE
+            return NanoHTTPD.newFixedLengthResponse(status, JSON_UTF8,
+                "{\"status\":\"error\",\"reason\":\"${result.reason}\"}")
         }
         return NanoHTTPD.newFixedLengthResponse(
-            NanoHTTPD.Response.Status.ACCEPTED,
+            NanoHTTPD.Response.Status.OK,
             JSON_UTF8,
-            "{\"status\":\"accepted\",\"cameraEnabled\":$enabled}"
+            "{\"status\":\"ok\",\"cameraEnabled\":$enabled}"
         )
     }
 
@@ -1850,6 +1851,7 @@ class ZCamHttpServer @Inject constructor(
                       <span class="chip mono" id="previewState">preview: idle</span>
                       <span class="chip mono" id="previewTransportState">transport: browser MJPEG fallback</span>
                     </div>
+                    <p id="cameraCommandState" class="sub" role="status"></p>
                     <img id="videoPreview" src="/video" alt="ZCam stream" />
                   </div>
 
@@ -1928,6 +1930,7 @@ class ZCamHttpServer @Inject constructor(
                       <div class="sub" id="globalRecordingTimelineHint">Recording history loads automatically.</div>
                       <div id="recordingMeta" class="metaGrid"></div>
                       <div class="row">
+                        <button id="refreshRecordingsBtn" type="button">Refresh recordings</button>
                         <span class="chip mono" id="recordingsState">recordings: idle</span>
                         <span class="chip mono" id="recordingSelection">selected: none</span>
                         <span class="chip mono" id="recordingPlaybackState">playback: idle</span>
@@ -3112,6 +3115,9 @@ class ZCamHttpServer @Inject constructor(
                       fetch(recordingsUrl, { headers: authHeaders(), cache: 'no-store' }),
                       fetch(eventsUrl, { headers: authHeaders(), cache: 'no-store' })
                     ]);
+                    if (!recordingsResponse.ok || !eventsResponse.ok) {
+                      throw new Error('Recording history request failed');
+                    }
                     const recordingsPayload = await recordingsResponse.json();
                     const eventsPayload = await eventsResponse.json();
                     recordingsCache = (Array.isArray(recordingsPayload.recordings) ? recordingsPayload.recordings : [])
@@ -3416,8 +3422,20 @@ class ZCamHttpServer @Inject constructor(
                 }
 
                 async function setCameraEnabled(enabled) {
-                  const { response } = await apiPost('/api/camera', { enabled });
+                  const commandState = document.getElementById('cameraCommandState');
+                  commandState.textContent = 'Camera update in progress...';
+                  const { response, parsed } = await apiPost('/api/camera', { enabled })
+                    .catch(() => ({ response: { ok: false }, parsed: null }));
+                  if (!response.ok) {
+                    const message = parsed?.reason === 'local_camera_activation_required'
+                      ? 'Open ZCam on the server device and turn the camera on.'
+                      : 'Camera update failed. Refresh status and try again.';
+                    updatePreviewState(message, 'errText');
+                    commandState.textContent = message;
+                    return;
+                  }
                   if (response.ok) {
+                    commandState.textContent = enabled ? 'Camera on.' : 'Camera off; server online.';
                     updatePreviewState(enabled ? 'preview: starting' : 'preview: stopped', enabled ? 'warnText' : '');
                     window.setTimeout(() => {
                       applyPreviewSources();
@@ -3548,6 +3566,8 @@ class ZCamHttpServer @Inject constructor(
                   updatePreviewState('preview: reloading', 'warnText');
                   applyPreviewSources();
                 });
+
+                document.getElementById('refreshRecordingsBtn').addEventListener('click', loadRecordings);
 
                 globalRecordingSeek.addEventListener('input', () => {
                   historySeekDragging = true;

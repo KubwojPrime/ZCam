@@ -14,6 +14,7 @@ import com.zcam.core.device.PowerStatusProvider
 import com.zcam.core.device.PowerStatusSnapshot
 import com.zcam.core.dispatchers.DispatcherProvider
 import com.zcam.core.domain.recording.RuntimeRestartRequester
+import com.zcam.core.domain.recording.CameraCommandResult
 import com.zcam.core.domain.config.TrustedDevice
 import com.zcam.core.logging.ZCamLogger
 import com.zcam.security.LanAccessPolicy
@@ -55,6 +56,7 @@ class ZCamAudioEndpointsIntegrationTest {
 
     private var restartRequested = false
     private var cameraEnabledRequested: Boolean? = null
+    private var cameraCommandResult = CameraCommandResult.APPLIED
 
     private val client = OkHttpClient()
     private val logger = NoopLogger()
@@ -93,9 +95,9 @@ class ZCamAudioEndpointsIntegrationTest {
                     return true
                 }
 
-                override fun requestCameraEnabled(enabled: Boolean): Boolean {
+                override suspend fun requestCameraEnabled(enabled: Boolean): CameraCommandResult {
                     cameraEnabledRequested = enabled
-                    return true
+                    return cameraCommandResult
                 }
             }
         )
@@ -125,8 +127,34 @@ class ZCamAudioEndpointsIntegrationTest {
     @Test
     fun camera_endpoint_accepts_remote_disable_request() {
         postJson("/api/camera", """{"enabled":false}""").use {
-            assertEquals(202, it.code)
+            assertEquals(200, it.code)
             assertEquals(false, cameraEnabledRequested)
+        }
+    }
+
+    @Test
+    fun camera_endpoint_reports_local_activation_requirement() {
+        cameraCommandResult = CameraCommandResult.LOCAL_ACTIVATION_REQUIRED
+        postJson("/api/camera", """{"enabled":true}""").use {
+            assertEquals(409, it.code)
+            assertTrue(it.body!!.string().contains("local_camera_activation_required"))
+        }
+    }
+
+    @Test
+    fun camera_endpoint_reports_failed_execution() {
+        cameraCommandResult = CameraCommandResult.FAILED
+        postJson("/api/camera", """{"enabled":true}""").use {
+            assertEquals(503, it.code)
+            assertTrue(it.body!!.string().contains("camera_update_failed"))
+        }
+    }
+
+    @Test
+    fun camera_endpoint_rejects_invalid_enabled_value() {
+        postJson("/api/camera", """{"enabled":"invalid"}""").use {
+            assertEquals(400, it.code)
+            assertEquals(null, cameraEnabledRequested)
         }
     }
 
@@ -140,6 +168,8 @@ class ZCamAudioEndpointsIntegrationTest {
             assertTrue(html.contains("id=\"globalRecordingSeek\""))
             assertTrue(html.contains("id=\"detailedRecordingSeek\""))
             assertTrue(html.contains("recordingsViewport"))
+            assertTrue(html.contains("id=\"refreshRecordingsBtn\""))
+            assertTrue(html.contains("addEventListener('click', loadRecordings)"))
             assertFalse(html.contains("id=\"loadRecordingsBtn\""))
             assertFalse(html.contains("Current Clip Timeline"))
         }

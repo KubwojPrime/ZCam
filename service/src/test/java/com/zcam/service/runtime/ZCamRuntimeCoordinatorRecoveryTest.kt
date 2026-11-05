@@ -158,6 +158,68 @@ class ZCamRuntimeCoordinatorRecoveryTest {
 
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test
+    fun camera_off_does_not_wait_for_permanent_storage_recovery() = runTest(timeout = 20.seconds) {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val dispatchers = TestDispatcherProvider(dispatcher)
+
+        val server = FlakyServer(failuresBeforeSuccess = 0)
+        val flakyStorage = FlakyLoopRecordingManager(failuresBeforeSuccess = Int.MAX_VALUE)
+        val watchdog = FakeWatchdogManager()
+        val runtimeState = FakeRuntimeStateRepository()
+        val runtimeCrash = FakeRuntimeCrashRepository()
+        val environmentMonitor = FakeRuntimeEnvironmentMonitor()
+        val runtimeSettings = FakeRuntimeSettingsRepository(
+            RuntimeSettingsDefaults.value.copy(
+                featureFlags = FeatureFlags(
+                    mjpegStreaming = false,
+                    loopRecording = true,
+                    audioPushToTalk = false,
+                    audioLive = false,
+                    audioPlayback = false,
+                    trustedDevices = true,
+                    watchdogRecovery = true
+                )
+            )
+        )
+        val scheduler = RecordingBackoffScheduler()
+        val coordinator = ZCamRuntimeCoordinator(
+            cameraRuntime = NoopCameraRuntime(),
+            localHttpServer = server,
+            pushToTalkManager = NoopAudioManager(),
+            loopRecordingManager = flakyStorage,
+            watchdogManager = watchdog,
+            runtimeEnvironmentMonitor = environmentMonitor,
+            runtimeSettingsRepository = runtimeSettings,
+            runtimeCrashRepository = runtimeCrash,
+            runtimeStateRepository = runtimeState,
+            runtimeHealthRepository = InMemoryRuntimeHealthRepository(),
+            recoveryPolicy = RecoveryPolicy(baseDelayMs = 5, maxDelayMs = 40, maxAttemptsBeforeCooldown = 4, cooldownMs = 100),
+            retryBackoffScheduler = scheduler,
+            dispatchers = dispatchers,
+            logger = NoopLogger()
+        )
+
+        coordinator.start()
+        try {
+            runCurrent()
+            assertEquals(ComponentHealthStatus.RECOVERING,
+                coordinator.health.value.components.getValue(RuntimeComponent.STORAGE).status)
+            kotlinx.coroutines.withTimeout(100) { assertTrue(coordinator.setCameraEnabled(false)) }
+            val startsAfterOff = flakyStorage.startCalls
+            advanceTimeBy(1_000)
+            runCurrent()
+            assertEquals(startsAfterOff, flakyStorage.startCalls)
+            assertEquals(ComponentHealthStatus.STOPPED,
+                coordinator.health.value.components.getValue(RuntimeComponent.STORAGE).status)
+            assertTrue(server.isHealthy())
+        } finally {
+            coordinator.stop(persistDesiredState = true)
+            advanceUntilIdle()
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
     fun recovers_storage_component_after_storage_failure() = runTest(timeout = 20.seconds) {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val dispatchers = TestDispatcherProvider(dispatcher)

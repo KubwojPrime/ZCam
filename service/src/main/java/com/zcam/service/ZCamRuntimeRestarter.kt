@@ -1,6 +1,9 @@
 package com.zcam.service
 
 import com.zcam.core.domain.recording.RuntimeRestartRequester
+import com.zcam.core.domain.recording.CameraCommandResult
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.receiveAsFlow
 import java.util.concurrent.atomic.AtomicBoolean
@@ -23,8 +26,17 @@ class ZCamRuntimeRestarter @Inject constructor() : RuntimeRestartRequester {
     }
 
 
-    override fun requestCameraEnabled(enabled: Boolean): Boolean =
-        queue.trySend(RuntimeControlCommand.SetCameraEnabled(enabled)).isSuccess
+    override suspend fun requestCameraEnabled(enabled: Boolean): CameraCommandResult {
+        val result = CompletableDeferred<CameraCommandResult>()
+        if (queue.trySend(RuntimeControlCommand.SetCameraEnabled(enabled, result)).isFailure) {
+            return CameraCommandResult.UNAVAILABLE
+        }
+        return try {
+            withTimeoutOrNull(5_000L) { result.await() } ?: CameraCommandResult.UNAVAILABLE
+        } finally {
+            result.cancel()
+        }
+    }
 
     fun finishRestart() {
         restarting.set(false)
@@ -33,5 +45,8 @@ class ZCamRuntimeRestarter @Inject constructor() : RuntimeRestartRequester {
 
 sealed interface RuntimeControlCommand {
     data object Restart : RuntimeControlCommand
-    data class SetCameraEnabled(val enabled: Boolean) : RuntimeControlCommand
+    data class SetCameraEnabled(
+        val enabled: Boolean,
+        val result: CompletableDeferred<CameraCommandResult>
+    ) : RuntimeControlCommand
 }

@@ -3,7 +3,6 @@
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import androidx.core.content.ContextCompat
 import com.zcam.core.domain.settings.RuntimeCrashRepository
 import com.zcam.core.domain.settings.RuntimeStateRepository
 import com.zcam.core.logging.LogEventId
@@ -11,7 +10,6 @@ import com.zcam.core.logging.ZCamLogger
 import com.zcam.core.logging.e
 import com.zcam.core.logging.i
 import com.zcam.core.logging.w
-import com.zcam.service.ZCamForegroundService
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -53,7 +51,7 @@ class BootReceiver : BroadcastReceiver() {
                     }
                     logger.i(LogEventId.STATE_RESTORE_START, "Restoring runtime after boot")
                     runCatching {
-                        ContextCompat.startForegroundService(context, ZCamForegroundService.recoveryIntent(context))
+                        RuntimeRecoveryStarter.request(context)
                     }.onFailure { error ->
                         logger.e(LogEventId.COMPONENT_FAILED, error, "Boot restore failed")
                     }

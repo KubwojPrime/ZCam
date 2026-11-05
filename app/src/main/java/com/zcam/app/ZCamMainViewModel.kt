@@ -1024,7 +1024,7 @@ class ZCamMainViewModel @Inject constructor(
                     _state.update {
                         it.copy(
                             clientCameraEnabled = enabled,
-                            clientStatusLabel = if (enabled) "Camera start requested" else "Camera stopped; server online",
+                            clientStatusLabel = if (enabled) "Camera on" else "Camera stopped; server online",
                             errorMessage = null
                         )
                     }
@@ -1032,7 +1032,11 @@ class ZCamMainViewModel @Inject constructor(
                     refreshClientStatusNow()
                 }
                 is ClientCallResult.Failure -> _state.update {
-                    it.copy(errorMessage = "Camera update failed: ${result.reason}")
+                    it.copy(errorMessage = if (result.reason == "local_camera_activation_required") {
+                        "Open ZCam on the server device and turn the camera on. Android requires local activation."
+                    } else {
+                        "Camera update failed: ${result.reason}"
+                    })
                 }
             }
         }
